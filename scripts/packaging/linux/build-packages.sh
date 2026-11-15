@@ -52,7 +52,19 @@ install_deps() {
 
 install_rust() {
     if ! command -v cargo >/dev/null; then
-        curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+        # rustup-init 1.29.3, verified against its published SHA-256 (not piped into a shell)
+        local triple sha tmp
+        case "$(uname -m)" in
+            x86_64)  triple=x86_64-unknown-linux-gnu;  sha=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 ;;
+            aarch64) triple=aarch64-unknown-linux-gnu; sha=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;;
+            *) echo "no pinned rustup-init for $(uname -m); install rust first" >&2; exit 1 ;;
+        esac
+        tmp=$(mktemp -d)
+        curl --proto '=https' --tlsv1.2 -fsSLo "$tmp/rustup-init" "https://static.rust-lang.org/rustup/archive/1.29.3/$triple/rustup-init"
+        echo "$sha  $tmp/rustup-init" | sha256sum -c -
+        chmod +x "$tmp/rustup-init"
+        "$tmp/rustup-init" -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+        rm -rf "$tmp"
     fi
     # shellcheck disable=SC1091
     [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"

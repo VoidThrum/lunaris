@@ -69,3 +69,8 @@ squashfs-root/
 !/scratch/test_arboard/
 !/scratch/test_arboard_persistence/
 build-dir/
+
+# TLS keys/certificates and agent logs must never be committed
+*.pem
+agent.log*
+*.log.*

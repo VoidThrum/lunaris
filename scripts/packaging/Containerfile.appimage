@@ -55,9 +55,18 @@ ENV QMAKE=${QTDIR}/bin/qmake PATH=${QTDIR}/bin:$PATH \
     LD_LIBRARY_PATH=${QTDIR}/lib:${PREFIX}/lib:${PREFIX}/lib/x86_64-linux-gnu
 
 # linuxdeploy + Qt plugin (run extracted: no FUSE inside containers).
+# Both come from the moving "continuous" release, so each file is checked against
+# a SHA-256 (the files served on 2026-11-15). When upstream republishes them the
+# build fails here on purpose: to update the tools, download the new files, review
+# them and replace the hashes. (Fixed tags exist but are older than "continuous";
+# the appimagetool inside the plugin is what make-appimage.sh relies on.)
+ARG LINUXDEPLOY_SHA256=df908b19f1ed1cdafa79508d415aa12d6c56ce4d56d4149aa8c09286718706e5
+ARG LINUXDEPLOY_QT_SHA256=cfc1055b2b9dbc08412b579f20990b7b41a17b61beaa5847dc9477c96c9e9617
 RUN cd /opt && for t in linuxdeploy-x86_64 linuxdeploy-plugin-qt-x86_64; do \
-        repo=$( [ "$t" = linuxdeploy-x86_64 ] && echo linuxdeploy || echo linuxdeploy-plugin-qt ); \
+        if [ "$t" = linuxdeploy-x86_64 ]; then repo=linuxdeploy; sha=${LINUXDEPLOY_SHA256}; \
+        else repo=linuxdeploy-plugin-qt; sha=${LINUXDEPLOY_QT_SHA256}; fi; \
         curl -fsSLo $t.AppImage https://github.com/linuxdeploy/$repo/releases/download/continuous/$t.AppImage \
+        && echo "$sha  $t.AppImage" | sha256sum -c - \
         && chmod +x $t.AppImage && ./$t.AppImage --appimage-extract >/dev/null \
         && mv squashfs-root $t && rm $t.AppImage && chmod -R a+rX /opt/$t \
         && printf '#!/bin/sh\nexec /opt/%s/AppRun "$@"\n' $t > /usr/local/bin/$t \
@@ -109,7 +118,12 @@ RUN set -e; v=${ICU_VERSION}; u=${ICU_FILE}; cd /tmp \
 
 ARG RUST_TOOLCHAIN=nightly-2026-04-17
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN} \
+# rustup-init 1.29.3, checked against the SHA-256 published next to it on static.rust-lang.org.
+RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-unknown-linux-gnu/rustup-init \
+    && echo "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55  /tmp/rustup-init" | sha256sum -c - \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN} \
+    && rm /tmp/rustup-init \
     && chmod -R a+rwX /opt/rustup /opt/cargo
 WORKDIR /src
 

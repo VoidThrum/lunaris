@@ -2,7 +2,11 @@
 #
 #   docker build -t lunaris-server .
 #   docker run -d -p 8090:8090 -p 8443:8443 -v lunaris-data:/data --name lunaris lunaris-server
-#   docker logs lunaris        # shows the initial admin password and agent token
+#   docker exec lunaris cat /data/initial_admin_password.txt   # initial admin password
+#   docker exec lunaris cat /data/server_token.txt             # agent token
+#
+# The container runs as root on purpose: existing /data volumes are owned by root and
+# a non-root user could not write to them.
 
 # --- Web client ---
 FROM node:20-slim AS web

@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-server-linux:
@@ -26,10 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: 'npm'
@@ -43,23 +43,23 @@ jobs:
           npm run build
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: nightly-2026-04-17
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: server-musl
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.13.0
 
       - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
         with:
           tool: cargo-zigbuild
 
@@ -77,7 +77,7 @@ jobs:
           file lunaris-server-linux-*/lunaris-server
 
       - name: Upload Server Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: server-linux
           path: lunaris-server-linux-*.tar.gz
@@ -87,13 +87,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build image (not pushed)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           tags: lunaris-server:ci
@@ -134,11 +134,11 @@ jobs:
           esac
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Cache static FFmpeg
         if: matrix.format != 'arch'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: /opt/lunaris-ffmpeg
           key: ffmpeg-static-${{ matrix.format }}-${{ hashFiles('scripts/packaging/build-ffmpeg-static.sh') }}
@@ -147,7 +147,7 @@ jobs:
         run: bash scripts/packaging/linux/build-packages.sh ${{ matrix.format }} dist
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-packages-${{ matrix.format }}
           path: dist/*
@@ -162,14 +162,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # The image, Qt, both cargo targets and the web client need ~15 GB.
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: 'npm'
@@ -180,16 +180,16 @@ jobs:
       - name: Build Web Frontend
         run: |
           cd web
-          npm ci || npm install
+          npm ci
           npm run build
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       # Ubuntu 22.04 + Qt 6.8 + FFmpeg/x264/SVT-AV1/dav1d/libva/oneVPL + slim ICU
       # data. The layers are cached, so only Lunaris itself is rebuilt on most runs.
       - name: Build packaging image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: scripts/packaging
           file: scripts/packaging/Containerfile.appimage
@@ -199,7 +199,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=agent-appimage
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             build-dir/cargo-cache
@@ -211,19 +211,19 @@ jobs:
         run: CONTAINER=docker ./scripts/packaging/build-appimages.sh
 
       - name: Upload Agent AppImage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: agent-linux-appimage
           path: dist/Lunaris-Agent-*-x86_64.AppImage
 
       - name: Upload Client Desktop Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: client-desktop-linux
           path: dist/client-desktop-x86_64.AppImage
 
       - name: Upload Client QML Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: client-qml-linux
           path: dist/client-qml-x86_64.AppImage
@@ -233,11 +233,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Cache FFmpeg build
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ffmpeg-windows
           key: ffmpeg-windows-${{ hashFiles('scripts/packaging/windows/build-ffmpeg-mingw.sh') }}
@@ -250,7 +250,7 @@ jobs:
           bash scripts/packaging/windows/build-ffmpeg-mingw.sh ffmpeg-windows
 
       - name: Upload FFmpeg
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ffmpeg-windows
           path: ffmpeg-windows
@@ -261,22 +261,22 @@ jobs:
     needs: build-ffmpeg-windows
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup MSVC Developer Command Prompt
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: vcpkg-cache
         with:
           path: C:\vcpkg\installed
@@ -292,7 +292,7 @@ jobs:
       # Trimmed FFmpeg 8.1 cross-compiled by the build-ffmpeg-windows job
       # (only the codecs Lunaris uses; x264/SVT-AV1/dav1d inside the DLLs).
       - name: Download FFmpeg
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ffmpeg-windows
           path: C:\ffmpeg
@@ -307,7 +307,7 @@ jobs:
         shell: pwsh
 
       - name: Install Qt6
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4
         with:
           version: '6.7.3'
           host: 'windows'
@@ -316,12 +316,12 @@ jobs:
           modules: 'qtmultimedia qtshadertools'
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: nightly-2026-04-17
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Configure environment
         run: |
@@ -350,7 +350,7 @@ jobs:
       - name: Build Web Frontend
         run: |
           cd web
-          npm ci || npm install
+          npm ci
           npm run build
         shell: pwsh
 
@@ -368,7 +368,7 @@ jobs:
         shell: pwsh
 
       - name: Upload Server Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: server-windows
           path: lunaris-server-windows-x86_64.zip
@@ -427,31 +427,31 @@ jobs:
         shell: pwsh
 
       - name: Upload Client Desktop Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: client-desktop-windows
           path: lunaris-client-desktop-windows.zip
 
       - name: Upload Client QML Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: client-qml-windows
           path: lunaris-client-qml-windows.zip
 
       - name: Upload Client Desktop Installer Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: client-desktop-installer-windows
           path: lunaris-client-installer.exe
 
       - name: Upload Agent Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: agent-windows
           path: lunaris-agent-windows.zip
 
       - name: Upload Agent Installer Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: agent-installer-windows
           path: lunaris-agent-installer.exe
@@ -461,42 +461,44 @@ jobs:
     needs: [build-server-linux, build-server-docker, build-linux-packages, build-agent-appimage, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download Linux Server Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: server-linux
           path: ./artifacts/linux-server
 
       - name: Download Linux Client Desktop Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: client-desktop-linux
           path: ./artifacts/linux-client-desktop
 
       - name: Download Linux Client QML Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: client-qml-linux
           path: ./artifacts/linux-client-qml
 
       - name: Download Windows Server Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: server-windows
           path: ./artifacts/windows-server
 
       - name: Download Windows Client Desktop Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: client-desktop-windows
           path: ./artifacts/windows-client-desktop
 
       - name: Download Windows Client QML Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: client-qml-windows
           path: ./artifacts/windows-client-qml
@@ -504,32 +506,32 @@ jobs:
 
 
       - name: Download Linux distro packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: linux-packages-*
           merge-multiple: true
           path: ./artifacts/linux-packages
 
       - name: Download Linux Agent AppImage
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: agent-linux-appimage
           path: ./artifacts/linux-agent
 
       - name: Download Windows Agent Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: agent-windows
           path: ./artifacts/windows-agent
 
       - name: Download Windows Agent Installer Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: agent-installer-windows
           path: ./artifacts/windows-agent-installer
 
       - name: Download Windows Client Desktop Installer Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: client-desktop-installer-windows
           path: ./artifacts/windows-client-desktop-installer
@@ -558,7 +560,7 @@ jobs:
 
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: Release ${{ github.ref_name }}
           tag_name: ${{ github.ref }}

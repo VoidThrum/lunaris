@@ -18,11 +18,20 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
 };
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::verify_jwt;
+use crate::queue::{Inbox, Outbox};
+use crate::security::{self, AgentKeyDecision, FailureLimiter};
+
+/// Largest WebSocket message accepted from a client: SDP answers and ICE
+/// candidates are a few KiB, so this leaves ample headroom.
+pub const CLIENT_MAX_MESSAGE: usize = 1024 * 1024;
+/// From an agent: app lists may carry base64 icons (none today), so more room.
+pub const AGENT_MAX_MESSAGE: usize = 8 * 1024 * 1024;
+/// Open client WebSockets per user.
+pub const MAX_CLIENT_SOCKETS_PER_USER: usize = 32;
 use webrtc::peer_connection::RTCIceCandidateInit;
 use webrtc::peer_connection::RTCSessionDescription;
 
@@ -52,10 +61,11 @@ pub struct SignalingState {
     pub client_local_ips: RwLock<HashMap<String, IpAddr>>,
     pub agent_token: String,
     // agent_id -> sender to agent WS
-    pub agents: RwLock<HashMap<String, mpsc::UnboundedSender<ServerToAgentMessage>>>,
-    // client_id -> sender to client WS
-    pub clients: RwLock<HashMap<String, mpsc::UnboundedSender<ServerToClientMessage>>>,
-    // client_id -> agent_id active peer mappings
+    pub agents: RwLock<HashMap<String, Outbox<ServerToAgentMessage>>>,
+    // conn_id -> sender to client WS
+    pub clients: RwLock<HashMap<String, Outbox<ServerToClientMessage>>>,
+    // conn_id -> agent_id of the streaming session started on that connection
+    // (agents address clients by conn_id)
     pub client_to_agent: RwLock<HashMap<String, String>>,
     // agent_id -> active connection Uuid
     pub agent_connections: RwLock<HashMap<String, Uuid>>,
@@ -67,6 +77,11 @@ pub struct SignalingState {
     pub local_sessions: RwLock<HashMap<String, Arc<crate::bridge::BridgeSession>>>,
     /// Computers added by address (the server connects to them).
     pub links: crate::links::Links,
+    /// Failed sign-ins per client address and per (username, address).
+    pub login_ip_limit: FailureLimiter,
+    pub login_user_limit: FailureLimiter,
+    /// Wrong agent tokens per client address.
+    pub agent_token_limit: FailureLimiter,
 }
 
 impl SignalingState {
@@ -85,6 +100,38 @@ impl SignalingState {
             file_sessions: RwLock::new(HashMap::new()),
             local_sessions: RwLock::new(HashMap::new()),
             links: crate::links::Links::default(),
+            login_ip_limit: FailureLimiter::standard(),
+            login_user_limit: FailureLimiter::standard(),
+            // Higher: a stale agent retrying every few seconds must not lock
+            // out every agent behind its address; the token is long and random.
+            agent_token_limit: FailureLimiter::new(300, std::time::Duration::from_secs(300), 10_000),
+        }
+    }
+
+    /// Closes every client WebSocket of a user (deactivated or deleted).
+    pub fn close_user_connections(&self, user_id: &str) {
+        let conn_ids: Vec<String> = self
+            .client_connections
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, uid)| uid.as_str() == user_id)
+            .map(|(conn, _)| conn.clone())
+            .collect();
+        let clients = self.clients.read().unwrap();
+        for conn in &conn_ids {
+            if let Some(tx) = clients.get(conn) {
+                tx.close();
+            }
+        }
+        if !conn_ids.is_empty() {
+            info!("Closed {} connection(s) of user {}", conn_ids.len(), user_id);
+        }
+    }
+
+    fn send_to_conn(&self, conn_id: &str, msg: ServerToClientMessage) {
+        if let Some(tx) = self.clients.read().unwrap().get(conn_id) {
+            let _ = tx.send(msg);
         }
     }
 
@@ -199,6 +246,9 @@ pub struct AgentParams {
     pub name: String,
     pub codec_support: Option<u32>,
     pub token: Option<String>,
+    /// The agent's own key (hex): once a host id has one, only that agent may
+    /// register with the id.
+    pub key: Option<String>,
 }
 
 // WS Client query params
@@ -211,21 +261,104 @@ pub async fn agent_ws_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<AgentParams>,
     ConnectInfo(addrs): ConnectInfo<ConnAddrs>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<SignalingState>>,
 ) -> impl IntoResponse {
+    let now = std::time::Instant::now();
+    let client_ip = security::client_ip(addrs.remote.ip(), &headers);
+    let ip_key = client_ip.to_string();
+    if state.agent_token_limit.is_blocked(&ip_key, now) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
     let incoming_token = params.token.as_deref().unwrap_or("").trim();
-    if incoming_token != state.agent_token.trim() {
+    if !security::ct_eq(incoming_token, state.agent_token.trim()) {
+        state.agent_token_limit.record_failure(&ip_key, now);
         warn!(
-            "Unauthorized agent connection attempt for ID {} (invalid or missing token)",
-            params.id
+            "Unauthorized agent connection attempt from {} (invalid or missing token)",
+            client_ip
         );
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Err(why) = security::validate_agent_identity(&params.id, &params.name) {
+        warn!("Agent connection from {} refused: {}", client_ip, why);
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let key = params.key.as_deref().map(str::trim).filter(|k| !k.is_empty());
+    if key.is_some_and(|k| !security::valid_agent_key(k)) {
+        warn!("Agent {} sent a malformed key", params.id);
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match check_agent_key(&state, &params.id, &params.name, key).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(
+                "Agent connection from {} refused: wrong key for host id {} (or the id is in use)",
+                client_ip,
+                params.id
+            );
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        Err(e) => {
+            error!("Database error checking agent key: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
 
     if let Some(local) = addrs.local {
         state.agent_local_ips.write().unwrap().insert(params.id.clone(), local.ip());
     }
-    ws.on_upgrade(move |socket| handle_agent_socket(socket, params, state))
+    ws.max_message_size(AGENT_MAX_MESSAGE)
+        .on_upgrade(move |socket| handle_agent_socket(socket, params, state))
+}
+
+/// Whether an agent may register as `host_id`: a host that has a key accepts
+/// only that key; the first key given for a host is stored.
+async fn check_agent_key(
+    state: &SignalingState,
+    host_id: &str,
+    name: &str,
+    key: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let stored: Option<String> = sqlx::query_scalar("SELECT agent_key_hash FROM hosts WHERE id = ?")
+        .bind(host_id)
+        .fetch_optional(&state.db)
+        .await?
+        .flatten();
+    match security::agent_key_decision(stored.as_deref(), key) {
+        AgentKeyDecision::Accept => Ok(true),
+        AgentKeyDecision::Reject => Ok(false),
+        AgentKeyDecision::Store => {
+            // An agent without a key is online with this id: a newcomer with
+            // the shared token must not claim the id and lock it out.
+            if state.agents.read().unwrap().contains_key(host_id) {
+                return Ok(false);
+            }
+            let hash = security::sha256_hex(key.unwrap_or_default());
+            // Only fills an empty slot, so two agents racing for a new id
+            // can't both win: re-read what was kept.
+            sqlx::query(
+                "INSERT INTO hosts (id, name, status, agent_key_hash) VALUES (?, ?, 'Offline', ?)
+                 ON CONFLICT(id) DO UPDATE SET agent_key_hash = excluded.agent_key_hash
+                 WHERE hosts.agent_key_hash IS NULL",
+            )
+            .bind(host_id)
+            .bind(name)
+            .bind(&hash)
+            .execute(&state.db)
+            .await?;
+            let kept: Option<String> = sqlx::query_scalar("SELECT agent_key_hash FROM hosts WHERE id = ?")
+                .bind(host_id)
+                .fetch_optional(&state.db)
+                .await?
+                .flatten();
+            if kept.as_deref().is_some_and(|k| security::ct_eq(k, &hash)) {
+                info!("Stored the key of agent {}", host_id);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+    }
 }
 
 pub async fn client_ws_handler(
@@ -234,15 +367,32 @@ pub async fn client_ws_handler(
     ConnectInfo(addrs): ConnectInfo<ConnAddrs>,
     State(state): State<Arc<SignalingState>>,
 ) -> impl IntoResponse {
-    // Verify token before upgrading if possible, or inside connection.
-    // Let's do it inside for simplicity with standard ws URL connection.
-    match verify_jwt(&params.token) {
-        Ok(claims) => {
-            let local_ip = addrs.local.map(|a| a.ip());
-            ws.on_upgrade(move |socket| handle_client_socket(socket, claims.sub, local_ip, state))
+    let Ok(claims) = verify_jwt(&params.token) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    // A valid token is not enough: the account must still exist and be active.
+    match security::user_status(&state.db, &claims.sub).await {
+        Ok(Some((_, true))) => {}
+        Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(e) => {
+            error!("Database error checking user: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        Err(_) => StatusCode::UNAUTHORIZED.into_response(),
     }
+    let open = state
+        .client_connections
+        .read()
+        .unwrap()
+        .values()
+        .filter(|uid| **uid == claims.sub)
+        .count();
+    if open >= MAX_CLIENT_SOCKETS_PER_USER {
+        warn!("User {} has too many open connections", claims.sub);
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let local_ip = addrs.local.map(|a| a.ip());
+    ws.max_message_size(CLIENT_MAX_MESSAGE)
+        .on_upgrade(move |socket| handle_client_socket(socket, claims.sub, local_ip, state))
 }
 
 // --- Agent Connection Handler ---
@@ -255,8 +405,8 @@ pub(crate) async fn agent_connected(
     agent_id: &str,
     agent_name: &str,
     codec_support: Option<u32>,
-) -> (Uuid, mpsc::UnboundedReceiver<ServerToAgentMessage>) {
-    let (tx, rx) = mpsc::unbounded_channel::<ServerToAgentMessage>();
+) -> (Uuid, Inbox<ServerToAgentMessage>) {
+    let (tx, rx) = crate::queue::channel::<ServerToAgentMessage>();
     let conn_id = Uuid::new_v4();
     state.agents.write().unwrap().insert(agent_id.to_string(), tx);
     state.agent_connections.write().unwrap().insert(agent_id.to_string(), conn_id);
@@ -290,6 +440,7 @@ pub(crate) async fn agent_disconnected(state: &Arc<SignalingState>, agent_id: &s
         if conn_map.get(agent_id) == Some(&conn_id) {
             conn_map.remove(agent_id);
             state.agents.write().unwrap().remove(agent_id);
+            state.agent_local_ips.write().unwrap().remove(agent_id);
             should_cleanup = true;
         }
     }
@@ -298,34 +449,26 @@ pub(crate) async fn agent_disconnected(state: &Arc<SignalingState>, agent_id: &s
     }
     state.set_host_status(agent_id, HostStatus::Offline).await;
 
-    // Clean up active client sessions related to this agent
-    let clients_to_disconnect: Vec<String> = state
-        .client_to_agent
-        .read()
-        .unwrap()
-        .iter()
-        .filter(|(_, a_id)| a_id.as_str() == agent_id)
-        .map(|(c_id, _)| c_id.clone())
-        .collect();
-
-    for client_id in clients_to_disconnect {
-        state.client_to_agent.write().unwrap().remove(&client_id);
-        // Find all connections for this client and send error to each
-        let conn_ids: Vec<String> = {
-            let conn_map = state.client_connections.read().unwrap();
-            conn_map.iter()
-                .filter(|(_, c_id)| *c_id == &client_id)
-                .map(|(conn_id, _)| conn_id.clone())
-                .collect()
-        };
-        let clients = state.clients.read().unwrap();
-        for conn_id in conn_ids {
-            if let Some(client_tx) = clients.get(&conn_id) {
-                let _ = client_tx.send(ServerToClientMessage::Signaling(SignalingMessage::Error {
-                    message: "Host disconnected".to_string(),
-                }));
-            }
+    // Tell the connections that had a session with this agent.
+    let conns: Vec<String> = {
+        let mut map = state.client_to_agent.write().unwrap();
+        let conns: Vec<String> = map
+            .iter()
+            .filter(|(_, a_id)| a_id.as_str() == agent_id)
+            .map(|(conn, _)| conn.clone())
+            .collect();
+        for conn in &conns {
+            map.remove(conn);
         }
+        conns
+    };
+    for conn_id in conns {
+        state.send_to_conn(
+            &conn_id,
+            ServerToClientMessage::Signaling(SignalingMessage::Error {
+                message: "Host disconnected".to_string(),
+            }),
+        );
     }
 }
 
@@ -336,7 +479,7 @@ async fn handle_agent_socket(socket: WebSocket, params: AgentParams, state: Arc<
 
     // Spawn a task to handle outbound messages to the agent (with heartbeat to prevent idle timeouts)
     let agent_id_clone = agent_id.clone();
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -369,8 +512,13 @@ async fn handle_agent_socket(socket: WebSocket, params: AgentParams, state: Arc<
         }
     });
 
-    // Handle inbound messages from agent
-    while let Some(result) = ws_receiver.next().await {
+    // Handle inbound messages from agent, until it or the sender (queue full) stops
+    loop {
+        let next = tokio::select! {
+            next = ws_receiver.next() => next,
+            _ = &mut send_task => break,
+        };
+        let Some(result) = next else { break };
         let msg = match result {
             Ok(m) => m,
             Err(e) => {
@@ -398,7 +546,7 @@ async fn handle_client_socket(
     state: Arc<SignalingState>,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<ServerToClientMessage>();
+    let (tx, mut rx) = crate::queue::channel::<ServerToClientMessage>();
     let conn_id = Uuid::new_v4();
 
     // Register active client sender (keyed by conn_id to support multiple connections per client)
@@ -418,7 +566,7 @@ async fn handle_client_socket(
 
     // Spawn a task to handle outbound messages to the client (with heartbeat to prevent idle timeouts)
     let client_id_clone = client_id.clone();
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -451,8 +599,14 @@ async fn handle_client_socket(
         }
     });
 
-    // Handle inbound messages from client
-    while let Some(result) = ws_receiver.next().await {
+    // Handle inbound messages from client, until it or the sender (queue full,
+    // user deactivated) stops
+    loop {
+        let next = tokio::select! {
+            next = ws_receiver.next() => next,
+            _ = &mut send_task => break,
+        };
+        let Some(result) = next else { break };
         let msg = match result {
             Ok(m) => m,
             Err(e) => {
@@ -507,15 +661,10 @@ async fn handle_client_socket(
         return;
     }
 
-    // Only clean up session if this was the last connection for this client
-    let has_other_connections = {
-        let conn_map = state.client_connections.read().unwrap();
-        conn_map.values().any(|cid| cid == &client_id)
-    };
-    let should_cleanup = !has_other_connections;
-
-    if should_cleanup {
-        let host_id_opt = state.client_to_agent.write().unwrap().remove(&client_id);
+    // The session started on this connection ends with it (agents know the
+    // client by its conn_id).
+    {
+        let host_id_opt = state.client_to_agent.write().unwrap().remove(&conn_id_str);
         if let Some(host_id) = host_id_opt {
             info!(
                 "Cleaning up active session for host {} due to client disconnect",
@@ -529,7 +678,7 @@ async fn handle_client_socket(
             if let Some(agent_tx) = agent_tx_opt {
                 let _ = agent_tx.send(ServerToAgentMessage::Signaling(
                     SignalingMessage::EndSession {
-                        target_id: client_id.clone(),
+                        target_id: conn_id_str.clone(),
                     },
                 ));
             }
@@ -557,6 +706,7 @@ async fn handle_agent_signaling(sig: SignalingMessage, agent_id: &str, state: Ar
             ice_servers: _,
             webtransport_port,
             webtransport_cert_hash,
+            webtransport_token,
         } => {
             let client_tx_opt = state.clients.read().unwrap().get(&target_id).cloned();
             if let Some(client_tx) = client_tx_opt {
@@ -567,6 +717,7 @@ async fn handle_agent_signaling(sig: SignalingMessage, agent_id: &str, state: Ar
                     ice_servers: Some(ice_servers),
                     webtransport_port,
                     webtransport_cert_hash,
+                    webtransport_token,
                 }));
             }
         }
@@ -584,15 +735,36 @@ async fn handle_agent_signaling(sig: SignalingMessage, agent_id: &str, state: Ar
             }
         }
         SignalingMessage::EndSession { target_id } => {
-            state.client_to_agent.write().unwrap().remove(&target_id);
-            if let Some(client_tx) = state.clients.read().unwrap().get(&target_id) {
-                let _ = client_tx.send(ServerToClientMessage::Signaling(
-                    SignalingMessage::EndSession {
-                        target_id: agent_id.to_string(),
-                    },
-                ));
+            // Only for a connection that has a session with this agent.
+            let stream = {
+                let mut map = state.client_to_agent.write().unwrap();
+                let ours = map.get(&target_id).is_some_and(|a| a == agent_id);
+                if ours {
+                    map.remove(&target_id);
+                }
+                ours
+            };
+            let file = {
+                let mut map = state.file_sessions.write().unwrap();
+                let ours = map.get(&target_id).is_some_and(|a| a == agent_id);
+                if ours {
+                    map.remove(&target_id);
+                }
+                ours
+            };
+            if !stream && !file {
+                debug!("Agent {} ended a session it does not have ({}); ignored", agent_id, target_id);
+                return;
             }
-            state.set_host_status(agent_id, HostStatus::Online).await;
+            state.send_to_conn(
+                &target_id,
+                ServerToClientMessage::Signaling(SignalingMessage::EndSession {
+                    target_id: agent_id.to_string(),
+                }),
+            );
+            if stream {
+                state.set_host_status(agent_id, HostStatus::Online).await;
+            }
         }
 
         SignalingMessage::AppListResponse {
@@ -677,6 +849,18 @@ async fn handle_client_signaling(
     conn_id: &str,
     state: Arc<SignalingState>,
 ) {
+    if let Some(host_id) = addressed_host(&sig) {
+        if !client_may_address(&state, client_id, conn_id, &sig, host_id).await {
+            warn!("User {} refused access to host {}", client_id, host_id);
+            state.send_to_conn(
+                conn_id,
+                ServerToClientMessage::Signaling(SignalingMessage::Error {
+                    message: "You don't have access to this computer.".to_string(),
+                }),
+            );
+            return;
+        }
+    }
     match sig {
         // A file-transfer connection (on its own client WebSocket): routed
         // like a session, without touching the host's streaming state.
@@ -703,9 +887,9 @@ async fn handle_client_signaling(
                 }
             }
         }
-        SignalingMessage::EndSession { ref target_id } if state.file_sessions.read().unwrap().contains_key(conn_id) => {
-            state.file_sessions.write().unwrap().remove(conn_id);
-            if let Some(agent_tx) = state.agents.read().unwrap().get(target_id).cloned() {
+        SignalingMessage::EndSession { .. } if state.file_sessions.read().unwrap().contains_key(conn_id) => {
+            let host_id = state.file_sessions.write().unwrap().remove(conn_id).unwrap_or_default();
+            if let Some(agent_tx) = state.agents.read().unwrap().get(&host_id).cloned() {
                 let _ = agent_tx.send(ServerToAgentMessage::Signaling(SignalingMessage::EndSession {
                     target_id: conn_id.to_string(),
                 }));
@@ -727,7 +911,7 @@ async fn handle_client_signaling(
         } => {
             info!("Client {} requested session for host {} with settings: w={:?}, h={:?}, fps={:?}, bitrate={:?}, codec={:?}, app_id={:?}, chroma={:?}, encoder_csc_mode={:?}", client_id, host_id, width, height, fps, bitrate, codec, app_id, chroma, encoder_csc_mode);
 
-            let previous_host = state.client_to_agent.write().unwrap().remove(client_id);
+            let previous_host = state.client_to_agent.write().unwrap().remove(conn_id);
             let mut stopped_previous_agent_session = false;
             if let Some(previous_host_id) = previous_host {
                 if let Some(agent_tx) = state.agents.read().unwrap().get(&previous_host_id).cloned() {
@@ -790,12 +974,14 @@ async fn handle_client_signaling(
                     );
                     // Fall through to fallback Agent-less code below
                 } else {
-                    // Store client-to-host routing and update status to Busy
-                    state
-                        .client_to_agent
-                        .write()
-                        .unwrap()
-                        .insert(client_id.to_string(), host_id.clone());
+                    // Store client-to-host routing and update status to Busy.
+                    // The agent runs one session: it replaces any other
+                    // connection's, which then must not end it or the status.
+                    {
+                        let mut map = state.client_to_agent.write().unwrap();
+                        map.retain(|_, h| *h != host_id);
+                        map.insert(conn_id.to_string(), host_id.clone());
+                    }
                     state.set_host_status(&host_id, HostStatus::Busy).await;
                     info!(
                         "IncomingSession successfully forwarded to agent {} for client {}",
@@ -819,6 +1005,7 @@ async fn handle_client_signaling(
             ice_servers: _,
             webtransport_port,
             webtransport_cert_hash,
+            webtransport_token,
         } => {
             // target_id is the host_id
             info!(
@@ -840,6 +1027,7 @@ async fn handle_client_signaling(
                     ice_servers: None,
                     webtransport_port,
                     webtransport_cert_hash,
+                    webtransport_token,
                 }));
                 info!("SDP Answer forwarded to agent {}", target_id);
                 return;
@@ -927,6 +1115,21 @@ async fn handle_client_signaling(
                 client_id, target_id
             );
 
+            // Only the connection that holds the host's session ends it;
+            // otherwise another stream on that host would be marked idle.
+            let ours = {
+                let mut map = state.client_to_agent.write().unwrap();
+                let ours = map.get(conn_id).is_some_and(|h| *h == target_id);
+                if ours {
+                    map.remove(conn_id);
+                }
+                ours
+            };
+            if !ours {
+                debug!("EndSession from {} for {} without a session there; ignored", conn_id, target_id);
+                return;
+            }
+
             // Check if there is an online Agent registered for this host_id
             let agent_tx_opt = {
                 let agents = state.agents.read().unwrap();
@@ -940,7 +1143,6 @@ async fn handle_client_signaling(
                         target_id: conn_id.to_string(),
                     },
                 ));
-                state.client_to_agent.write().unwrap().remove(client_id);
                 state.set_host_status(&target_id, HostStatus::Online).await;
                 info!("EndSession forwarded to agent {}", target_id);
                 return;
@@ -954,7 +1156,6 @@ async fn handle_client_signaling(
             if let Some(session) = session {
                 let _ = session.peer_connection.close().await;
             }
-            state.client_to_agent.write().unwrap().remove(client_id);
             state.set_host_status(&target_id, HostStatus::Online).await;
         }
 
@@ -1024,4 +1225,213 @@ async fn handle_client_signaling(
     }
 }
 
+/// The host a client message is about, if any.
+fn addressed_host(sig: &SignalingMessage) -> Option<&str> {
+    match sig {
+        SignalingMessage::RequestSession { host_id, .. }
+        | SignalingMessage::RequestFileSession { host_id } => Some(host_id),
+        SignalingMessage::Sdp { target_id, .. }
+        | SignalingMessage::IceCandidate { target_id, .. }
+        | SignalingMessage::EndSession { target_id }
+        | SignalingMessage::GetAppList { target_id }
+        | SignalingMessage::StopActiveStream { target_id }
+        | SignalingMessage::GetCapabilities { target_id } => Some(target_id),
+        _ => None,
+    }
+}
 
+/// Whether a client connection may send `sig` to `host_id`: the user may use
+/// the host (same rule as the host list), or it is ending its own session.
+async fn client_may_address(
+    state: &SignalingState,
+    user_id: &str,
+    conn_id: &str,
+    sig: &SignalingMessage,
+    host_id: &str,
+) -> bool {
+    if matches!(sig, SignalingMessage::EndSession { .. }) {
+        let own_stream = state.client_to_agent.read().unwrap().get(conn_id).is_some_and(|h| h == host_id);
+        let own_file = state.file_sessions.read().unwrap().contains_key(conn_id);
+        if own_stream || own_file {
+            return true;
+        }
+    }
+    security::may_use_host(&state.db, user_id, host_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn state() -> Arc<SignalingState> {
+        let db = crate::security::tests::test_db().await;
+        Arc::new(SignalingState::new(db, "t".into(), None))
+    }
+
+    #[tokio::test]
+    async fn closing_a_users_connections() {
+        let state = state().await;
+        let (tx, mut rx) = crate::queue::channel::<ServerToClientMessage>();
+        let (tx2, mut rx2) = crate::queue::channel::<ServerToClientMessage>();
+        state.clients.write().unwrap().insert("c1".into(), tx);
+        state.clients.write().unwrap().insert("c2".into(), tx2);
+        state.client_connections.write().unwrap().insert("c1".into(), "alice".into());
+        state.client_connections.write().unwrap().insert("c2".into(), "bob".into());
+        state.close_user_connections("alice");
+        assert!(rx.recv().await.is_none());
+        state.send_to_conn("c2", ServerToClientMessage::Signaling(SignalingMessage::Error { message: "x".into() }));
+        assert!(rx2.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn agent_ends_only_its_own_sessions() {
+        let state = state().await;
+        let (tx, mut rx) = crate::queue::channel::<ServerToClientMessage>();
+        state.clients.write().unwrap().insert("c1".into(), tx);
+        state.client_to_agent.write().unwrap().insert("c1".into(), "host-a".into());
+        // Another agent can't end it.
+        handle_agent_signaling(SignalingMessage::EndSession { target_id: "c1".into() }, "host-b", state.clone()).await;
+        assert_eq!(state.client_to_agent.read().unwrap().get("c1").map(String::as_str), Some("host-a"));
+        // Its own agent can, and the client hears about it.
+        handle_agent_signaling(SignalingMessage::EndSession { target_id: "c1".into() }, "host-a", state.clone()).await;
+        assert!(state.client_to_agent.read().unwrap().get("c1").is_none());
+        assert!(matches!(
+            rx.recv().await,
+            Some(ServerToClientMessage::Signaling(SignalingMessage::EndSession { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_messages_need_host_access() {
+        let state = state().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash, role, is_active) VALUES ('u1', 'u1', 'x', 'user', 1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let (agent_tx, mut agent_rx) = crate::queue::channel::<ServerToAgentMessage>();
+        state.agents.write().unwrap().insert("h1".into(), agent_tx);
+        let (tx, mut rx) = crate::queue::channel::<ServerToClientMessage>();
+        state.clients.write().unwrap().insert("c1".into(), tx);
+
+        handle_client_signaling(SignalingMessage::GetCapabilities { target_id: "h1".into() }, "u1", "c1", state.clone()).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(ServerToClientMessage::Signaling(SignalingMessage::Error { .. }))
+        ));
+
+        // In a group with the host: forwarded.
+        sqlx::query("INSERT INTO hosts (id, name, status) VALUES ('h1', 'H1', 'Online')").execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO groups (id, name) VALUES ('g', 'G')").execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO host_groups VALUES ('h1', 'g')").execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO user_groups VALUES ('u1', 'g')").execute(&state.db).await.unwrap();
+        handle_client_signaling(SignalingMessage::GetCapabilities { target_id: "h1".into() }, "u1", "c1", state.clone()).await;
+        assert!(matches!(
+            agent_rx.recv().await,
+            Some(ServerToAgentMessage::Signaling(SignalingMessage::GetCapabilities { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_key_is_stored_then_required() {
+        let state = state().await;
+        let key = "00112233445566778899aabbccddeeff";
+        // Old agent, new id: accepted, nothing stored.
+        assert!(check_agent_key(&state, "h1", "PC", None).await.unwrap());
+        // First key: stored.
+        assert!(check_agent_key(&state, "h1", "PC", Some(key)).await.unwrap());
+        assert!(check_agent_key(&state, "h1", "PC", Some(key)).await.unwrap());
+        // Someone else with the shared token can't take the id over.
+        assert!(!check_agent_key(&state, "h1", "PC", Some("ffffffffffffffffffffffffffffffff")).await.unwrap());
+        assert!(!check_agent_key(&state, "h1", "PC", None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn key_cannot_claim_an_online_keyless_agent() {
+        let state = state().await;
+        let key = "00112233445566778899aabbccddeeff";
+        // An old agent (no key) is online as h1.
+        let (tx, _rx) = crate::queue::channel::<ServerToAgentMessage>();
+        state.agents.write().unwrap().insert("h1".into(), tx);
+        assert!(!check_agent_key(&state, "h1", "PC", Some(key)).await.unwrap());
+        let hash: Option<String> = sqlx::query_scalar("SELECT agent_key_hash FROM hosts WHERE id = 'h1'")
+            .fetch_optional(&state.db)
+            .await
+            .unwrap()
+            .flatten();
+        assert!(hash.is_none());
+        // The old agent itself may still reconnect.
+        assert!(check_agent_key(&state, "h1", "PC", None).await.unwrap());
+        // Offline: the first key is stored as before.
+        state.agents.write().unwrap().remove("h1");
+        assert!(check_agent_key(&state, "h1", "PC", Some(key)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn agent_token_limit_tolerates_retrying_agents() {
+        let state = state().await;
+        let limit = &state.agent_token_limit;
+        let now = std::time::Instant::now();
+        // A stale agent retrying every 3 s for 5 minutes.
+        for _ in 0..100 {
+            limit.record_failure("10.0.0.9", now);
+        }
+        assert!(!limit.is_blocked("10.0.0.9", now));
+        for _ in 0..200 {
+            limit.record_failure("10.0.0.9", now);
+        }
+        assert!(limit.is_blocked("10.0.0.9", now));
+    }
+
+    async fn host_status(state: &SignalingState, id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM hosts WHERE id = ?").bind(id).fetch_one(&state.db).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_the_sessions_connection_ends_it() {
+        let state = state().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash, role, is_active) VALUES ('a', 'a', 'x', 'admin', 1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO hosts (id, name, status) VALUES ('h1', 'H1', 'Online')").execute(&state.db).await.unwrap();
+        let (agent_tx, mut agent_rx) = crate::queue::channel::<ServerToAgentMessage>();
+        state.agents.write().unwrap().insert("h1".into(), agent_tx);
+        for conn in ["c1", "c2"] {
+            let (tx, _rx) = crate::queue::channel::<ServerToClientMessage>();
+            state.clients.write().unwrap().insert(conn.into(), tx);
+        }
+        let request = || SignalingMessage::RequestSession {
+            host_id: "h1".into(),
+            width: None,
+            height: None,
+            fps: None,
+            bitrate: None,
+            codec: None,
+            app_id: None,
+            encoder: None,
+            display_id: None,
+            chroma: None,
+            encoder_csc_mode: None,
+            microphone: None,
+        };
+        handle_client_signaling(request(), "a", "c1", state.clone()).await;
+        // A second connection takes the host over (the agent runs one session).
+        handle_client_signaling(request(), "a", "c2", state.clone()).await;
+        assert!(state.client_to_agent.read().unwrap().get("c1").is_none());
+        assert_eq!(host_status(&state, "h1").await, "Busy");
+        while agent_rx.rx_try().is_some() {}
+
+        // c1 ending "its" session: nothing reaches the agent, h1 stays busy.
+        handle_client_signaling(SignalingMessage::EndSession { target_id: "h1".into() }, "a", "c1", state.clone()).await;
+        assert!(agent_rx.rx_try().is_none());
+        assert_eq!(host_status(&state, "h1").await, "Busy");
+
+        // c2 ends it for real.
+        handle_client_signaling(SignalingMessage::EndSession { target_id: "h1".into() }, "a", "c2", state.clone()).await;
+        assert!(matches!(
+            agent_rx.rx_try(),
+            Some(ServerToAgentMessage::Signaling(SignalingMessage::EndSession { .. }))
+        ));
+        assert_eq!(host_status(&state, "h1").await, "Online");
+    }
+}

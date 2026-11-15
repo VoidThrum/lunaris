@@ -31,6 +31,9 @@ struct HostStatus {
     /// Clients may share the clipboard / send files to this computer.
     allow_clipboard: bool,
     allow_file_transfer: bool,
+    /// File transfer may reach the whole disk, not only the home folder
+    /// (`file_access` "full").
+    full_disk_access: bool,
     /// "password", "click" or "password-click" (agent/src/approval.rs).
     approve_mode: String,
     error: String,
@@ -192,6 +195,7 @@ pub fn status_json() -> String {
             input_ready: input_ready(),
             allow_clipboard: config.allow_clipboard,
             allow_file_transfer: config.allow_file_transfer,
+            full_disk_access: config.file_access.trim() == "full",
             approve_mode: config.approve_mode.clone(),
             error: String::new(),
         },
@@ -205,6 +209,7 @@ pub fn status_json() -> String {
             input_ready: input_ready(),
             allow_clipboard: true,
             allow_file_transfer: true,
+            full_disk_access: false,
             approve_mode: "password-click".into(),
             error,
         },
@@ -551,6 +556,15 @@ pub fn set_sharing(clipboard: bool, files: bool) -> Result<(), String> {
     let mut config = load_or_create_config()?;
     config.allow_clipboard = clipboard;
     config.allow_file_transfer = files;
+    save(&config)?;
+    restart_if_ours()
+}
+
+/// Whether file transfer may reach the whole disk ("full") or only the home
+/// folder ("home", the default). Restarts the app's agent.
+pub fn set_file_access(full: bool) -> Result<(), String> {
+    let mut config = load_or_create_config()?;
+    config.file_access = if full { "full" } else { "home" }.to_string();
     save(&config)?;
     restart_if_ours()
 }

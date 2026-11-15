@@ -49,7 +49,45 @@ pub struct AgentConfig {
     /// RustDesk.
     #[serde(default = "default_approve_mode")]
     pub approve_mode: String,
+    /// Sessions that arrive through the Lunaris server (`server_url`):
+    /// "trusted" (the default) lets in whoever the server lets through, for
+    /// unattended access through one's own server; "ask" puts every screen
+    /// or file session to the person at this computer (approval.rs) and
+    /// refuses it when they decline or nobody is there to answer.
+    #[serde(default = "default_server_sessions")]
+    pub server_sessions: String,
+    /// SHA-256 (hex) of the server's TLS certificate, pinned on the first
+    /// connection when it is not valid by the system's roots (the server's
+    /// own self-signed certificate), and `server_cert_host` the `host:port`
+    /// it belongs to. Later connections must present the same certificate;
+    /// clear both to accept a new one.
+    #[serde(default)]
+    pub server_cert_sha256: String,
+    #[serde(default)]
+    pub server_cert_host: String,
+    /// What file transfer (files.rs) may reach: "home" (the home folder),
+    /// "full" (the whole disk) or an absolute folder. Empty (not set) means
+    /// "home", except for the Windows service's agent, which runs as
+    /// LocalSystem and so gets "full" (lib.rs `file_access_setting`).
+    #[serde(default)]
+    pub file_access: String,
+    /// This agent's own secret for the server (64 hex characters, generated
+    /// when missing), sent as `key` on `/ws/agent`.
+    #[serde(default)]
+    pub agent_key: String,
 }
+
+impl Default for AgentConfig {
+    /// Every field at its serde default (no id, no password).
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("every field has a default")
+    }
+}
+
+fn default_server_sessions() -> String {
+    "trusted".to_string()
+}
+
 
 fn default_approve_mode() -> String {
     "password-click".to_string()
@@ -63,16 +101,49 @@ pub fn default_direct_port() -> u16 {
     8091
 }
 
+/// Bytes from the OS random source.
+pub fn random_bytes(n: usize) -> Vec<u8> {
+    use ring::rand::SecureRandom;
+    let mut buf = vec![0u8; n];
+    let rng = ring::rand::SystemRandom::new();
+    // It does not fail on supported systems; retry rather than use weak bytes.
+    for _ in 0..8 {
+        if rng.fill(&mut buf).is_ok() {
+            return buf;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Last resort, still OS randomness (getrandom through uuid).
+    buf.iter_mut()
+        .zip(std::iter::repeat_with(|| *uuid::Uuid::new_v4().as_bytes()).flatten())
+        .for_each(|(b, r)| *b = r);
+    buf
+}
+
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// `count` characters from `alphabet`, uniformly: bytes at or above the
+/// largest multiple of the alphabet size are thrown away (no modulo bias).
+fn random_chars(alphabet: &[u8], count: usize) -> Vec<char> {
+    let limit = 256 - 256 % alphabet.len();
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        for b in random_bytes(count * 2) {
+            if (b as usize) < limit && out.len() < count {
+                out.push(alphabet[b as usize % alphabet.len()] as char);
+            }
+        }
+    }
+    out
+}
+
 /// A new access password like "k7wq-3mzp-x9tr" (unambiguous lowercase letters
-/// and digits, ~62 bits of entropy).
+/// and digits, ~59 bits of entropy).
 pub fn generate_direct_password() -> String {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
-    let bytes = *uuid::Uuid::new_v4().as_bytes();
-    let chars: Vec<char> = bytes
-        .iter()
-        .take(12)
-        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
-        .collect();
+    let chars = random_chars(ALPHABET, 12);
     format!(
         "{}-{}-{}",
         chars[0..4].iter().collect::<String>(),
@@ -93,6 +164,16 @@ pub fn ensure_direct_password(config: &mut AgentConfig) -> bool {
 }
 
 
+/// Gives the config its own key for the server when it has none (or a
+/// malformed one); returns whether it changed.
+pub fn ensure_agent_key(config: &mut AgentConfig) -> bool {
+    let key = config.agent_key.trim();
+    if key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    config.agent_key = to_hex(&random_bytes(32));
+    true
+}
 
 static CONFIG_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -142,16 +223,61 @@ pub fn load_config(path: &str) -> Result<AgentConfig, anyhow::Error> {
     Ok(config)
 }
 
+/// Saves the config. It holds the access password, the server token and
+/// the agent key, so on unix it is created owner-only (0600) from the start,
+/// written to a new file next to it and renamed over the old one; on Windows
+/// it gets the folder's permissions (win_service.rs locks the service's).
 pub fn save_config(config: &AgentConfig, path: &str) -> Result<(), anyhow::Error> {
     let content = serde_json::to_string_pretty(config)?;
-    fs::write(path, content)?;
-    // The file holds the server token and the client key: owner-only.
+    write_private(std::path::Path::new(path), content.as_bytes())?;
+    Ok(())
+}
+
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let tmp = dir.join(format!(".{}.{}.tmp", name.to_string_lossy(), to_hex(&random_bytes(6))));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    Ok(())
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Changes the config file on disk: read again first, so what the app or
+/// another process saved meanwhile is kept. `current` is used when there is
+/// no file yet.
+pub fn update_config_file(
+    path: &str,
+    current: &AgentConfig,
+    change: impl FnOnce(&mut AgentConfig),
+) -> Result<(), anyhow::Error> {
+    let mut config = if std::path::Path::new(path).exists() {
+        load_config(path)?
+    } else {
+        current.clone()
+    };
+    change(&mut config);
+    save_config(&config, path)
 }
 
 pub fn import_config_file(imported_path: &str, target_path: &str) -> Result<(), anyhow::Error> {
@@ -331,5 +457,67 @@ pub fn set_autostart_enabled_impl(enabled: bool) {
                 ])
                 .output();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passwords_use_the_alphabet_and_differ() {
+        let a = generate_direct_password();
+        let b = generate_direct_password();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 14);
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|p| p.len() == 4));
+        assert!(a.bytes().filter(|&c| c != b'-').all(|c| b"abcdefghjkmnpqrstuvwxyz23456789".contains(&c)));
+    }
+
+    #[test]
+    fn agent_key_is_64_hex_and_kept() {
+        let mut c = AgentConfig::default();
+        assert!(ensure_agent_key(&mut c));
+        assert_eq!(c.agent_key.len(), 64);
+        assert!(c.agent_key.bytes().all(|b| b.is_ascii_hexdigit()));
+        let key = c.agent_key.clone();
+        assert!(!ensure_agent_key(&mut c));
+        assert_eq!(c.agent_key, key);
+        c.agent_key = "short".into();
+        assert!(ensure_agent_key(&mut c));
+    }
+
+    #[test]
+    fn defaults_for_new_fields() {
+        let c: AgentConfig = serde_json::from_str(r#"{"server_url":"x"}"#).unwrap();
+        assert_eq!(c.server_sessions, "trusted");
+        assert_eq!(c.file_access, "");
+        assert!(c.server_cert_sha256.is_empty() && c.agent_key.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_is_saved_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("lunaris-pairing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent_config.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut c = AgentConfig::default();
+        c.direct_password = "secret".into();
+        save_config(&c, path.to_str().unwrap()).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(load_config(path.to_str().unwrap()).unwrap().direct_password, "secret");
+        // No temporary file left behind.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        update_config_file(path.to_str().unwrap(), &c, |c| c.agent_key = "k".into()).unwrap();
+        let back = load_config(path.to_str().unwrap()).unwrap();
+        assert_eq!((back.agent_key.as_str(), back.direct_password.as_str()), ("k", "secret"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

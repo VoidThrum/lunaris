@@ -49,7 +49,7 @@ impl ApproveMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     /// See and control the screen.
     Control,
@@ -144,10 +144,35 @@ fn answer(id: u64, accept: bool) {
     }
 }
 
+/// What the person here is asked about for a signaling message; None for
+/// messages that need no permission.
+pub fn kind_of(sig: &common::SignalingMessage) -> Option<Kind> {
+    use common::SignalingMessage::*;
+    match sig {
+        RequestSession { .. } | IncomingSession { .. } => Some(Kind::Control),
+        RequestFileSession { .. } | IncomingFileSession { .. } => Some(Kind::Files),
+        _ => None,
+    }
+}
+
+/// Messages a client may send before it is accepted: questions about the
+/// computer, and the end of its own connection; nothing that shows or
+/// changes anything.
+pub fn allowed_before_approval(sig: &common::SignalingMessage) -> bool {
+    use common::SignalingMessage::*;
+    matches!(sig, GetCapabilities { .. } | GetAppList { .. } | EndSession { .. })
+}
+
 /// Asks the person here to let `requester` in; waits up to [`TIMEOUT`].
 pub async fn ask(requester: &str, kind: Kind) -> Decision {
+    ask_unless(requester, kind, std::future::pending::<()>()).await.unwrap_or(Decision::Denied)
+}
+
+/// Like [`ask`], but withdrawn when `cancel` completes first (the one
+/// asking went away): the question is taken down and None returned.
+pub async fn ask_unless(requester: &str, kind: Kind, cancel: impl std::future::Future<Output = ()>) -> Option<Decision> {
     if !attended() {
-        return Decision::Unattended;
+        return Some(Decision::Unattended);
     }
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = oneshot::channel();
@@ -163,16 +188,22 @@ pub async fn ask(requester: &str, kind: Kind) -> Decision {
     };
     info!("Asking to accept a connection from {:?} ({:?})", requester, kind);
     emit(&format!("@lunaris-approval {}", serde_json::to_string(&question).unwrap_or_default()));
-    let decision = match tokio::time::timeout(TIMEOUT, rx).await {
-        Ok(Ok(true)) => Decision::Accepted,
-        Ok(_) => Decision::Denied,
-        Err(_) => Decision::Timeout,
+    let decision = tokio::select! {
+        answer = tokio::time::timeout(TIMEOUT, rx) => Some(match answer {
+            Ok(Ok(true)) => Decision::Accepted,
+            Ok(_) => Decision::Denied,
+            Err(_) => Decision::Timeout,
+        }),
+        _ = cancel => None,
     };
-    if decision != Decision::Accepted {
+    if decision != Some(Decision::Accepted) {
         PENDING.lock().unwrap().as_mut().map(|m| m.remove(&id));
         emit(&format!("@lunaris-approval-cancel {{\"id\":{}}}", id));
     }
-    info!("Connection from {:?}: {}", requester, decision.status());
+    match decision {
+        Some(d) => info!("Connection from {:?}: {}", requester, d.status()),
+        None => info!("Connection from {:?}: withdrawn before an answer", requester),
+    }
     decision
 }
 

@@ -21,12 +21,19 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 
+# Each tag is pinned to the commit it pointed to when chosen (checked after the clone);
+# when bumping a version, update the commit with it.
 NVCODEC_VERSION=n12.2.72.0
+NVCODEC_COMMIT=c69278340ab1d5559c7d7bf0edf615dc33ddbba7
 AMF_VERSION=v1.4.36
+AMF_COMMIT=16f7d73e0b45c473e903e46981ed0b91efc4c091
 X264_BRANCH=stable
 SVTAV1_VERSION=v2.3.0
+SVTAV1_COMMIT=6e69def4ec283fe0b71195671245c3b768bebdef
 DAV1D_VERSION=1.5.1
+DAV1D_COMMIT=42b2b24fb8819f1ed3643aa9cf2a62f03868e3aa
 FFMPEG_VERSION=n8.1
+FFMPEG_COMMIT=9047fa1b084f76b1b4d065af2d743df1b40dfb56
 
 DEPS="$WORK/deps"            # static dependencies, not shipped
 export PKG_CONFIG_PATH="$DEPS/lib/pkgconfig"
@@ -34,7 +41,19 @@ export PKG_CONFIG_LIBDIR="$DEPS/lib/pkgconfig"
 LIC="$OUT/share/licenses"
 mkdir -p "$LIC" "$DEPS"
 
-clone() { git clone -q --depth 1 -b "$2" "$1" "$3"; }
+# clone <url> <tag> <dir> [expected commit]
+check_commit() {
+    local got
+    got="$(git -C "$1" rev-parse HEAD)"
+    if [ "$got" != "$3" ]; then
+        echo "ERROR: $2 is at $got, expected $3. The tag was moved or the host was tampered with; check it before updating the pinned commit." >&2
+        exit 1
+    fi
+}
+clone() {
+    git clone -q --depth 1 -b "$2" "$1" "$3"
+    if [ -n "${4:-}" ]; then check_commit "$3" "$1 tag $2" "$4"; fi
+}
 
 cat > cross.cmake <<EOF
 set(CMAKE_SYSTEM_NAME Windows)
@@ -49,13 +68,14 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 EOF
 
 echo "== nv-codec-headers $NVCODEC_VERSION"
-clone https://github.com/FFmpeg/nv-codec-headers.git "$NVCODEC_VERSION" nvcodec
+clone https://github.com/FFmpeg/nv-codec-headers.git "$NVCODEC_VERSION" nvcodec "$NVCODEC_COMMIT"
 make -C nvcodec PREFIX="$DEPS" install >/dev/null
 install -Dm644 nvcodec/README "$LIC/nv-codec-headers/README"
 
 echo "== AMF headers $AMF_VERSION"
 git clone -q --depth 1 -b "$AMF_VERSION" --filter=blob:none --sparse \
     https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git amf
+check_commit amf "AMF tag $AMF_VERSION" "$AMF_COMMIT"
 git -C amf sparse-checkout set amf/public/include
 mkdir -p "$DEPS/include/AMF"
 cp -r amf/amf/public/include/* "$DEPS/include/AMF/"
@@ -70,7 +90,7 @@ install -Dm644 x264/COPYING "$LIC/x264/COPYING"
 git -C x264 rev-parse HEAD > "$LIC/x264/VERSION"
 
 echo "== SVT-AV1 $SVTAV1_VERSION"
-clone https://gitlab.com/AOMediaCodec/SVT-AV1.git "$SVTAV1_VERSION" svtav1
+clone https://gitlab.com/AOMediaCodec/SVT-AV1.git "$SVTAV1_VERSION" svtav1 "$SVTAV1_COMMIT"
 cmake -S svtav1 -B svtav1/build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$WORK/cross.cmake" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$DEPS" -DCMAKE_INSTALL_LIBDIR=lib \
     -DBUILD_SHARED_LIBS=OFF -DBUILD_APPS=OFF -DBUILD_DEC=OFF -DBUILD_TESTING=OFF \
@@ -80,7 +100,7 @@ install -Dm644 svtav1/LICENSE.md "$LIC/svt-av1/LICENSE.md"
 install -Dm644 svtav1/PATENTS.md "$LIC/svt-av1/PATENTS.md"
 
 echo "== dav1d $DAV1D_VERSION"
-clone https://code.videolan.org/videolan/dav1d.git "$DAV1D_VERSION" dav1d
+clone https://code.videolan.org/videolan/dav1d.git "$DAV1D_VERSION" dav1d "$DAV1D_COMMIT"
 meson setup dav1d/build dav1d --cross-file dav1d/package/crossfiles/x86_64-w64-mingw32.meson \
     --prefix="$DEPS" --libdir=lib --buildtype=release --default-library=static \
     -Denable_tools=false -Denable_tests=false >/dev/null
@@ -88,7 +108,7 @@ ninja -C dav1d/build install >/dev/null
 install -Dm644 dav1d/COPYING "$LIC/dav1d/COPYING"
 
 echo "== FFmpeg $FFMPEG_VERSION"
-clone https://github.com/FFmpeg/FFmpeg.git "$FFMPEG_VERSION" ffmpeg
+clone https://github.com/FFmpeg/FFmpeg.git "$FFMPEG_VERSION" ffmpeg "$FFMPEG_COMMIT"
 (cd ffmpeg && exec ./configure --prefix="$OUT" --target-os=mingw32 --arch=x86_64 --cross-prefix="$HOST-" \
     --pkg-config=pkg-config --pkg-config-flags=--static \
     --enable-shared --disable-static \

@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -51,7 +50,7 @@ use crate::video::h264::payloader::H264Payloader;
 use crate::video::h264::reader::H264Reader;
 use crate::video::h265::payloader::H265Payloader;
 use crate::video::h265::reader::H265Reader;
-use crate::video::trim_bytes_to_range;
+use crate::video::{frame_buffer, trim_bytes_to_range};
 
 // We reuse the same channel IDs
 use crate::input::TransportChannelId;
@@ -62,6 +61,46 @@ const FLEX_FEC_PAYLOAD_TYPE: u8 = 49;
 
 fn random_ssrc() -> u32 {
     (uuid::Uuid::new_v4().as_u128() & 0xFFFF_FFFF) as u32
+}
+
+type PipelineCmdSlot =
+    Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<lunaris_media::pipeline::PipelineCommand>>>>;
+
+/// Asks the encoder for a key frame after a frame was dropped before it was
+/// packetised, at most once per `KEYFRAME_AFTER_DROP_INTERVAL` so a backlog
+/// does not ask for one per frame.
+struct KeyframeRequester {
+    pipeline_cmd: PipelineCmdSlot,
+    last_request: Option<Instant>,
+}
+
+const KEYFRAME_AFTER_DROP_INTERVAL: Duration = Duration::from_millis(500);
+
+impl KeyframeRequester {
+    fn new(pipeline_cmd: PipelineCmdSlot) -> Self {
+        Self { pipeline_cmd, last_request: None }
+    }
+
+    /// Whether a request is due now (and records it).
+    fn due(&mut self, now: Instant) -> bool {
+        if self
+            .last_request
+            .is_some_and(|last| now.duration_since(last) < KEYFRAME_AFTER_DROP_INTERVAL)
+        {
+            return false;
+        }
+        self.last_request = Some(now);
+        true
+    }
+
+    fn request(&mut self) {
+        if !self.due(Instant::now()) {
+            return;
+        }
+        if let Some(ref cmd_tx) = *self.pipeline_cmd.lock().unwrap() {
+            let _ = cmd_tx.try_send(lunaris_media::pipeline::PipelineCommand::RequestKeyframe);
+        }
+    }
 }
 
 /// The payload type of FlexFEC-03 in an SDP answer, when the answer accepted
@@ -163,6 +202,8 @@ pub struct BridgeSession {
     pub peer_connection: Arc<dyn PeerConnection>,
     pub webtransport_port: Option<u16>,
     pub webtransport_cert_hash: Option<String>,
+    /// Secret the client puts in the WebTransport URL path (`/<token>`).
+    pub webtransport_token: Option<String>,
     pub _webtransport_endpoint:
         Option<Arc<wtransport::Endpoint<wtransport::endpoint::endpoint_side::Server>>>,
     pub webtransport_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -647,8 +688,6 @@ pub async fn setup_bridge_session(
     let mut spawned_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let pipeline_cmd_tx_for_pli = pipeline_cmd_tx_shared.clone();
 
-    let need_idr_flag = Arc::new(AtomicBool::new(true));
-    let need_idr_clone = need_idr_flag.clone();
     let video_track_for_rtcp = video_track.clone();
     // The client's RTCP about the video stream (PLI, FIR, NACK, REMB), which
     // 0.17 returned from `RTCRtpSender::read`, arrives as track events (see
@@ -695,7 +734,6 @@ pub async fn setup_bridge_session(
                         // Enough time has passed — honor this PLI and generate IDR.
                         info!("Received PLI/FIR from the client, requesting IDR frame (last IDR {}ms ago)", elapsed_ms);
                         last_pli_idr_time = now;
-                        need_idr_clone.store(true, Ordering::SeqCst);
                         if let Some(ref cmd_tx) = *pipeline_cmd_tx_for_pli.lock().unwrap() {
                             let _ = cmd_tx.try_send(lunaris_media::pipeline::PipelineCommand::RequestKeyframe);
                         }
@@ -969,7 +1007,12 @@ pub async fn setup_bridge_session(
         // starve the mouse task when the pipeline is CPU-heavy (e.g. encoding
         // 60 fps high-motion), causing progressive input lag. A dedicated thread
         // guarantees the OS scheduler gives mouse injection its own time slice.
-        let input_task = std::thread::Builder::new()
+        // The input threads are detached: they end by themselves when every
+        // sender of their channel is gone (the session's data channel tasks
+        // and WebTransport connections), which aborting a task could not
+        // force anyway. Waiting for them in a task would hold a runtime
+        // worker for the whole session.
+        std::thread::Builder::new()
             .name("lunaris-mouse-input".into())
             .spawn(move || {
                 info!("InputInjector: started mouse input processing thread");
@@ -980,14 +1023,9 @@ pub async fn setup_bridge_session(
                 info!("InputInjector: stopped mouse input processing thread");
             })
             .expect("Failed to spawn mouse input thread");
-        // Wrap in a no-op tokio task so the cleanup code still works
-        let input_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-            let _ = input_task.join();
-        });
-        spawned_tasks.push(input_task);
 
         // Dedicated OS thread for keyboard — same reasoning as mouse.
-        let key_input_task = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("lunaris-key-input".into())
             .spawn(move || {
                 info!("InputInjector: started keyboard input processing thread");
@@ -997,10 +1035,6 @@ pub async fn setup_bridge_session(
                 info!("InputInjector: stopped keyboard input processing thread");
             })
             .expect("Failed to spawn keyboard input thread");
-        let key_input_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-            let _ = key_input_task.join();
-        });
-        spawned_tasks.push(key_input_task);
     } else {
         error!(
             "InputInjector: no input backend available — remote mouse/keyboard disabled. \
@@ -1017,6 +1051,7 @@ pub async fn setup_bridge_session(
     let general_channel_for_media = general_channel_for_cursor.clone();
     let latest_host_cursor_for_media = latest_host_cursor_payload.clone();
     let active_display_id_for_media = display_id.clone();
+    let mut keyframe_after_ingress_drop = KeyframeRequester::new(pipeline_cmd_tx_shared.clone());
     let media_event_task = tokio::spawn(async move {
         let mut metrics_started = Instant::now();
         let mut forwarded_frames: u64 = 0;
@@ -1070,6 +1105,8 @@ pub async fn setup_bridge_session(
                     if let Err(e) = video_frame_tx_clone.try_send(payload) {
                         dropped_frames += 1;
                         warn!("Failed to forward video frame to packager: {:?}", e);
+                        // The next frames reference the dropped one.
+                        keyframe_after_ingress_drop.request();
                     } else {
                         forwarded_frames += 1;
                         forwarded_bytes += frame_size;
@@ -1185,7 +1222,6 @@ pub async fn setup_bridge_session(
     });
     spawned_tasks.push(media_event_task);
     let video_track_clone = video_track.clone();
-    let need_idr_clone_worker = need_idr_flag.clone();
     let pipeline_cmd_tx_for_writer = pipeline_cmd_tx_shared.clone();
 
     let video_packager_task = tokio::spawn(async move {
@@ -1199,7 +1235,7 @@ pub async fn setup_bridge_session(
         let (packet_tx, mut packet_rx) =
             tokio::sync::mpsc::channel::<Vec<Packet>>(RTP_FRAME_QUEUE_CAPACITY);
 
-        let need_idr_clone_writer = need_idr_clone_worker.clone();
+        let mut keyframe_after_queue_drop = KeyframeRequester::new(pipeline_cmd_tx_for_writer.clone());
         let pipeline_cmd_tx_for_writer = pipeline_cmd_tx_for_writer.clone();
         // Send pacing. Structure of Sunshine's video broadcast loop
         // (stream.cpp:1740-1900): a frame's packets leave in 1 ms groups, each
@@ -1258,7 +1294,6 @@ pub async fn setup_bridge_session(
                             discarded_count,
                             queue_len
                         );
-                        need_idr_clone_writer.store(true, Ordering::SeqCst);
                         if let Some(ref cmd_tx) = *pipeline_cmd_tx_for_writer.lock().unwrap() {
                             let _ = cmd_tx.try_send(
                                 lunaris_media::pipeline::PipelineCommand::RequestKeyframe,
@@ -1386,7 +1421,7 @@ pub async fn setup_bridge_session(
             let mut samples = Vec::new();
             match &mut payloader {
                 VideoPayloader::H264(_) => {
-                    let mut reader = H264Reader::new(Cursor::new(full_frame), 0);
+                    let mut reader = H264Reader::new(frame_buffer(full_frame));
                     while let Ok(Some(nal)) = reader.next_nal() {
                         if nal.header.nal_unit_type == crate::video::h264::NalUnitType::FillerData {
                             continue;
@@ -1399,7 +1434,7 @@ pub async fn setup_bridge_session(
                     }
                 }
                 VideoPayloader::H265(_) => {
-                    let mut reader = H265Reader::new(Cursor::new(full_frame), 0);
+                    let mut reader = H265Reader::new(frame_buffer(full_frame));
                     while let Ok(Some(nal)) = reader.next_nal() {
                         if nal.header.nal_unit_type
                             == crate::video::h265::reader::NalUnitType::FdNut
@@ -1418,7 +1453,7 @@ pub async fn setup_bridge_session(
                     // Annex-B NAL stream. The WebRTC AV1 payloader parses the OBU
                     // sequence itself, so pass the complete encoded frame through.
                     if !full_frame.is_empty() {
-                        samples.push(bytes::BytesMut::from(full_frame.as_slice()));
+                        samples.push(frame_buffer(full_frame));
                     }
                 }
             }
@@ -1478,7 +1513,9 @@ pub async fn setup_bridge_session(
             );
             if let Err(e) = packet_tx.try_send(packets) {
                 warn!("RTP frame queue full, dropping frame: {:?}", e);
-                need_idr_clone_worker.store(true, Ordering::SeqCst);
+                // Sequence numbers are assigned by the writer, so the client
+                // sees no gap: it needs a key frame to recover.
+                keyframe_after_queue_drop.request();
             }
 
             if frame_count % 120 == 0 {
@@ -1498,9 +1535,25 @@ pub async fn setup_bridge_session(
     let mut webtransport_cert_hash = None;
     let mut webtransport_endpoint = None;
     let mut webtransport_shutdown = None;
+    let mut webtransport_token = None;
 
-    match wtransport::Identity::self_signed(&["localhost", "127.0.0.1", "::1"]) {
-        Ok(identity) => {
+    // The token in the WebTransport URL path proves a connection comes from
+    // this session's client (it travels in the signaling offer). Without a
+    // random source there is no endpoint: input stays on the data channels.
+    let token = match new_webtransport_token() {
+        Ok(token) => Some(token),
+        Err(e) => {
+            error!("WebTransport disabled for this session: {}", e);
+            None
+        }
+    };
+
+    match token.map(|token| (token, wtransport::Identity::self_signed(&["localhost", "127.0.0.1", "::1"]))) {
+        None => {}
+        Some((_, Err(e))) => {
+            error!("Failed to generate self-signed certificate: {:?}", e);
+        }
+        Some((token, Ok(identity))) => {
             let cert_hash = identity.certificate_chain().as_slice()[0]
                 .hash()
                 .as_ref()
@@ -1540,93 +1593,27 @@ pub async fn setup_bridge_session(
                         info!("WebTransport server listening on port {}", port);
                         webtransport_port = Some(port);
                         webtransport_cert_hash = Some(cert_hash);
+                        webtransport_token = Some(token.clone());
 
                         let endpoint_arc = Arc::new(endpoint);
                         webtransport_endpoint = Some(endpoint_arc.clone());
 
-                        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
                         webtransport_shutdown = Some(shutdown_tx);
 
-                        let input_tx_clone = input_tx.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    incoming = endpoint_arc.accept() => {
-                                        let input_tx = input_tx_clone.clone();
-                                        tokio::spawn(async move {
-                                            info!(
-                                                "Incoming WebTransport session from {}",
-                                                incoming.remote_address()
-                                            );
-                                            let session_request = match incoming.await {
-                                                Ok(req) => req,
-                                                Err(e) => {
-                                                    error!(
-                                                        "WebTransport session handshake failed: {:?}",
-                                                        e
-                                                    );
-                                                    return;
-                                                }
-                                            };
-                                            let connection = match session_request.accept().await {
-                                                Ok(conn) => conn,
-                                                Err(e) => {
-                                                    error!("WebTransport session accept failed: {:?}", e);
-                                                    return;
-                                                }
-                                            };
-                                            info!("WebTransport session accepted successfully");
-                                            let last_timestamp = Arc::new(std::sync::atomic::AtomicU32::new(0));
-                                            loop {
-                                                match connection.receive_datagram().await {
-                                                    Ok(datagram) => {
-                                                        if datagram.len() < 1 {
-                                                            continue;
-                                                        }
-                                                        let channel_id = datagram[0];
-                                                        let payload = &datagram[1..];
-                                                        let Some(packet) = InboundPacket::deserialize(
-                                                            TransportChannel(channel_id),
-                                                            payload,
-                                                        ) else {
-                                                            warn!(
-                                                                "WebTransport: Failed to deserialize packet on channel {}, payload len: {}",
-                                                                channel_id,
-                                                                payload.len()
-                                                            );
-                                                            continue;
-                                                        };
-                                                        let _ = input_tx.send((packet, last_timestamp.clone()));
-                                                    }
-                                                    Err(e) => {
-                                                        info!("WebTransport connection closed: {:?}", e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    }
-                                    _ = &mut shutdown_rx => {
-                                        info!("WebTransport accept loop received shutdown signal, exiting.");
-                                        // Close the session's connections too: an open
-                                        // connection keeps the UDP port until its idle
-                                        // timeout, and the next session then has to take
-                                        // a random port.
-                                        endpoint_arc.close(wtransport::VarInt::from_u32(0), b"session ended");
-                                        break;
-                                    }
-                                }
-                            }
-                        });
+                        let gate = Arc::new(WebTransportGate::new(token));
+                        tokio::spawn(serve_webtransport_input(
+                            endpoint_arc,
+                            gate,
+                            input_tx.clone(),
+                            shutdown_rx,
+                        ));
                     }
                 }
                 Err(e) => {
                     error!("Failed to start WebTransport endpoint: {:?}", e);
                 }
             }
-        }
-        Err(e) => {
-            error!("Failed to generate self-signed certificate: {:?}", e);
         }
     }
 
@@ -1636,11 +1623,195 @@ pub async fn setup_bridge_session(
         peer_connection,
         webtransport_port,
         webtransport_cert_hash,
+        webtransport_token,
         _webtransport_endpoint: webtransport_endpoint,
         webtransport_shutdown,
         pipeline_cmd,
         spawned_tasks,
     }))
+}
+
+/// Failed WebTransport handshakes (bad token, broken handshake) after which a
+/// session's endpoint accepts no more connections.
+const WEBTRANSPORT_MAX_FAILED_HANDSHAKES: u32 = 20;
+
+/// A random per-session secret, 32 bytes as hex, from the OS random source
+/// (through rustls' ring provider, which wtransport already uses).
+fn new_webtransport_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    wtransport::tls::rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut bytes)
+        .map_err(|_| "no OS random source for the WebTransport token".to_string())?;
+    Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Compares in time independent of where the inputs differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Who may feed input through a session's WebTransport endpoint: a request
+/// whose path is `/<token>`, one connection at a time, and nobody once too
+/// many handshakes failed.
+pub(crate) struct WebTransportGate {
+    expected_path: String,
+    connected: AtomicBool,
+    failures: std::sync::atomic::AtomicU32,
+}
+
+impl WebTransportGate {
+    pub(crate) fn new(token: String) -> Self {
+        Self {
+            expected_path: format!("/{token}"),
+            connected: AtomicBool::new(false),
+            failures: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn locked(&self) -> bool {
+        self.failures.load(Ordering::SeqCst) >= WEBTRANSPORT_MAX_FAILED_HANDSHAKES
+    }
+
+    fn record_failure(&self, from: std::net::SocketAddr, what: &str) {
+        let failures = self.failures.fetch_add(1, Ordering::SeqCst) + 1;
+        warn!("WebTransport: {} from {} ({} failed)", what, from, failures);
+        if failures == WEBTRANSPORT_MAX_FAILED_HANDSHAKES {
+            warn!(
+                "WebTransport: {} failed handshakes, refusing all further connections for this session",
+                failures
+            );
+        }
+    }
+
+    fn path_allowed(&self, path: &str) -> bool {
+        constant_time_eq(path.as_bytes(), self.expected_path.as_bytes())
+    }
+
+    /// Takes the session's single connection slot.
+    fn try_claim(&self) -> Option<WebTransportSlot<'_>> {
+        self.connected
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| WebTransportSlot(self))
+    }
+}
+
+/// The connection slot, given back when the connection ends.
+struct WebTransportSlot<'a>(&'a WebTransportGate);
+
+impl Drop for WebTransportSlot<'_> {
+    fn drop(&mut self) {
+        self.0.connected.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Completes the handshake of an incoming connection and accepts it only
+/// when the request carries the session's token and no other connection is
+/// alive; everything else is refused before any datagram is read.
+async fn authenticate_webtransport<'a>(
+    incoming: wtransport::endpoint::IncomingSession,
+    gate: &'a WebTransportGate,
+) -> Option<(wtransport::Connection, WebTransportSlot<'a>)> {
+    let remote = incoming.remote_address();
+    if gate.locked() {
+        incoming.refuse();
+        return None;
+    }
+    let request = match incoming.await {
+        Ok(request) => request,
+        Err(e) => {
+            gate.record_failure(remote, &format!("handshake failed: {e}"));
+            return None;
+        }
+    };
+    if !gate.path_allowed(request.path()) {
+        gate.record_failure(remote, "request without the session token");
+        request.forbidden().await;
+        return None;
+    }
+    let Some(slot) = gate.try_claim() else {
+        info!("WebTransport: refusing a second connection from {} while one is open", remote);
+        request.too_many_requests().await;
+        return None;
+    };
+    match request.accept().await {
+        Ok(connection) => Some((connection, slot)),
+        Err(e) => {
+            error!("WebTransport session accept failed: {:?}", e);
+            None
+        }
+    }
+}
+
+/// The accept loop of a session's WebTransport endpoint: authenticated
+/// connections' datagrams go to the input queue, until `shutdown_rx` fires.
+pub(crate) async fn serve_webtransport_input(
+    endpoint: Arc<wtransport::Endpoint<wtransport::endpoint::endpoint_side::Server>>,
+    gate: Arc<WebTransportGate>,
+    input_tx: mpsc::UnboundedSender<InputQueueItem>,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                if gate.locked() {
+                    incoming.refuse();
+                    continue;
+                }
+                let input_tx = input_tx.clone();
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    let remote = incoming.remote_address();
+                    debug!("Incoming WebTransport connection from {}", remote);
+                    let Some((connection, _slot)) = authenticate_webtransport(incoming, &gate).await else {
+                        return;
+                    };
+                    info!("WebTransport session from {} accepted", remote);
+                    let last_timestamp = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    loop {
+                        match connection.receive_datagram().await {
+                            Ok(datagram) => {
+                                if datagram.len() < 1 {
+                                    continue;
+                                }
+                                let channel_id = datagram[0];
+                                let payload = &datagram[1..];
+                                let Some(packet) = InboundPacket::deserialize(
+                                    TransportChannel(channel_id),
+                                    payload,
+                                ) else {
+                                    warn!(
+                                        "WebTransport: Failed to deserialize packet on channel {}, payload len: {}",
+                                        channel_id,
+                                        payload.len()
+                                    );
+                                    continue;
+                                };
+                                let _ = input_tx.send((packet, last_timestamp.clone()));
+                            }
+                            Err(e) => {
+                                info!("WebTransport connection closed: {:?}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            _ = &mut shutdown_rx => {
+                info!("WebTransport accept loop received shutdown signal, exiting.");
+                // Close the session's connections too: an open
+                // connection keeps the UDP port until its idle
+                // timeout, and the next session then has to take
+                // a random port.
+                endpoint.close(wtransport::VarInt::from_u32(0), b"session ended");
+                break;
+            }
+        }
+    }
 }
 
 async fn setup_data_channel_handler(
@@ -2038,5 +2209,170 @@ mod fec_answer_tests {
         // Rejected video section.
         let sdp = format!("{HEAD}m=video 0 UDP/TLS/RTP/SAVPF 96 49\r\na=rtpmap:49 flexfec-03/90000\r\n");
         assert_eq!(flexfec_in_answer(&sdp), None);
+    }
+}
+
+#[cfg(test)]
+mod webtransport_auth_tests {
+    use super::*;
+    use wtransport::{ClientConfig, Endpoint, Identity, ServerConfig};
+
+    struct Server {
+        port: u16,
+        cert_hash: wtransport::tls::Sha256Digest,
+        token: String,
+        gate: Arc<WebTransportGate>,
+        input_rx: mpsc::UnboundedReceiver<InputQueueItem>,
+        _shutdown: tokio::sync::oneshot::Sender<()>,
+    }
+
+    async fn start_server() -> Server {
+        let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+        let cert_hash = identity.certificate_chain().as_slice()[0].hash();
+        let config = ServerConfig::builder()
+            .with_bind_address("127.0.0.1:0".parse().unwrap())
+            .with_identity(identity)
+            .build();
+        let endpoint = Arc::new(Endpoint::server(config).unwrap());
+        let port = endpoint.local_addr().unwrap().port();
+        let token = new_webtransport_token().unwrap();
+        let gate = Arc::new(WebTransportGate::new(token.clone()));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(serve_webtransport_input(endpoint, gate.clone(), input_tx, shutdown_rx));
+        Server { port, cert_hash, token, gate, input_rx, _shutdown: shutdown }
+    }
+
+    async fn connect(server: &Server, path: &str) -> Result<wtransport::Connection, String> {
+        let config = ClientConfig::builder()
+            .with_bind_address("127.0.0.1:0".parse().unwrap())
+            .with_server_certificate_hashes([server.cert_hash.clone()])
+            .build();
+        let client = Endpoint::client(config).unwrap();
+        let url = format!("https://127.0.0.1:{}{}", server.port, path);
+        match tokio::time::timeout(Duration::from_secs(10), client.connect(url)).await {
+            Ok(Ok(connection)) => Ok(connection),
+            Ok(Err(e)) => Err(format!("{e:?}")),
+            Err(_) => Err("timed out".into()),
+        }
+    }
+
+    /// A relative mouse move on the MOUSE_RELATIVE channel.
+    fn mouse_move_datagram() -> Vec<u8> {
+        vec![TransportChannelId::MOUSE_RELATIVE, 0, 0, 5, 0, 7]
+    }
+
+    async fn next_input(server: &mut Server) -> Option<InboundPacket> {
+        tokio::time::timeout(Duration::from_secs(2), server.input_rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .map(|(packet, _)| packet)
+    }
+
+    #[test]
+    fn token_is_32_random_bytes_as_hex() {
+        let a = new_webtransport_token().unwrap();
+        let b = new_webtransport_token().unwrap();
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn path_check_needs_the_exact_token() {
+        let gate = WebTransportGate::new("ab12".into());
+        assert!(gate.path_allowed("/ab12"));
+        for path in ["/", "", "ab12", "/ab1", "/ab123", "/AB12", "/ab12/", "/ab12?x=1", "//ab12"] {
+            assert!(!gate.path_allowed(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn old_offers_without_a_token_still_parse() {
+        let json = r#"{"type":"Sdp","payload":{"target_id":"c","sdp":{"ty":"offer","sdp":"v=0"},"ice_servers":null,"webtransport_port":55200,"webtransport_cert_hash":"00"}}"#;
+        match serde_json::from_str::<common::SignalingMessage>(json) {
+            Ok(common::SignalingMessage::Sdp { webtransport_token, .. }) => assert!(webtransport_token.is_none()),
+            other => panic!("unexpected {:?}", other.map(|_| ())),
+        }
+        // And a new offer carries it.
+        let offer = common::SignalingMessage::Sdp {
+            target_id: "c".into(),
+            sdp: common::RtcSessionDescription { ty: common::RtcSdpType::Offer, sdp: "v=0".into() },
+            ice_servers: None,
+            webtransport_port: Some(1),
+            webtransport_cert_hash: None,
+            webtransport_token: Some("ab".into()),
+        };
+        assert!(serde_json::to_string(&offer).unwrap().contains(r#""webtransport_token":"ab""#));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn right_token_is_accepted_and_its_input_arrives() {
+        let mut server = start_server().await;
+        let path = format!("/{}", server.token);
+        let connection = connect(&server, &path).await.expect("accepted");
+        connection.send_datagram(mouse_move_datagram()).unwrap();
+        assert!(matches!(next_input(&mut server).await, Some(InboundPacket::MouseMove { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrong_or_missing_token_is_refused() {
+        let mut server = start_server().await;
+        let wrong = format!("/{}", "0".repeat(64));
+        for path in ["", "/", wrong.as_str()] {
+            assert!(connect(&server, path).await.is_err(), "path {path:?} accepted");
+        }
+        assert_eq!(server.gate.failures.load(Ordering::SeqCst), 3);
+        assert!(next_input(&mut server).await.is_none());
+        // The right token still works after a few failures.
+        let path = format!("/{}", server.token);
+        assert!(connect(&server, &path).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_connection_at_a_time_and_reconnect_after_close() {
+        let server = start_server().await;
+        let path = format!("/{}", server.token);
+        let first = connect(&server, &path).await.expect("first accepted");
+        assert!(connect(&server, &path).await.is_err(), "second connection accepted");
+        // Not counted as a failed handshake: it had the token.
+        assert_eq!(server.gate.failures.load(Ordering::SeqCst), 0);
+        first.close(wtransport::VarInt::from_u32(0), b"bye");
+        drop(first);
+        // The server notices the close, then the slot is free again.
+        let mut reconnected = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(c) = connect(&server, &path).await {
+                reconnected = Some(c);
+                break;
+            }
+        }
+        assert!(reconnected.is_some(), "reconnect after close refused");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn too_many_failures_lock_the_endpoint() {
+        let server = start_server().await;
+        for _ in 0..WEBTRANSPORT_MAX_FAILED_HANDSHAKES {
+            assert!(connect(&server, "/nope").await.is_err());
+        }
+        assert!(server.gate.locked());
+        let path = format!("/{}", server.token);
+        assert!(connect(&server, &path).await.is_err(), "accepted after the limit");
+        assert_eq!(server.gate.failures.load(Ordering::SeqCst), WEBTRANSPORT_MAX_FAILED_HANDSHAKES);
+    }
+
+    #[test]
+    fn keyframe_requests_after_drops_are_rate_limited() {
+        let mut requester = KeyframeRequester::new(Arc::new(std::sync::Mutex::new(None)));
+        let t0 = Instant::now();
+        assert!(requester.due(t0));
+        assert!(!requester.due(t0 + Duration::from_millis(100)));
+        assert!(!requester.due(t0 + Duration::from_millis(499)));
+        assert!(requester.due(t0 + Duration::from_millis(500)));
+        assert!(!requester.due(t0 + Duration::from_millis(900)));
+        assert!(requester.due(t0 + Duration::from_millis(1000)));
     }
 }

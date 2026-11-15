@@ -71,12 +71,8 @@ fn make_self_signed(cert: &PathBuf, key: &PathBuf) -> Result<(), String> {
         let _ = std::fs::create_dir_all(dir);
     }
     std::fs::write(cert, made.cert.pem()).map_err(|e| format!("{}: {}", cert.display(), e))?;
-    std::fs::write(key, made.signing_key.serialize_pem()).map_err(|e| format!("{}: {}", key.display(), e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600));
-    }
+    // Created owner-only: never readable by others, not even briefly.
+    paths::write_private(key, &made.signing_key.serialize_pem()).map_err(|e| format!("{}: {}", key.display(), e))?;
     info!("Made a self-signed HTTPS certificate for {}", names.join(", "));
     Ok(())
 }

@@ -290,12 +290,26 @@ impl PeerConnectionEventHandler for FilesHandler {
 }
 
 async fn connect(server_url: String, token: String, host_id: String) -> Result<(), String> {
-    let encoded: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
-    let ws_url = format!("{}/ws/client?token={}{}", server_url.trim_end_matches('/').replacen("http", "ws", 1), encoded, crate::host::client_name_query());
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(ws_url.as_str()))
-        .await
-        .map_err(|_| "cannot reach the server".to_string())?
-        .map_err(|e| format!("cannot reach the server: {}", e))?;
+    // Straight to an agent: TLS and a password proof, no password in the URL
+    // (the same connection the stream uses).
+    let direct = (host_id == "direct")
+        .then(|| server_url.strip_prefix("ws://").or_else(|| server_url.strip_prefix("wss://")))
+        .flatten()
+        .map(|a| a.trim_end_matches('/').to_string());
+    let ws = if let Some(address) = direct {
+        agent::direct::connect(&address, "/ws/client", &token, &crate::host::client_name_query())
+            .await
+            .map_err(|e| format!("cannot reach the computer: {}", e))?
+            .ws
+    } else {
+        let encoded: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
+        let ws_url = format!("{}/ws/client?token={}{}", server_url.trim_end_matches('/').replacen("http", "ws", 1), encoded, crate::host::client_name_query());
+        tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(ws_url.as_str()))
+            .await
+            .map_err(|_| "cannot reach the server".to_string())?
+            .map_err(|e| format!("cannot reach the server: {}", e))?
+            .0
+    };
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalingMessage>();
     tokio::spawn(async move {
@@ -355,7 +369,7 @@ async fn connect(server_url: String, token: String, host_id: String) -> Result<(
                         let _ = out_tx.send(SignalingMessage::Sdp {
                             target_id: host_id.clone(),
                             sdp: RtcSessionDescription { ty: RtcSdpType::Answer, sdp: answer.sdp },
-                            ice_servers: None, webtransport_port: None, webtransport_cert_hash: None,
+                            ice_servers: None, webtransport_port: None, webtransport_cert_hash: None, webtransport_token: None,
                         });
                         pc = Some(p);
                     }
@@ -682,6 +696,47 @@ pub fn upload_to_downloads(paths: Vec<PathBuf>) {
     }
 }
 
+/// A Windows device name (CON, NUL, COM1...), with or without an extension.
+fn is_reserved_device_name(c: &str) -> bool {
+    let stem = c.split('.').next().unwrap_or(c).trim_end().to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
+}
+
+/// One path component sent by the remote computer.
+fn check_remote_component(c: &str) -> Result<(), String> {
+    if c.is_empty() {
+        return Err("empty name".into());
+    }
+    if c == "." || c == ".." {
+        return Err("'.' or '..' in a name".into());
+    }
+    if c.chars().any(|ch| matches!(ch, '/' | '\\' | ':' | '\0')) {
+        return Err("forbidden character in a name".into());
+    }
+    if is_reserved_device_name(c) {
+        return Err("reserved name".into());
+    }
+    if cfg!(windows) && (c.ends_with('.') || c.ends_with(' ')) {
+        return Err("name ends with a dot or space".into());
+    }
+    Ok(())
+}
+
+/// The local path for `rel`, a '/'-separated relative path from the remote
+/// computer, below `base`. Every component is checked; nothing can leave `base`.
+fn safe_local_path(base: &Path, rel: &str) -> Result<PathBuf, String> {
+    let mut p = base.to_path_buf();
+    for c in rel.split('/') {
+        check_remote_component(c)?;
+        p.push(c);
+    }
+    Ok(p)
+}
+
 /// Remote entries (names in `remote_dir`) -> the local folder `local_dir`.
 pub fn download(names: Vec<String>, remote_dir: String, local_dir: PathBuf) {
     runtime().spawn(async move {
@@ -696,24 +751,47 @@ pub fn download(names: Vec<String>, remote_dir: String, local_dir: PathBuf) {
             .and_then(|s| s.remote.get("entries").cloned())
             .unwrap_or(Value::Null);
         let mut jobs = Vec::new();
+        let mut rejected: Vec<String> = Vec::new();
         for name in names {
+            // Names come from the remote computer: only ever a single plain
+            // component under the chosen folder.
+            let top = match safe_local_path(&local_dir, &name).and_then(|p| {
+                if name.contains('/') { Err("not a plain name".to_string()) } else { Ok(p) }
+            }) {
+                Ok(p) => p,
+                Err(e) => {
+                    rejected.push(format!("{}: {}", name, e));
+                    continue;
+                }
+            };
             let info = entries.as_array().and_then(|a| a.iter().find(|e| e.get("name").and_then(Value::as_str) == Some(&name)).cloned());
             let is_dir = info.as_ref().and_then(|e| e.get("dir")).and_then(Value::as_bool).unwrap_or(false);
             let remote = join_remote(&remote_dir, &name, &c.sep());
             if is_dir {
                 match c.request(json!({"type": "walk", "path": remote}), 120).await {
                     Ok(tree) => {
+                        let _ = std::fs::create_dir_all(&top);
                         if let Some(ds) = tree.get("dirs").and_then(Value::as_array) {
                             for d in ds.iter().filter_map(Value::as_str) {
-                                let _ = std::fs::create_dir_all(local_dir.join(&name).join(d));
+                                match safe_local_path(&top, d) {
+                                    Ok(p) => {
+                                        let _ = std::fs::create_dir_all(p);
+                                    }
+                                    Err(e) => rejected.push(format!("{}/{}: {}", name, d, e)),
+                                }
                             }
                         }
-                        let _ = std::fs::create_dir_all(local_dir.join(&name));
                         for f in tree.get("files").and_then(Value::as_array).cloned().unwrap_or_default() {
                             let rel = f.get("rel").and_then(Value::as_str).unwrap_or("").to_string();
                             let size = f.get("size").and_then(Value::as_u64).unwrap_or(0);
                             let mtime = f.get("mtime").and_then(Value::as_u64).unwrap_or(0);
-                            let local = rel.split('/').fold(local_dir.join(&name), |p, part| p.join(part));
+                            let local = match safe_local_path(&top, &rel) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    rejected.push(format!("{}/{}: {}", name, rel, e));
+                                    continue;
+                                }
+                            };
                             jobs.push(job(false, format!("{}/{}", name, rel), local, join_remote(&remote, &rel, &c.sep()), size, mtime));
                         }
                     }
@@ -722,10 +800,18 @@ pub fn download(names: Vec<String>, remote_dir: String, local_dir: PathBuf) {
             } else {
                 let size = info.as_ref().and_then(|e| e.get("size")).and_then(Value::as_u64).unwrap_or(0);
                 let mtime = info.as_ref().and_then(|e| e.get("mtime")).and_then(Value::as_u64).unwrap_or(0);
-                jobs.push(job(false, name.clone(), local_dir.join(&name), remote, size, mtime));
+                jobs.push(job(false, name.clone(), top, remote, size, mtime));
             }
         }
         push_jobs(jobs);
+        if !rejected.is_empty() {
+            let more = rejected.len().saturating_sub(3);
+            let mut msg = format!("Skipped (unsafe name from the remote computer): {}", rejected.iter().take(3).cloned().collect::<Vec<_>>().join("; "));
+            if more > 0 {
+                msg.push_str(&format!(" and {} more", more));
+            }
+            set_error(msg);
+        }
     });
 }
 
@@ -995,6 +1081,20 @@ fn free_name(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_names_cannot_leave_the_folder() {
+        let base = Path::new("/dl");
+        assert_eq!(safe_local_path(base, "a/b/c.txt").unwrap(), Path::new("/dl/a/b/c.txt"));
+        for bad in [
+            "", "..", ".", "../x", "a/../../x", "/etc/passwd", "a//b", "a\\b", "..\\x", "C:\\x", "C:x",
+            "a/b\0", "con", "NUL.txt", "a/aux", "COM1", "lpt9.log", "x/", "./a",
+        ] {
+            assert!(safe_local_path(base, bad).is_err(), "{:?}", bad);
+        }
+        assert!(safe_local_path(base, "com0").is_ok());
+        assert!(safe_local_path(base, "console.txt").is_ok());
+    }
 
     #[test]
     fn remote_paths_use_the_remote_separator() {

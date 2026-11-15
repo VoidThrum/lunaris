@@ -310,7 +310,7 @@ fn get_config_path() -> std::path::PathBuf {
         std::path::PathBuf::from(".")
     };
     path.push(".lunaris");
-    let _ = std::fs::create_dir_all(&path);
+    let _ = crate::secure_fs::create_private_dir(&path);
     path.push("client_config.json");
     path
 }
@@ -332,8 +332,13 @@ fn save_settings(server_url: &str, token: &str, username: &str) {
         username: username.to_string(),
     };
     if let Ok(data) = serde_json::to_string_pretty(&settings) {
-        let _ = std::fs::write(path, data);
+        let _ = crate::secure_fs::write_private(&path, data);
     }
+}
+
+/// The server the user is signed in to (saved login), for judging links.
+pub(crate) fn saved_server_url() -> Option<String> {
+    load_settings().map(|s| s.server_url).filter(|s| !s.is_empty())
 }
 
 fn clear_settings() {
@@ -354,6 +359,16 @@ fn local_paths(text: &str) -> Vec<std::path::PathBuf> {
                 .unwrap_or_else(|| std::path::PathBuf::from(l))
         })
         .collect()
+}
+
+/// The agent's "host:port" when this is a direct connection (QML passes
+/// server "ws://<address>" and host "direct"), None for a server.
+fn direct_address<'a>(server_url: &'a str, host_id: &str) -> Option<&'a str> {
+    if host_id != "direct" {
+        return None;
+    }
+    let address = server_url.strip_prefix("ws://").or_else(|| server_url.strip_prefix("wss://"))?;
+    Some(address.trim_end_matches('/'))
 }
 
 /// The last direct connection (no server), remembered like the login.
@@ -380,14 +395,8 @@ fn load_direct_target() -> Option<DirectTarget> {
 fn save_direct_target_file(target: &DirectTarget) {
     let path = direct_target_path();
     if let Ok(data) = serde_json::to_string_pretty(target) {
-        if std::fs::write(&path, data).is_ok() {
-            // Holds an access password: owner-only.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+        // Holds an access password: owner-only.
+        let _ = crate::secure_fs::write_private(&path, data);
     }
 }
 
@@ -398,6 +407,10 @@ pub static STREAM_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::ne
 /// A message for the user from a stream task error.
 fn describe_stream_error(e: &anyhow::Error) -> String {
     use tokio_tungstenite::tungstenite::Error as WsError;
+    // Direct connections: already full sentences (e.g. an agent too old for TLS).
+    if let Some(direct) = e.downcast_ref::<agent::direct::ConnectError>() {
+        return direct.to_string();
+    }
     if let Some(ws) = e.downcast_ref::<WsError>() {
         match ws {
             WsError::Http(resp) => {
@@ -427,7 +440,7 @@ fn get_agent_config_path() -> std::path::PathBuf {
         std::path::PathBuf::from(".")
     };
     path.push(".lunaris");
-    let _ = std::fs::create_dir_all(&path);
+    let _ = crate::secure_fs::create_private_dir(&path);
     path.push("agent_config.json");
     path
 }
@@ -449,7 +462,7 @@ fn prepare_agent_config(server_url: &str, server_token: &str) -> std::path::Path
     config_json["server_token"] = serde_json::json!(server_token);
 
     if let Ok(data) = serde_json::to_string_pretty(&config_json) {
-        let _ = std::fs::write(&path, data);
+        let _ = crate::secure_fs::write_private(&path, data);
     }
     path
 }
@@ -963,6 +976,15 @@ pub mod qobject {
         #[qinvokable]
         fn has_connection_args(self: Pin<&mut StreamBridge>) -> bool;
 
+        /// A lunaris:// link to a server the user is not signed in to waits
+        /// for an answer: JSON {"server":..,"computer":..}, "" if none.
+        #[qinvokable]
+        fn pending_link_info(self: Pin<&mut StreamBridge>) -> QString;
+
+        /// Answer to that question; true when the stream may start.
+        #[qinvokable]
+        fn answer_pending_link(self: Pin<&mut StreamBridge>, accept: bool) -> bool;
+
         #[qinvokable]
         fn load_saved_credentials(self: Pin<&mut StreamBridge>);
 
@@ -1090,6 +1112,11 @@ pub mod qobject {
         /// computer; returns an error message or "".
         #[qinvokable]
         fn host_set_sharing(self: Pin<&mut StreamBridge>, clipboard: bool, files: bool) -> QString;
+
+        /// Whether file transfer may reach the whole disk or only the home
+        /// folder; returns an error message or "".
+        #[qinvokable]
+        fn host_set_file_access(self: Pin<&mut StreamBridge>, full: bool) -> QString;
 
         /// How connections are accepted: "password", "click" or
         /// "password-click"; returns an error message or "".
@@ -1677,6 +1704,24 @@ impl qobject::StreamBridge {
         APP_ARGS.get().is_some()
     }
 
+    pub fn pending_link_info(self: Pin<&mut Self>) -> QString {
+        match crate::deeplink::pending_info() {
+            Some(i) => QString::from(
+                &serde_json::json!({ "server": i.server_host, "computer": i.computer }).to_string(),
+            ),
+            None => QString::from(""),
+        }
+    }
+
+    pub fn answer_pending_link(self: Pin<&mut Self>, accept: bool) -> bool {
+        if accept {
+            crate::deeplink::confirm_pending()
+        } else {
+            crate::deeplink::cancel_pending();
+            false
+        }
+    }
+
     pub fn load_saved_credentials(self: Pin<&mut Self>) {
         if let Some(settings) = load_settings() {
             PENDING_EVENTS
@@ -2226,16 +2271,23 @@ impl qobject::StreamBridge {
         let rt = rust_obj.get_or_init_runtime();
 
         rt.spawn(async move {
-            let encoded_token: String =
-                url::form_urlencoded::byte_serialize(token_str.as_bytes()).collect();
-            let ws_url = format!(
-                "{}/ws/client?token={}",
-                server_str.replace("http", "ws"),
-                encoded_token
-            );
-
-            let connect_result = connect_async(&ws_url).await;
-            let (mut ws_stream, _) = match connect_result {
+            let connect_result = match direct_address(&server_str, &host_id_str) {
+                Some(address) => agent::direct::connect(address, "/ws/client", &token_str, &crate::host::client_name_query())
+                    .await
+                    .map(|c| c.ws)
+                    .map_err(|e| e.to_string()),
+                None => {
+                    let encoded_token: String =
+                        url::form_urlencoded::byte_serialize(token_str.as_bytes()).collect();
+                    let ws_url = format!(
+                        "{}/ws/client?token={}",
+                        server_str.replace("http", "ws"),
+                        encoded_token
+                    );
+                    connect_async(&ws_url).await.map(|(ws, _)| ws).map_err(|e| e.to_string())
+                }
+            };
+            let mut ws_stream = match connect_result {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("fetch_capabilities: WebSocket connection failed: {}", e);
@@ -2566,8 +2618,11 @@ impl qobject::StreamBridge {
                         }
                     }
 
-                    let err_msg =
-                        if let Ok(err_data) = serde_json::from_str::<serde_json::Value>(&text) {
+                    // The token that adds computers to the server is for
+                    // administrators only.
+                    let err_msg = if status == reqwest::StatusCode::FORBIDDEN {
+                            "Only an administrator can add a computer to the server. Ask an administrator to do it.".to_string()
+                        } else if let Ok(err_data) = serde_json::from_str::<serde_json::Value>(&text) {
                             err_data
                                 .get("error")
                                 .and_then(|v| v.as_str())
@@ -2708,6 +2763,10 @@ impl qobject::StreamBridge {
 
     pub fn host_set_sharing(self: Pin<&mut Self>, clipboard: bool, files: bool) -> QString {
         QString::from(&crate::host::set_sharing(clipboard, files).err().unwrap_or_default())
+    }
+
+    pub fn host_set_file_access(self: Pin<&mut Self>, full: bool) -> QString {
+        QString::from(&crate::host::set_file_access(full).err().unwrap_or_default())
     }
 
     pub fn host_set_approve_mode(self: Pin<&mut Self>, mode: QString) -> QString {
@@ -2854,14 +2913,8 @@ impl qobject::StreamBridge {
         if serde_json::from_str::<serde_json::Value>(&json).is_err() {
             return;
         }
-        if std::fs::write(&path, json).is_ok() {
-            // "peers" may hold access passwords: owner-only.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+        // "peers" may hold access passwords: owner-only.
+        let _ = crate::secure_fs::write_private(&path, json);
     }
 
     pub fn app_version(self: Pin<&mut Self>) -> QString {
@@ -3152,6 +3205,7 @@ async fn connect_webtransport_input(
     server_url: String,
     port: u16,
     cert_hash: Option<String>,
+    token: Option<String>,
     wt_conn: Arc<Mutex<Option<wtransport::Connection>>>,
     wt_connected: Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -3187,14 +3241,22 @@ async fn connect_webtransport_input(
     }
 
     let hash = cert_hash.as_deref().and_then(parse_sha256_hex);
-    let config = match hash {
-        Some(digest) => ClientConfig::builder()
+    let config = match (hash, token.is_some()) {
+        (Some(digest), _) => ClientConfig::builder()
             .with_bind_default()
             .with_server_certificate_hashes([wtransport::tls::Sha256Digest::new(digest)])
             .build(),
-        // Older agents send no hash: accept their self-signed certificate.
-        None => ClientConfig::builder().with_bind_default().with_no_cert_validation().build(),
+        // An agent that sends a token always sends its certificate hash:
+        // without one the token could go to anyone on the path.
+        (None, true) => {
+            eprintln!("WebTransport: the agent sent a token but no valid certificate hash, input stays on WebRTC");
+            return;
+        }
+        // Older agents send neither: accept their self-signed certificate.
+        (None, false) => ClientConfig::builder().with_bind_default().with_no_cert_validation().build(),
     };
+    // Newer agents accept only the session's token as the URL path.
+    let path = webtransport_path(token.as_deref());
     let endpoint = match Endpoint::client(config) {
         Ok(e) => e,
         Err(e) => {
@@ -3204,20 +3266,30 @@ async fn connect_webtransport_input(
     };
     for host in hosts {
         let host_part = if host.contains(':') { format!("[{}]", host) } else { host.clone() };
-        let url = format!("https://{}:{}", host_part, port);
-        println!("WebTransport: connecting to {}", url);
+        let url = format!("https://{}:{}{}", host_part, port, path);
+        println!("WebTransport: connecting to https://{}:{}", host_part, port);
         match tokio::time::timeout(std::time::Duration::from_secs(4), endpoint.connect(&url)).await {
             Ok(Ok(connection)) => {
-                println!("WebTransport: connected to {}; input now goes over QUIC datagrams", url);
+                println!("WebTransport: connected to {}:{}; input now goes over QUIC datagrams", host_part, port);
                 *wt_conn.lock().unwrap() = Some(connection);
                 wt_connected.store(true, std::sync::atomic::Ordering::Release);
                 return;
             }
-            Ok(Err(e)) => eprintln!("WebTransport: {} failed: {:?}", url, e),
-            Err(_) => eprintln!("WebTransport: {} timed out", url),
+            Ok(Err(e)) => eprintln!("WebTransport: {}:{} failed: {:?}", host_part, port, e),
+            Err(_) => eprintln!("WebTransport: {}:{} timed out", host_part, port),
         }
     }
     eprintln!("WebTransport: no agent address answered, input stays on WebRTC");
+}
+
+/// The URL path of the WebTransport request: `/<token>`, or none (the root,
+/// as before) for agents that send no token. The agent's token is hex;
+/// anything else is dropped rather than put into the URL.
+fn webtransport_path(token: Option<&str>) -> String {
+    match token.filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_hexdigit())) {
+        Some(token) => format!("/{token}"),
+        None => String::new(),
+    }
 }
 
 /// A SHA-256 digest from hex (the agent's certificate hash).
@@ -4822,17 +4894,22 @@ async fn run_webrtc_client_task(
     input_senders: Arc<Mutex<Option<super::input::InputSenders>>>,
     active_decoder: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 ) -> Result<(), anyhow::Error> {
-    let encoded_token: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
-    let ws_url = format!(
-        "{}/ws/client?token={}{}",
-        server_url.replace("http", "ws"),
-        encoded_token,
-        crate::host::client_name_query()
-    );
-    // Never log ws_url itself: it carries the session token.
-    println!("Connecting to signaling server at: {}/ws/client", server_url.replace("http", "ws"));
-
-    let (ws_stream, _) = connect_async(ws_url.as_str()).await?;
+    let ws_stream = if let Some(address) = direct_address(&server_url, &host_id) {
+        // Straight to the agent: TLS and a password proof, no password in the URL.
+        println!("Connecting directly to {}", address);
+        agent::direct::connect(address, "/ws/client", &token, &crate::host::client_name_query()).await?.ws
+    } else {
+        let encoded_token: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
+        let ws_url = format!(
+            "{}/ws/client?token={}{}",
+            server_url.replace("http", "ws"),
+            encoded_token,
+            crate::host::client_name_query()
+        );
+        // Never log ws_url itself: it carries the session token.
+        println!("Connecting to signaling server at: {}/ws/client", server_url.replace("http", "ws"));
+        connect_async(ws_url.as_str()).await?.0
+    };
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     let (outbox_tx, mut outbox_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
@@ -5218,12 +5295,15 @@ async fn run_webrtc_client_task(
                         ice_servers,
                         webtransport_port,
                         webtransport_cert_hash,
+                        webtransport_token,
                         ..
                     } => {
                         if sdp.ty == RtcSdpType::Offer {
                             // WebTransport input starts once ICE is connected (below).
                             let wt_target = if input_protocol == "webtransport" {
-                                webtransport_port.map(|port| (port, webtransport_cert_hash.clone()))
+                                webtransport_port.map(|port| {
+                                    (port, webtransport_cert_hash.clone(), webtransport_token.clone())
+                                })
                             } else {
                                 None
                             };
@@ -5264,13 +5344,14 @@ async fn run_webrtc_client_task(
                                 }
                             };
 
-                            if let Some((port, cert_hash)) = wt_target {
+                            if let Some((port, cert_hash, token)) = wt_target {
                                 tokio::spawn(connect_webtransport_input(
                                     Arc::clone(&pc),
                                     pc_state.clone(),
                                     server_url.clone(),
                                     port,
                                     cert_hash,
+                                    token,
                                     Arc::clone(&wt_conn_ref),
                                     Arc::clone(&wt_connected),
                                 ));
@@ -5322,6 +5403,7 @@ async fn run_webrtc_client_task(
                                                     ice_servers: None,
                                                     webtransport_port: None,
                                                     webtransport_cert_hash: None,
+                                                    webtransport_token: None,
                                                 });
                                             if let Err(e) = outbox_tx.send(answer_msg) {
                                                 eprintln!("Failed to queue SDP answer for websocket send: {:?}", e);

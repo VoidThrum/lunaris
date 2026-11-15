@@ -3,7 +3,6 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -323,12 +322,18 @@ where
         }
     }
     if config.direct_enabled {
-        // Printed, not logged: the password should not end up in log files.
         println!("Direct connections — connect a client to one of:");
         for addr in direct::local_addresses().await {
             println!("    {}:{}", addr, config.direct_port);
         }
-        println!("Access password: {}", config.direct_password);
+        // Printed, not logged, and only to a terminal: when stdout is a file
+        // or a pipe (the Windows service's log, the app) it would be stored.
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            println!("Access password: {}", config.direct_password);
+        } else {
+            println!("Access password: not shown here (output is not a terminal); it is in {}", config_path);
+        }
     }
 
     run_agent(config, name).await
@@ -374,6 +379,19 @@ pub async fn run_agent(
     if config.server_url.trim().is_empty() {
         info!("No Lunaris server configured: direct connections only.");
     } else {
+        if crate::pairing::ensure_agent_key(&mut config) {
+            let key = config.agent_key.clone();
+            if let Err(e) = crate::pairing::update_config_file(crate::pairing::config_path(), &config, |c| c.agent_key = key) {
+                // A key the server stores but this agent forgets on restart
+                // would lock it out: register without one (as older agents do).
+                error!(
+                    "Could not save the agent's server key to {} ({}): connecting without a key until it can be saved",
+                    crate::pairing::config_path(),
+                    e
+                );
+                config.agent_key.clear();
+            }
+        }
         tasks.0.push(tokio::spawn(run_server_connection(
             config.clone(),
             name.clone(),
@@ -441,14 +459,14 @@ fn probe_codec_support() -> u32 {
 
 /// Keeps a connection to the signaling server, reconnecting every 3 s.
 async fn run_server_connection(
-    config: AgentConfig,
+    mut config: AgentConfig,
     name: String,
     hub: Arc<hub::Hub>,
     inbound_tx: mpsc::UnboundedSender<SignalingMessage>,
 ) {
     let mut last_error = String::new();
     loop {
-        match connect_server_once(&config, &name, &hub, &inbound_tx).await {
+        match connect_server_once(&mut config, &name, &hub, &inbound_tx).await {
             Ok(()) => {
                 info!("Disconnected from the signaling server. Reconnecting in 3 seconds...");
                 last_error.clear();
@@ -474,7 +492,7 @@ async fn run_server_connection(
 }
 
 async fn connect_server_once(
-    config: &AgentConfig,
+    config: &mut AgentConfig,
     name: &str,
     hub: &Arc<hub::Hub>,
     inbound_tx: &mpsc::UnboundedSender<SignalingMessage>,
@@ -491,7 +509,7 @@ async fn connect_server_once(
     }
 
     // Connect to Signaling Server
-    let server_ws_url = if let Some(support) = codec_support {
+    let mut server_ws_url = if let Some(support) = codec_support {
         format!(
             "{}/ws/agent?id={}&name={}&codec_support={}&token={}",
             base_ws_url.trim_end_matches('/'),
@@ -510,28 +528,27 @@ async fn connect_server_once(
         )
     };
 
-    // Never log server_ws_url itself: it carries the agent token.
-    debug!("Connecting to signaling server at {}", base_ws_url);
-    // Build a TLS connector that accepts self-signed certificates.
-    // The signaling server typically uses a self-signed cert for local/LAN use.
-    let tls_connector = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build TLS connector: {}", e))?;
-    let connector = tokio_tungstenite::Connector::NativeTls(tls_connector);
+    // The agent's own key (servers that don't know it ignore it).
+    if !config.agent_key.is_empty() {
+        server_ws_url.push_str("&key=");
+        server_ws_url.push_str(&urlencoding::encode(&config.agent_key));
+    }
 
-    let (ws_stream, _) = connect_async_tls_with_config(
-        server_ws_url,
-        None,
-        false,
-        Some(connector),
-    ).await?;
+    // Never log server_ws_url itself: it carries the agent token and key.
+    debug!("Connecting to signaling server at {}", base_ws_url);
+    // TLS first (the certificate is checked or pinned before the token is
+    // sent), then the WebSocket handshake over it.
+    let stream = server_stream(config, &base_ws_url).await?;
+    let (ws_stream, _) = tokio_tungstenite::client_async(server_ws_url, stream)
+        .await
+        .map_err(|e| anyhow::anyhow!("WebSocket handshake with {} failed: {}", base_ws_url, e))?;
     info!("Connected to signaling server!");
     CONNECTED_TO_SERVER.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (server_tx, mut server_rx) = mpsc::unbounded_channel::<AgentMessage>();
-    hub.set_server(Some(server_tx));
+    hub.set_server(Some(server_tx.clone()));
+    let gate = ServerGate::new(config.server_sessions.trim() == "ask", server_tx, inbound_tx.clone());
 
     // Outbound: the hub routes the session logic's replies for server clients here.
     let write_task = tokio::spawn(async move {
@@ -561,9 +578,7 @@ async fn connect_server_once(
             Ok(ServerToAgentMessage::Registered { success }) => {
                 info!("Registration success: {}", success);
             }
-            Ok(ServerToAgentMessage::Signaling(sig)) => {
-                let _ = inbound_tx.send(sig);
-            }
+            Ok(ServerToAgentMessage::Signaling(sig)) => gate.pass(sig),
             Err(e) => error!("Failed to parse server message: {}. Payload: {}", e, text),
         }
     }
@@ -572,6 +587,433 @@ async fn connect_server_once(
     hub.set_server(None);
     CONNECTED_TO_SERVER.store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(())
+}
+
+/// Sessions that arrive through the server: passed on as they come
+/// (`server_sessions` "trusted"), or, with "ask", each client connection
+/// that wants the screen or files is put to the person here first, the way
+/// direct.rs does for a server linked without the password.
+struct ServerGate {
+    ask: bool,
+    server_tx: mpsc::UnboundedSender<AgentMessage>,
+    inbound_tx: mpsc::UnboundedSender<SignalingMessage>,
+    /// What the person here granted each client connection (server
+    /// connection id): the screen and files are asked for separately.
+    accepted: Arc<std::sync::Mutex<std::collections::HashSet<(String, approval::Kind)>>>,
+    /// Questions open, each withdrawn through its Notify when the client
+    /// leaves first.
+    asking: Arc<std::sync::Mutex<std::collections::HashMap<(String, approval::Kind), Arc<tokio::sync::Notify>>>>,
+    ask_fn: AskFn,
+}
+
+/// Puts a question to the person here: None when withdrawn (the Notify).
+type AskFn = Arc<
+    dyn Fn(String, approval::Kind, Arc<tokio::sync::Notify>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<approval::Decision>> + Send>>
+        + Send
+        + Sync,
+>;
+
+impl ServerGate {
+    fn new(
+        ask: bool,
+        server_tx: mpsc::UnboundedSender<AgentMessage>,
+        inbound_tx: mpsc::UnboundedSender<SignalingMessage>,
+    ) -> Self {
+        if ask {
+            info!("Sessions through the server are accepted at this computer (server_sessions = \"ask\")");
+        }
+        let ask_fn: AskFn = Arc::new(|requester, kind, cancel| {
+            Box::pin(async move { approval::ask_unless(&requester, kind, cancel.notified()).await })
+        });
+        Self { ask, server_tx, inbound_tx, accepted: Arc::default(), asking: Arc::default(), ask_fn }
+    }
+
+    fn pass(&self, sig: SignalingMessage) {
+        if !self.ask {
+            let _ = self.inbound_tx.send(sig);
+            return;
+        }
+        let Some(client) = hub::target_of(&sig).map(str::to_owned) else {
+            let _ = self.inbound_tx.send(sig);
+            return;
+        };
+        if let SignalingMessage::EndSession { .. } = sig {
+            // The client is gone: withdraw its questions, forget its grants.
+            // Under the lock, so an answer arriving now is ordered before or
+            // after this, never in between.
+            let mut asking = self.asking.lock().unwrap();
+            asking.retain(|(c, _), cancel| {
+                if *c == client {
+                    cancel.notify_one();
+                    false
+                } else {
+                    true
+                }
+            });
+            self.accepted.lock().unwrap().retain(|(c, _)| *c != client);
+            let _ = self.inbound_tx.send(sig);
+            return;
+        }
+        let kind = approval::kind_of(&sig);
+        let pass = {
+            let accepted = self.accepted.lock().unwrap();
+            match (kind, &sig) {
+                (Some(kind), _) => accepted.contains(&(client.clone(), kind)),
+                // Stopping the stream is for a client allowed to see it.
+                (None, SignalingMessage::StopActiveStream { .. }) => {
+                    accepted.contains(&(client.clone(), approval::Kind::Control))
+                }
+                // Answers, candidates and the like: from a client granted something.
+                (None, _) => approval::allowed_before_approval(&sig) || accepted.iter().any(|(c, _)| *c == client),
+            }
+        };
+        if pass {
+            let _ = self.inbound_tx.send(sig);
+            return;
+        }
+        let Some(kind) = kind else {
+            debug!("Server client {} not accepted yet: dropping a {:?} message", client, std::mem::discriminant(&sig));
+            return;
+        };
+        let key = (client.clone(), kind);
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut asking = self.asking.lock().unwrap();
+            if asking.contains_key(&key) {
+                return;
+            }
+            asking.insert(key.clone(), cancel.clone());
+        }
+        let requester = match &sig {
+            SignalingMessage::IncomingSession { requester: Some(r), .. }
+            | SignalingMessage::IncomingFileSession { requester: Some(r), .. }
+                if !r.trim().is_empty() =>
+            {
+                format!("{} (through the Lunaris server)", r.trim())
+            }
+            _ => "a user of the Lunaris server".to_string(),
+        };
+        let status = |client: &str, s: &str| {
+            AgentMessage::Signaling(SignalingMessage::AccessRequest { target_id: client.to_string(), status: s.to_string() })
+        };
+        let _ = self.server_tx.send(status(&client, "waiting"));
+        let (server_tx, inbound_tx) = (self.server_tx.clone(), self.inbound_tx.clone());
+        let (accepted, asking) = (self.accepted.clone(), self.asking.clone());
+        let question = (self.ask_fn)(requester, kind, cancel.clone());
+        tokio::spawn(async move {
+            let decision = question.await;
+            let mut asking = asking.lock().unwrap();
+            // Gone meanwhile (its EndSession withdrew the question): nothing
+            // to deliver, nobody to tell.
+            let still_here = matches!(asking.get(&key), Some(c) if Arc::ptr_eq(c, &cancel));
+            let Some(decision) = decision.filter(|_| still_here) else { return };
+            asking.remove(&key);
+            let _ = server_tx.send(status(&client, decision.status()));
+            if decision == approval::Decision::Accepted {
+                accepted.lock().unwrap().insert(key);
+                let _ = inbound_tx.send(sig);
+            } else if kind == approval::Kind::Control {
+                // The server marked the computer busy for this request.
+                let _ = server_tx.send(AgentMessage::Signaling(SignalingMessage::EndSession { target_id: client }));
+            }
+        });
+    }
+}
+
+impl Drop for ServerGate {
+    /// The server connection is gone: its questions are withdrawn.
+    fn drop(&mut self) {
+        for (_, cancel) in self.asking.lock().unwrap().drain() {
+            cancel.notify_one();
+        }
+        self.accepted.lock().unwrap().clear();
+    }
+}
+
+/// The connection to the server: plain TCP for ws://; for wss:// a TLS
+/// handshake whose certificate is checked before anything is sent: valid
+/// for the host by the system's roots, or else the one pinned in the config
+/// (`server_cert_sha256`), pinned now on the first connection.
+async fn server_stream(
+    config: &mut AgentConfig,
+    ws_url: &str,
+) -> Result<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
+    let uri: tokio_tungstenite::tungstenite::http::Uri = ws_url
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad server address {}: {}", ws_url, e))?;
+    let tls = match uri.scheme_str() {
+        Some("wss") => true,
+        Some("ws") => false,
+        _ => return Err(anyhow::anyhow!("bad server address {}", ws_url).into()),
+    };
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("no host in the server address {}", ws_url))?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connecting to {}:{} timed out", host, port))??;
+    let _ = tcp.set_nodelay(true);
+    if !tls {
+        return Ok(tokio_tungstenite::MaybeTlsStream::Plain(tcp));
+    }
+
+    let verifier = Arc::new(server_tls::RecordingVerifier::new());
+    let tls_config = server_tls::client_config(verifier.clone())?;
+    let name = rustls::pki_types::ServerName::try_from(host.clone())
+        .map_err(|e| anyhow::anyhow!("bad server host name {}: {}", host, e))?;
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+        .connect(name, tcp)
+        .await
+        .map_err(|e| anyhow::anyhow!("TLS handshake with {}:{} failed: {}", host, port, e))?;
+    let seen = verifier
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("{}:{} sent no certificate", host, port))?;
+    let fingerprint = server_tls::fingerprint(&seen.der);
+    let host_port = format!("{}:{}", host, port);
+    match server_tls::decide(seen.valid, &fingerprint, &host_port, &config.server_cert_sha256, &config.server_cert_host) {
+        server_tls::Decision::Valid | server_tls::Decision::PinMatches => {}
+        server_tls::Decision::Pin => {
+            warn!(
+                "The Lunaris server {} has a certificate the system does not trust (self-signed?): \
+                 trusting it from now on (pinned SHA-256 {}). Compare it with the server's if in doubt.",
+                host_port, fingerprint
+            );
+            config.server_cert_sha256 = fingerprint.clone();
+            config.server_cert_host = host_port.clone();
+            let (sha, for_host) = (fingerprint.clone(), host_port.clone());
+            if let Err(e) = crate::pairing::update_config_file(crate::pairing::config_path(), config, |c| {
+                c.server_cert_sha256 = sha;
+                c.server_cert_host = for_host;
+            }) {
+                warn!("Could not save the pinned server certificate: {}", e);
+            }
+        }
+        server_tls::Decision::Mismatch => {
+            return Err(anyhow::anyhow!(
+                "the TLS certificate of the Lunaris server {} is not the one trusted before \
+                 (pinned SHA-256 {}, now {}): not connecting, the connection may be intercepted. \
+                 If the server's certificate was replaced on purpose, empty server_cert_sha256 in {} \
+                 and restart the agent",
+                host_port,
+                config.server_cert_sha256,
+                fingerprint,
+                crate::pairing::config_path()
+            )
+            .into());
+        }
+    }
+    Ok(tokio_tungstenite::MaybeTlsStream::Rustls(stream))
+}
+
+/// Trust on first use for the server's TLS certificate.
+mod server_tls {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::client::WebPkiServerVerifier;
+    use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
+
+    pub struct Seen {
+        pub der: Vec<u8>,
+        /// Valid for the host name by the system's roots.
+        pub valid: bool,
+    }
+
+    /// Lets the handshake finish with any certificate (its signatures over
+    /// the handshake are still verified, so the server holds its key) and
+    /// records it; the caller decides before sending anything.
+    pub struct RecordingVerifier {
+        roots: Option<Arc<WebPkiServerVerifier>>,
+        algorithms: WebPkiSupportedAlgorithms,
+        seen: Mutex<Option<Seen>>,
+    }
+
+    impl std::fmt::Debug for RecordingVerifier {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("RecordingVerifier")
+        }
+    }
+
+    fn provider() -> Arc<CryptoProvider> {
+        Arc::new(rustls::crypto::ring::default_provider())
+    }
+
+    /// The system's root certificates, loaded once.
+    fn system_roots() -> Option<Arc<RootCertStore>> {
+        static ROOTS: OnceLock<Option<Arc<RootCertStore>>> = OnceLock::new();
+        ROOTS
+            .get_or_init(|| {
+                let mut store = RootCertStore::empty();
+                store.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+                (!store.is_empty()).then(|| Arc::new(store))
+            })
+            .clone()
+    }
+
+    impl RecordingVerifier {
+        pub fn new() -> Self {
+            let provider = provider();
+            let roots = system_roots()
+                .and_then(|r| WebPkiServerVerifier::builder_with_provider(r, provider.clone()).build().ok());
+            Self { roots, algorithms: provider.signature_verification_algorithms, seen: Mutex::new(None) }
+        }
+
+        pub fn take(&self) -> Option<Seen> {
+            self.seen.lock().unwrap().take()
+        }
+    }
+
+    impl ServerCertVerifier for RecordingVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            server_name: &ServerName<'_>,
+            ocsp_response: &[u8],
+            now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            let valid = self
+                .roots
+                .as_ref()
+                .map(|v| v.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now).is_ok())
+                .unwrap_or(false);
+            *self.seen.lock().unwrap() = Some(Seen { der: end_entity.as_ref().to_vec(), valid });
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.algorithms.supported_schemes()
+        }
+    }
+
+    pub fn client_config(verifier: Arc<RecordingVerifier>) -> Result<rustls::ClientConfig, rustls::Error> {
+        Ok(rustls::ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth())
+    }
+
+    pub fn fingerprint(der: &[u8]) -> String {
+        crate::pairing::to_hex(ring::digest::digest(&ring::digest::SHA256, der).as_ref())
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Decision {
+        /// Valid by the system's roots.
+        Valid,
+        /// The pinned certificate.
+        PinMatches,
+        /// Nothing pinned for this server: pin this one.
+        Pin,
+        /// Another certificate than the pinned one: refuse.
+        Mismatch,
+    }
+
+    /// `pinned_host` empty: the pin holds for any server address.
+    pub fn decide(valid: bool, fingerprint: &str, host: &str, pinned: &str, pinned_host: &str) -> Decision {
+        let pinned = pinned.trim();
+        if valid {
+            Decision::Valid
+        } else if pinned.is_empty() || (!pinned_host.is_empty() && pinned_host != host) {
+            Decision::Pin
+        } else if pinned.eq_ignore_ascii_case(fingerprint) {
+            Decision::PinMatches
+        } else {
+            Decision::Mismatch
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn trust_on_first_use() {
+            let fp = fingerprint(b"cert");
+            assert_eq!(fp.len(), 64);
+            assert_eq!(decide(true, &fp, "h:1", "", ""), Decision::Valid);
+            assert_eq!(decide(true, &fp, "h:1", "00", "h:1"), Decision::Valid);
+            assert_eq!(decide(false, &fp, "h:1", "", ""), Decision::Pin);
+            assert_eq!(decide(false, &fp, "h:1", &fp, "h:1"), Decision::PinMatches);
+            assert_eq!(decide(false, &fp, "h:1", &fp.to_uppercase(), ""), Decision::PinMatches);
+            assert_eq!(decide(false, &fp, "h:1", &fingerprint(b"other"), "h:1"), Decision::Mismatch);
+            assert_eq!(decide(false, &fp, "h:1", &fingerprint(b"other"), ""), Decision::Mismatch);
+            // Pinned for another server: this one is new.
+            assert_eq!(decide(false, &fp, "h:1", &fingerprint(b"other"), "g:1"), Decision::Pin);
+        }
+    }
+}
+
+/// `file_access` as it applies here. Not set: "home", but "full" when
+/// running as LocalSystem (the Windows service's agent), whose home folder
+/// is the system profile; the person used to reach every drive there.
+fn file_access_setting(config: &AgentConfig) -> String {
+    let value = config.file_access.trim();
+    if !value.is_empty() {
+        return value.to_string();
+    }
+    #[cfg(target_os = "windows")]
+    if win_service::running_as_local_system() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            info!(
+                "File transfer may reach the whole disk: this agent runs as LocalSystem (the Windows service). \
+                 To restrict it, set \"file_access\" to a folder (or \"home\") in {}",
+                crate::pairing::config_path()
+            )
+        });
+        return "full".to_string();
+    }
+    "home".to_string()
+}
+
+/// Stream parameters from the client, bounded to what the capture and
+/// encoders handle (lunaris-media divides by the frame rate, and a few
+/// encoders take the bitrate in 16- or 32-bit fields).
+fn clamp_stream_request(
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<u32>,
+    bitrate: Option<u32>,
+) -> (Option<u32>, Option<u32>, Option<u32>, Option<u32>) {
+    // Even sizes: 4:2:0 encoders need them.
+    let size = |v: u32| v.clamp(64, 8192) & !1;
+    (
+        width.map(size),
+        height.map(size),
+        // lunaris-media keeps the frame rate within 1..=240 when it changes it.
+        fps.map(|v| v.clamp(1, 240)),
+        // kbps; the clients offer up to 150 Mbps.
+        bitrate.map(|v| v.clamp(500, 500_000)),
+    )
 }
 
 /// The agent's session logic: one streaming session at a time, driven by
@@ -598,7 +1040,11 @@ async fn run_session_logic(
                 if let Some(old) = file_sessions.remove(&client_id) {
                     let _ = old.close().await;
                 }
-                match files::start(client_id.clone(), agent_tx.clone(), ice_servers, config.allow_file_transfer).await {
+                let access = files::Access::from_config(&file_access_setting(&config));
+                if let files::Access::Denied(reason) = &access {
+                    warn!("{}", reason);
+                }
+                match files::start(client_id.clone(), agent_tx.clone(), ice_servers, config.allow_file_transfer, access).await {
                     Ok((pc, sdp)) => {
                         file_sessions.insert(client_id.clone(), pc);
                         let _ = agent_tx.send(AgentMessage::Signaling(SignalingMessage::Sdp {
@@ -607,6 +1053,7 @@ async fn run_session_logic(
                             ice_servers: None,
                             webtransport_port: None,
                             webtransport_cert_hash: None,
+                            webtransport_token: None,
                         }));
                     }
                     Err(e) => {
@@ -669,6 +1116,7 @@ async fn run_session_logic(
                 ice_servers,
                 ..
             } => {
+                let (width, height, fps, bitrate) = clamp_stream_request(width, height, fps, bitrate);
                 info!(
                     "Incoming session request from client: {} codec={:?} encoder={:?} res={:?}x{:?} fps={:?} bitrate={:?} display={:?} chroma={:?} encoder_csc_mode={:?} microphone={:?}",
                     client_id, codec, encoder, width, height, fps, bitrate, display_id, chroma, encoder_csc_mode, microphone
@@ -763,6 +1211,7 @@ async fn run_session_logic(
                     ice_servers: None,
                     webtransport_port: session.webtransport_port,
                     webtransport_cert_hash: session.webtransport_cert_hash.clone(),
+                    webtransport_token: session.webtransport_token.clone(),
                 });
 
                 // CRITICAL: Store session BEFORE sending the offer to avoid a race
@@ -777,6 +1226,10 @@ async fn run_session_logic(
 
                 let _ = agent_tx.send(sdp_msg);
                 warn!("[SIGNALING] SDP Offer sent to client: {}", client_id);
+            }
+            SignalingMessage::Sdp { target_id, .. } if active_client.as_deref() != Some(target_id.as_str()) => {
+                // Only the client the offer went to answers it.
+                warn!("[SIGNALING] Ignoring an SDP answer from {} (not the session's client)", target_id);
             }
             SignalingMessage::Sdp { target_id, sdp, .. } => {
                 warn!("[SIGNALING] Received SDP answer from client: {}", target_id);
@@ -811,6 +1264,9 @@ async fn run_session_logic(
                 } else {
                     warn!("[SIGNALING] *** BUG: Received SDP answer but active_session is None! Answer dropped.");
                 }
+            }
+            SignalingMessage::IceCandidate { target_id, .. } if active_client.as_deref() != Some(target_id.as_str()) => {
+                debug!("Ignoring an ICE candidate from {} (not the session's client)", target_id);
             }
             SignalingMessage::IceCandidate {
                 target_id: _,
@@ -961,5 +1417,155 @@ async fn run_session_logic(
     if let Some(session) = session_lock.take() {
         info!("Stopping active remote streaming session on agent exit...");
         let _ = session.peer_connection.close().await;
+    }
+}
+
+#[cfg(test)]
+mod stream_limit_tests {
+    use super::clamp_stream_request;
+
+    #[test]
+    fn stream_parameters_are_bounded() {
+        assert_eq!(clamp_stream_request(None, None, None, None), (None, None, None, None));
+        assert_eq!(
+            clamp_stream_request(Some(1920), Some(1080), Some(60), Some(20_000)),
+            (Some(1920), Some(1080), Some(60), Some(20_000))
+        );
+        assert_eq!(
+            clamp_stream_request(Some(0), Some(u32::MAX), Some(0), Some(u32::MAX)),
+            (Some(64), Some(8192), Some(1), Some(500_000))
+        );
+        assert_eq!(clamp_stream_request(Some(1365), Some(767), Some(100_000), Some(0)), (Some(1364), Some(766), Some(240), Some(500)));
+    }
+}
+
+#[cfg(test)]
+mod server_gate_tests {
+    use super::*;
+
+    fn incoming(client: &str) -> SignalingMessage {
+        SignalingMessage::IncomingFileSession { client_id: client.into(), ice_servers: None, requester: Some("bob".into()) }
+    }
+
+    fn answer(client: &str) -> SignalingMessage {
+        SignalingMessage::IceCandidate {
+            target_id: client.into(),
+            candidate: common::RtcIceCandidate {
+                candidate: String::new(),
+                sdp_mid: None,
+                sdp_mline_index: None,
+                username_fragment: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_passes_everything_ask_waits_for_the_person_here() {
+        let (server_tx, mut server_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let gate = ServerGate::new(false, server_tx.clone(), inbound_tx.clone());
+        gate.pass(incoming("c1"));
+        assert!(matches!(inbound_rx.try_recv(), Ok(SignalingMessage::IncomingFileSession { .. })));
+
+        let gate = ServerGate::new(true, server_tx, inbound_tx);
+        gate.pass(SignalingMessage::GetCapabilities { target_id: "c1".into() });
+        assert!(matches!(inbound_rx.try_recv(), Ok(SignalingMessage::GetCapabilities { .. })));
+        // Nothing from a client that was not accepted reaches the session.
+        gate.pass(answer("c1"));
+        gate.pass(incoming("c1"));
+        assert!(inbound_rx.try_recv().is_err());
+        match server_rx.try_recv() {
+            Ok(AgentMessage::Signaling(SignalingMessage::AccessRequest { target_id, status })) => {
+                assert_eq!((target_id.as_str(), status.as_str()), ("c1", "waiting"));
+            }
+            other => panic!("{:?}", other),
+        }
+        // Once granted, that kind and the messages that follow pass.
+        gate.accepted.lock().unwrap().insert(("c1".into(), approval::Kind::Files));
+        gate.pass(answer("c1"));
+        assert!(matches!(inbound_rx.try_recv(), Ok(SignalingMessage::IceCandidate { .. })));
+        gate.pass(answer("c2"));
+        assert!(inbound_rx.try_recv().is_err());
+    }
+
+    fn session(client: &str) -> SignalingMessage {
+        serde_json::from_value(serde_json::json!({
+            "type": "IncomingSession",
+            "payload": {"client_id": client, "width": null, "height": null, "fps": null, "bitrate": null,
+                        "codec": null, "app_id": null, "encoder": null, "display_id": null, "ice_servers": null}
+        }))
+        .unwrap()
+    }
+
+    /// A gate whose questions are answered "accept" when `answer` is notified.
+    fn gate_with_answer() -> (
+        ServerGate,
+        Arc<tokio::sync::Notify>,
+        mpsc::UnboundedReceiver<AgentMessage>,
+        mpsc::UnboundedReceiver<SignalingMessage>,
+    ) {
+        let (server_tx, server_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let mut gate = ServerGate::new(true, server_tx, inbound_tx);
+        let answer = Arc::new(tokio::sync::Notify::new());
+        let a = answer.clone();
+        gate.ask_fn = Arc::new(move |_, _, cancel| {
+            let a = a.clone();
+            Box::pin(async move {
+                tokio::select! {
+                    _ = a.notified() => Some(approval::Decision::Accepted),
+                    _ = cancel.notified() => None,
+                }
+            })
+        });
+        (gate, answer, server_rx, inbound_rx)
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_left_while_asked_gets_nothing() {
+        let (gate, answer, mut server_rx, mut inbound_rx) = gate_with_answer();
+        gate.pass(session("c1"));
+        assert!(matches!(server_rx.try_recv(), Ok(AgentMessage::Signaling(SignalingMessage::AccessRequest { .. }))));
+        gate.pass(SignalingMessage::EndSession { target_id: "c1".into() });
+        assert!(matches!(inbound_rx.try_recv(), Ok(SignalingMessage::EndSession { .. })));
+        assert!(gate.asking.lock().unwrap().is_empty());
+        // Accepted after the client left: the request is not delivered.
+        answer.notify_waiters();
+        settle().await;
+        assert!(inbound_rx.try_recv().is_err());
+        assert!(server_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn grants_end_with_the_client_and_stop_needs_control() {
+        let (gate, answer, _server_rx, mut inbound_rx) = gate_with_answer();
+        gate.pass(session("c1"));
+        settle().await;
+        answer.notify_waiters();
+        settle().await;
+        assert!(matches!(inbound_rx.try_recv(), Ok(SignalingMessage::IncomingSession { .. })));
+        assert!(gate.accepted.lock().unwrap().contains(&("c1".to_string(), approval::Kind::Control)));
+        // Only a client with screen control stops the stream.
+        gate.accepted.lock().unwrap().insert(("c2".into(), approval::Kind::Files));
+        gate.pass(SignalingMessage::StopActiveStream { target_id: "c2".into() });
+        assert!(inbound_rx.try_recv().is_err());
+        gate.pass(SignalingMessage::StopActiveStream { target_id: "c1".into() });
+        assert!(matches!(inbound_rx.try_recv(), Ok(SignalingMessage::StopActiveStream { .. })));
+        // Its end prunes the grants: later messages from it are dropped.
+        gate.pass(SignalingMessage::EndSession { target_id: "c1".into() });
+        assert!(matches!(inbound_rx.try_recv(), Ok(SignalingMessage::EndSession { .. })));
+        assert!(!gate.accepted.lock().unwrap().iter().any(|(c, _)| c == "c1"));
+        gate.pass(answer_msg("c1"));
+        assert!(inbound_rx.try_recv().is_err());
+    }
+
+    fn answer_msg(client: &str) -> SignalingMessage {
+        answer(client)
     }
 }

@@ -5,7 +5,10 @@
 //! through a relay. The server already is the one address both sides reach, so
 //! it runs a TURN server (UDP, default port 3478) and hands each peer the relay
 //! at the address that peer used to reach the server. Credentials are
-//! short-lived (12 h) HMAC credentials from a per-process secret.
+//! short-lived HMAC credentials from a per-process secret, handed only to
+//! users allowed to use the host (signaling.rs). The relay never sends to
+//! loopback, link-local or unspecified addresses, so it can't be used to
+//! reach services on the server itself.
 //!
 //! Environment:
 //!   LUNARIS_TURN=0              disable
@@ -19,6 +22,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use turn::relay::RelayAddressGenerator;
+use webrtc_util::Conn;
+
 use tracing::{info, warn};
 use turn::auth::{generate_long_term_credentials, LongTermAuthHandler};
 use turn::relay::relay_range::RelayAddressGeneratorRanges;
@@ -27,7 +34,10 @@ use turn::server::Server;
 use webrtc_util::vnet::net::Net;
 
 const REALM: &str = "lunaris";
-const CREDENTIAL_LIFETIME: Duration = Duration::from_secs(12 * 3600);
+/// Needed to open allocations (refreshes of an existing one keep working
+/// after expiry): long enough for new allocations after an ICE restart or a
+/// network change in a long session.
+const CREDENTIAL_LIFETIME: Duration = Duration::from_secs(2 * 3600);
 
 pub struct TurnService {
     secret: String,
@@ -130,14 +140,14 @@ impl TurnService {
             let config = ServerConfig {
                 conn_configs: vec![ConnConfig {
                     conn: Arc::new(socket),
-                    relay_addr_generator: Box::new(RelayAddressGeneratorRanges {
+                    relay_addr_generator: Box::new(GuardedRelay(RelayAddressGeneratorRanges {
                         relay_address: relay_ip,
                         min_port: settings.relay_ports.0,
                         max_port: settings.relay_ports.1,
                         max_retries: 20,
                         address: bind_ip.to_string(),
                         net: net.clone(),
-                    }),
+                    })),
                 }],
                 realm: REALM.to_string(),
                 auth_handler: Arc::new(LongTermAuthHandler::new(secret.clone())),
@@ -192,6 +202,81 @@ impl TurnService {
     }
 }
 
+/// Peers the relay must not send to: this machine and link-local networks.
+fn forbidden_peer(ip: IpAddr) -> bool {
+    match normalize_ip(ip) {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// The turn crate has no permission hook, so the relay socket itself refuses
+/// forbidden peers.
+struct GuardedRelay(RelayAddressGeneratorRanges);
+
+#[async_trait]
+impl RelayAddressGenerator for GuardedRelay {
+    fn validate(&self) -> Result<(), turn::Error> {
+        self.0.validate()
+    }
+
+    fn supports_family(&self, use_ipv4: bool) -> bool {
+        self.0.supports_family(use_ipv4)
+    }
+
+    async fn allocate_conn(
+        &self,
+        use_ipv4: bool,
+        requested_port: u16,
+    ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), turn::Error> {
+        let (conn, addr) = self.0.allocate_conn(use_ipv4, requested_port).await?;
+        Ok((Arc::new(GuardedConn(conn)), addr))
+    }
+}
+
+struct GuardedConn(Arc<dyn Conn + Send + Sync>);
+
+#[async_trait]
+impl Conn for GuardedConn {
+    async fn connect(&self, addr: SocketAddr) -> webrtc_util::Result<()> {
+        if forbidden_peer(addr.ip()) {
+            return Err(webrtc_util::Error::Other(format!("relay to {} refused", addr)));
+        }
+        self.0.connect(addr).await
+    }
+    async fn recv(&self, buf: &mut [u8]) -> webrtc_util::Result<usize> {
+        self.0.recv(buf).await
+    }
+    async fn recv_from(&self, buf: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+    async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
+        self.0.send(buf).await
+    }
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> webrtc_util::Result<usize> {
+        if forbidden_peer(target.ip()) {
+            // Dropped quietly: an error would be logged for every packet.
+            tracing::debug!("TURN relay: dropped data for {}", target);
+            return Ok(buf.len());
+        }
+        self.0.send_to(buf, target).await
+    }
+    fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        self.0.remote_addr()
+    }
+    async fn close(&self) -> webrtc_util::Result<()> {
+        self.0.close().await
+    }
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
 /// IPv4-mapped IPv6 (from a dual-stack socket) as plain IPv4.
 fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
@@ -203,6 +288,16 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_refuses_local_peers() {
+        for ip in ["127.0.0.1", "169.254.1.2", "0.0.0.0", "::1", "fe80::1", "::ffff:127.0.0.1", "224.0.0.1"] {
+            assert!(forbidden_peer(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["192.168.1.20", "10.0.0.5", "172.22.0.4", "203.0.113.7", "2001:db8::1"] {
+            assert!(!forbidden_peer(ip.parse().unwrap()), "{ip}");
+        }
+    }
 
     #[test]
     fn parses_port_ranges() {

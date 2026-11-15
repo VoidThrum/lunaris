@@ -18,9 +18,11 @@ services:
       - SERVER_PORT=8090
       - RUST_LOG=info
       # Initial admin password (first start only). When unset a random one is
-      # generated: see `docker logs lunaris-server` or /data/initial_admin_password.txt.
+      # generated: read it with
+      # `docker exec lunaris-server cat /data/initial_admin_password.txt`.
       # - LUNARIS_ADMIN_PASSWORD=change-me
-      # Token agents use to register (generated on first start when unset):
+      # Token agents use to register (generated on first start when unset; read it with
+      # `docker exec lunaris-server cat /data/server_token.txt`):
       # - LUNARIS_TOKEN=your_secure_agent_token_here
       # This host's LAN or public address, for the built-in TURN relay that
       # connects clients and agents which can't reach each other directly.

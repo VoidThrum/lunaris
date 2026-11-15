@@ -2,13 +2,13 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use url::Url;
 
 use cxx_qt_lib::{QQmlApplicationEngine, QUrl};
 
 pub mod audio;
 pub mod bridge;
 pub mod decoder;
+pub mod deeplink;
 pub mod display_gpu;
 pub mod files;
 pub mod gamepad;
@@ -16,126 +16,12 @@ pub mod host;
 pub mod local_server;
 pub mod input;
 pub mod protocol;
+pub mod secure_fs;
 pub mod share;
 
 use bridge::{AppArgs, PendingDashboardEvent, APP_ARGS};
 
-pub fn parse_deeplink_url(url_str: &str) -> Option<AppArgs> {
-    if !url_str.starts_with("lunaris://") {
-        return None;
-    }
-    if let Ok(parsed_url) = Url::parse(url_str) {
-        let mut host_id = String::new();
-        let mut server_url = String::new();
-        let mut token = String::new();
-
-        let mut width = 1920; // Default resolution
-        let mut height = 1080;
-        let mut fps = 60;
-        let mut bitrate = 8000;
-        let mut codec = "h264".to_string();
-        let mut app_id: Option<u32> = None;
-        let mut mouse_queue_limit = 256;
-        let mut host_name = "Desktop • Host".to_string();
-        let mut disable_cuda = false;
-        let mut input_protocol = "webrtc".to_string();
-        let mut encoder: Option<String> = None;
-        let mut display_id: Option<String> = None;
-        let mut render_backend: Option<String> = None;
-
-        for (k, v) in parsed_url.query_pairs() {
-            match k.as_ref() {
-                "host_id" => host_id = v.into_owned(),
-                "server" => server_url = v.into_owned(),
-                "token" => token = v.into_owned(),
-                "host_name" => host_name = v.into_owned(),
-                "input_protocol" => input_protocol = v.into_owned().to_lowercase(),
-                "encoder" => {
-                    let value = v.into_owned().to_lowercase();
-                    if !value.is_empty() && value != "auto" {
-                        encoder = Some(value);
-                    }
-                }
-                "display" | "display_id" => {
-                    let value = v.into_owned();
-                    if !value.is_empty() && value != "default" {
-                        display_id = Some(value);
-                    }
-                }
-                "render_backend" | "gpu_backend" | "decode_backend" => {
-                    render_backend = Some(v.into_owned());
-                }
-                "app_id" => {
-                    if let Ok(id) = v.parse::<u32>() {
-                        app_id = Some(id);
-                    }
-                }
-                "res" => {
-                    let parts: Vec<&str> = v.split('x').collect();
-                    if parts.len() == 2 {
-                        if let (Ok(w), Ok(h)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                            width = w;
-                            height = h;
-                        }
-                    }
-                }
-                "fps" => {
-                    if let Ok(f) = v.parse::<u32>() {
-                        fps = f;
-                    }
-                }
-                "bitrate" => {
-                    if let Ok(b) = v.parse::<u32>() {
-                        bitrate = b;
-                    }
-                }
-                "codec" => {
-                    codec = v.into_owned().to_lowercase();
-                }
-                "mouse_queue_limit" => {
-                    if let Ok(limit) = v.parse::<u32>() {
-                        mouse_queue_limit = limit;
-                    }
-                }
-                "disable_cuda" => {
-                    if let Ok(val) = v.parse::<bool>() {
-                        disable_cuda = val;
-                    } else if v.as_ref() == "1" || v.as_ref() == "true" {
-                        disable_cuda = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let render_backend = render_backend
-            .map(|value| bridge::normalize_render_backend(&value, disable_cuda))
-            .unwrap_or_else(|| bridge::render_backend_from_disable_cuda(disable_cuda));
-        disable_cuda = bridge::render_backend_disables_cuda(&render_backend);
-
-        if !host_id.is_empty() && !server_url.is_empty() && !token.is_empty() {
-            return Some(AppArgs {
-                host_id,
-                server_url,
-                token,
-                width,
-                height,
-                fps,
-                bitrate,
-                codec,
-                app_id,
-                mouse_queue_limit,
-                host_name,
-                disable_cuda,
-                render_backend,
-                input_protocol,
-                encoder,
-                display_id,
-            });
-        }
-    }
-    None
-}
+pub use deeplink::parse_deeplink_url;
 
 /// Whether Qt Quick can render with OpenGL. In Qt 6 OpenGL is a built-in
 /// RHI backend of Qt Quick, not a plugin (the old `scenegraph/libqsgopengl.so`
@@ -153,6 +39,13 @@ fn linux_nvidia_cuda_present() -> bool {
     }
     std::path::Path::new("/dev/nvidiactl").exists()
         || std::path::Path::new("/proc/driver/nvidia/version").exists()
+}
+
+fn push_event(event: PendingDashboardEvent) {
+    bridge::PENDING_EVENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(event);
 }
 
 fn handle_single_instance() -> bool {
@@ -191,7 +84,9 @@ fn handle_single_instance() -> bool {
                 Err(_) => continue,
             };
 
-            let mut buffer = [0; 4096];
+            // A client that connects and says nothing must not block the others.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut buffer = [0; 16384];
             let n = match stream.read(&mut buffer) {
                 Ok(n) => n,
                 Err(_) => continue,
@@ -202,27 +97,33 @@ fn handle_single_instance() -> bool {
 
             if msg == "FOCUS" {
                 info!("Single-instance: Received FOCUS command");
-                bridge::PENDING_EVENTS.lock().unwrap().push(
-                    PendingDashboardEvent::DeepLinkReceived {
-                        url: "".to_string(),
-                    },
-                );
-            } else if msg.starts_with("CONNECT ") {
-                let url = msg["CONNECT ".len()..].to_string();
-                info!(
-                    "Single-instance: Received CONNECT command with url: {}",
-                    url
-                );
-
-                if let Some(args) = parse_deeplink_url(&url) {
-                    let mut active_config_lock = bridge::ACTIVE_CONFIG.lock().unwrap();
-                    *active_config_lock = Some(args);
+                push_event(PendingDashboardEvent::DeepLinkReceived { url: String::new() });
+            } else if let Some(url) = msg.strip_prefix("CONNECT ") {
+                // Same checks as a link on the command line; a bad line is
+                // ignored (the listener must not panic).
+                let url = url.trim();
+                match deeplink::judge(url) {
+                    deeplink::Verdict::Connect(args) => {
+                        info!(
+                            "Single-instance: link to {} (host {})",
+                            args.server_url, args.host_id
+                        );
+                        deeplink::mark_trusted_session();
+                        *bridge::ACTIVE_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(args);
+                        push_event(PendingDashboardEvent::DeepLinkReceived {
+                            url: "lunaris://connect".to_string(),
+                        });
+                    }
+                    deeplink::Verdict::NeedsConfirmation => {
+                        info!("Single-instance: link to an unknown server, asking the user");
+                        // Empty url = focus; the window then finds the pending link.
+                        push_event(PendingDashboardEvent::DeepLinkReceived { url: String::new() });
+                    }
+                    deeplink::Verdict::Invalid => {
+                        warn!("Single-instance: ignored an invalid link");
+                    }
                 }
-
-                bridge::PENDING_EVENTS
-                    .lock()
-                    .unwrap()
-                    .push(PendingDashboardEvent::DeepLinkReceived { url });
             }
         }
     });
@@ -238,7 +139,18 @@ fn parse_args() -> Option<AppArgs> {
 
     // Check if deep linked: lunaris://connect?host_id=...&server=...&token=...
     if args[1].starts_with("lunaris://") {
-        return parse_deeplink_url(&args[1]);
+        return match deeplink::judge(&args[1]) {
+            deeplink::Verdict::Connect(a) => {
+                deeplink::mark_trusted_session();
+                Some(a)
+            }
+            // The dashboard opens and asks (main.qml).
+            deeplink::Verdict::NeedsConfirmation => None,
+            deeplink::Verdict::Invalid => {
+                warn!("Ignored an invalid lunaris:// link");
+                None
+            }
+        };
     }
 
     // Fallback to normal CLI arguments: client --host-id ID --server URL --token TOKEN ...

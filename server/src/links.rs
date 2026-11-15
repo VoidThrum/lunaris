@@ -1,6 +1,6 @@
 //! Computers added by address: instead of their agent connecting to this
 //! server, the server connects to the agent (its direct-access port,
-//! `ws://<address>/ws/server`, agent/src/direct.rs) and then treats that
+//! `wss://<address>/ws/server`, agent/src/direct.rs) and then treats that
 //! connection exactly like an agent's own (`signaling::agent_connected`), so
 //! they show in the computer list and work from every client.
 //!
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use common::{AgentMessage, ServerToAgentMessage};
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::{self, Message as WsMessage};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, warn};
 
 use crate::signaling::SignalingState;
@@ -168,28 +168,16 @@ async fn connect_once(
     error: &Arc<Mutex<Option<String>>>,
     host_id: &Arc<Mutex<Option<String>>>,
 ) -> Result<(), (String, bool)> {
-    let url = format!(
-        "ws://{}/ws/server?token={}&name={}",
-        address,
-        urlencoding::encode(password.trim()),
-        urlencoding::encode(&server_name())
-    );
-    let (ws, _) = match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url.as_str())).await {
-        Err(_) => return Err(("not reachable (timed out)".into(), false)),
-        Ok(Err(tungstenite::Error::Http(resp))) => {
-            return Err(match resp.status().as_u16() {
-                401 => ("wrong password".into(), true),
-                429 => ("too many wrong passwords; retrying later".into(), true),
-                404 => ("not a Lunaris agent, or one too old for this (update it)".into(), false),
-                code => (format!("refused (HTTP {})", code), false),
-            });
+    let name_query = format!("name={}", urlencoding::encode(&server_name()));
+    let (ws, local_ip) = match direct_auth::connect(address, "/ws/server", password, &name_query).await {
+        Ok(c) => (c.ws, c.local_ip),
+        Err(e) => {
+            // Also slower when TLS fails or the agent can't prove itself:
+            // retrying fast won't change it.
+            use direct_auth::ConnectError as E;
+            let refused = matches!(e, E::WrongPassword | E::TooManyAttempts | E::NotSecure(_) | E::NotProven);
+            return Err((e.to_string(), refused));
         }
-        Ok(Err(e)) => return Err((format!("not reachable ({})", e), false)),
-        Ok(Ok(c)) => c,
-    };
-    let local_ip = match ws.get_ref() {
-        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp.local_addr().ok().map(|a| a.ip()),
-        _ => None,
     };
     let (mut write, mut read) = ws.split();
 
@@ -276,6 +264,426 @@ impl Drop for Registered {
     fn drop(&mut self) {
         let (state, id, conn_id) = (self.state.clone(), self.id.clone(), self.conn_id);
         tokio::spawn(async move { crate::signaling::agent_disconnected(&state, &id, conn_id).await });
+    }
+}
+
+/// Client side of the agent's direct-connection handshake (the agent's side
+/// and the desktop app's copy are agent/src/direct/handshake.rs; the test
+/// vectors below are the same there, so the two cannot drift apart).
+///
+/// TLS first, accepting the agent's self-signed certificate: there is
+/// nothing to check it against. What stops a man in the middle is the
+/// password proof, bound to the certificate seen here: HMAC-SHA256(password,
+/// label || agent nonce || client nonce || SHA-256 of the certificate), sent
+/// by us, and the agent's answer over another label, checked here (the
+/// `tls-server-end-point` channel binding of SCRAM, RFC 5929). The password
+/// itself never crosses the network. With a password, only an answer with
+/// the agent's valid MAC is accepted. Older agents don't speak TLS: no
+/// connection then (no plain fallback that would expose the password).
+mod direct_auth {
+    use std::net::IpAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
+    use ring::hmac;
+    use ring::rand::{SecureRandom, SystemRandom};
+    use serde::{Deserialize, Serialize};
+    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio::net::TcpStream;
+    use tokio_rustls::rustls;
+    use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use tokio_rustls::rustls::crypto::CryptoProvider;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use tokio_rustls::rustls::{DigitallySignedStruct, SignatureScheme};
+    use tokio_tungstenite::tungstenite::{self, Message as WsMessage};
+    use tokio_tungstenite::WebSocketStream;
+
+    pub const CLIENT_LABEL: &[u8] = b"lunaris-direct-auth-v1 client";
+    pub const AGENT_LABEL: &[u8] = b"lunaris-direct-auth-v1 agent";
+    pub type Nonce = [u8; 32];
+    pub type Digest = [u8; 32];
+
+    const STEP_TIMEOUT: Duration = Duration::from_secs(8);
+
+    pub fn sha256(data: &[u8]) -> Digest {
+        ring::digest::digest(&ring::digest::SHA256, data).as_ref().try_into().expect("SHA-256 is 32 bytes")
+    }
+
+    fn mac_input(label: &[u8], agent_nonce: &Nonce, client_nonce: &Nonce, cert_hash: &Digest) -> Vec<u8> {
+        [label, &agent_nonce[..], &client_nonce[..], &cert_hash[..]].concat()
+    }
+
+    fn mac_key(password: &str) -> hmac::Key {
+        hmac::Key::new(hmac::HMAC_SHA256, password.trim().as_bytes())
+    }
+
+    pub fn mac(label: &[u8], password: &str, agent_nonce: &Nonce, client_nonce: &Nonce, cert_hash: &Digest) -> Digest {
+        let tag = hmac::sign(&mac_key(password), &mac_input(label, agent_nonce, client_nonce, cert_hash));
+        tag.as_ref().try_into().expect("HMAC-SHA256 is 32 bytes")
+    }
+
+    /// Constant time (ring's HMAC verify).
+    pub fn mac_ok(label: &[u8], password: &str, agent_nonce: &Nonce, client_nonce: &Nonce, cert_hash: &Digest, tag: &[u8]) -> bool {
+        hmac::verify(&mac_key(password), &mac_input(label, agent_nonce, client_nonce, cert_hash), tag).is_ok()
+    }
+
+    pub fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    pub fn from_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+        if text.len() != 2 * N || !text.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut out = [0u8; N];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+        }
+        Some(out)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "auth", rename_all = "snake_case")]
+    pub enum AuthMessage {
+        Hello { version: u32 },
+        Challenge { nonce: String },
+        Proof {
+            client_nonce: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            mac: Option<String>,
+        },
+        Ok {
+            trusted: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            mac: Option<String>,
+        },
+        Refused { reason: String },
+    }
+
+    /// The agent's self-signed certificate is accepted (see the module
+    /// comment); handshake signatures are still checked, so the peer owns
+    /// the key of the certificate the proof is bound to.
+    #[derive(Debug)]
+    struct AcceptAnyCert(Arc<CryptoProvider>);
+
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    fn server_name(address: &str) -> ServerName<'static> {
+        let host = if let Some(rest) = address.strip_prefix('[') {
+            rest.split(']').next().unwrap_or("")
+        } else {
+            address.rsplit_once(':').map(|(h, _)| h).unwrap_or(address)
+        };
+        ServerName::try_from(host.to_string())
+            .unwrap_or_else(|_| ServerName::try_from("lunaris-agent").expect("valid DNS name"))
+    }
+
+    pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+    impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+    pub struct Connected {
+        pub ws: WebSocketStream<Box<dyn Io>>,
+        pub local_ip: Option<IpAddr>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum ConnectError {
+        Unreachable(String),
+        /// TLS failed: an agent from before secure direct connections (or
+        /// someone in the way). The password is never sent without TLS.
+        NotSecure(String),
+        WrongPassword,
+        /// With a password: no valid MAC from the agent in the answer.
+        NotProven,
+        TooManyAttempts,
+        NotFound,
+        Refused(String),
+        Protocol(String),
+    }
+
+    impl std::fmt::Display for ConnectError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                ConnectError::Unreachable(e) => write!(f, "not reachable ({})", e),
+                ConnectError::NotSecure(e) => write!(
+                    f,
+                    "cannot connect securely (TLS failed: {}); if it runs a Lunaris agent older than {}, update that agent",
+                    e,
+                    env!("CARGO_PKG_VERSION")
+                ),
+                ConnectError::WrongPassword => write!(f, "wrong password"),
+                ConnectError::NotProven => write!(f, "wrong password, or this is not the computer you expect"),
+                ConnectError::TooManyAttempts => write!(f, "too many wrong passwords; retrying later"),
+                ConnectError::NotFound => write!(f, "not a Lunaris agent, or one too old for this (update it)"),
+                ConnectError::Refused(e) => write!(f, "refused ({})", e),
+                ConnectError::Protocol(e) => write!(f, "{}", e),
+            }
+        }
+    }
+
+    fn http_error(e: tungstenite::Error) -> ConnectError {
+        match e {
+            tungstenite::Error::Http(resp) => match resp.status().as_u16() {
+                401 => ConnectError::WrongPassword,
+                429 => ConnectError::TooManyAttempts,
+                404 => ConnectError::NotFound,
+                code => ConnectError::Refused(format!("HTTP {}", code)),
+            },
+            e => ConnectError::Unreachable(e.to_string()),
+        }
+    }
+
+    async fn tcp(address: &str) -> Result<TcpStream, ConnectError> {
+        match tokio::time::timeout(STEP_TIMEOUT, TcpStream::connect(address)).await {
+            Ok(Ok(s)) => {
+                let _ = s.set_nodelay(true);
+                Ok(s)
+            }
+            Ok(Err(e)) => Err(ConnectError::Unreachable(e.to_string())),
+            Err(_) => Err(ConnectError::Unreachable("timed out".into())),
+        }
+    }
+
+    async fn upgrade(url: String, stream: Box<dyn Io>) -> Result<WebSocketStream<Box<dyn Io>>, ConnectError> {
+        match tokio::time::timeout(STEP_TIMEOUT, tokio_tungstenite::client_async(url, stream)).await {
+            Ok(r) => r.map(|(ws, _)| ws).map_err(http_error),
+            Err(_) => Err(ConnectError::Unreachable("timed out".into())),
+        }
+    }
+
+    /// `address` "host:port", `path` "/ws/server", `query` extra parameters
+    /// (never the password).
+    pub async fn connect(address: &str, path: &str, password: &str, query: &str) -> Result<Connected, ConnectError> {
+        let query = query.trim_start_matches(['&', '?']);
+        let stream = tcp(address).await?;
+        let local_ip = stream.local_addr().ok().map(|a| a.ip());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| ConnectError::Protocol(e.to_string()))?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        // TLS only: no plain fallback, which anyone on the network could
+        // force (the retry loop would hand them the password every time).
+        let tls = match tokio::time::timeout(STEP_TIMEOUT, connector.connect(server_name(address), stream)).await {
+            Ok(Ok(tls)) => tls,
+            Ok(Err(e)) => return Err(ConnectError::NotSecure(e.to_string())),
+            Err(_) => return Err(ConnectError::NotSecure("timed out".into())),
+        };
+        let cert_hash = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| sha256(cert))
+            .ok_or_else(|| ConnectError::Protocol("no certificate".into()))?;
+        let sep = if query.is_empty() { "" } else { "?" };
+        let mut ws = upgrade(format!("wss://{}{}{}{}", address, path, sep, query), Box::new(tls)).await?;
+        // Untrusted (no password): the person at the computer accepts each
+        // session; `Link::needs_approval` already says so.
+        let _trusted = match tokio::time::timeout(STEP_TIMEOUT, client_auth(&mut ws, password, &cert_hash)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(ConnectError::Protocol("no answer to the password proof".into())),
+        };
+        Ok(Connected { ws, local_ip })
+    }
+
+    async fn send_auth(ws: &mut WebSocketStream<Box<dyn Io>>, msg: &AuthMessage) -> Result<(), ConnectError> {
+        let json = serde_json::to_string(msg).expect("handshake messages serialize");
+        ws.send(WsMessage::Text(json.into())).await.map_err(|e| ConnectError::Unreachable(e.to_string()))
+    }
+
+    async fn recv_auth(ws: &mut WebSocketStream<Box<dyn Io>>) -> Option<AuthMessage> {
+        loop {
+            match ws.next().await? {
+                Ok(WsMessage::Text(text)) => return serde_json::from_str(&text).ok(),
+                Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => continue,
+                _ => return None,
+            }
+        }
+    }
+
+    fn refusal(reason: &str) -> ConnectError {
+        match reason {
+            "unauthorized" => ConnectError::WrongPassword,
+            "too_many_attempts" => ConnectError::TooManyAttempts,
+            other => ConnectError::Refused(other.chars().filter(|c| !c.is_control()).take(100).collect()),
+        }
+    }
+
+    /// Ok(trusted): false when the person at the computer will be asked.
+    async fn client_auth(ws: &mut WebSocketStream<Box<dyn Io>>, password: &str, cert_hash: &Digest) -> Result<bool, ConnectError> {
+        send_auth(ws, &AuthMessage::Hello { version: 1 }).await?;
+        let agent_nonce = match recv_auth(ws).await {
+            Some(AuthMessage::Challenge { nonce }) => from_hex::<32>(&nonce),
+            Some(AuthMessage::Refused { reason }) => return Err(refusal(&reason)),
+            _ => None,
+        }
+        .ok_or_else(|| ConnectError::Protocol("unexpected answer (not a Lunaris agent?)".into()))?;
+        let mut client_nonce = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut client_nonce)
+            .map_err(|_| ConnectError::Protocol("no random numbers".into()))?;
+        let has_password = !password.trim().is_empty();
+        let mac = has_password.then(|| to_hex(&mac(CLIENT_LABEL, password, &agent_nonce, &client_nonce, cert_hash)));
+        send_auth(ws, &AuthMessage::Proof { client_nonce: to_hex(&client_nonce), mac }).await?;
+        judge_answer(recv_auth(ws).await, password, &agent_nonce, &client_nonce, cert_hash)
+    }
+
+    /// Ok(trusted). With a password, only an answer carrying the agent's
+    /// valid MAC goes on: "ok, untrusted" without it could come from an
+    /// impostor with its own certificate.
+    fn judge_answer(
+        answer: Option<AuthMessage>,
+        password: &str,
+        agent_nonce: &Nonce,
+        client_nonce: &Nonce,
+        cert_hash: &Digest,
+    ) -> Result<bool, ConnectError> {
+        let has_password = !password.trim().is_empty();
+        match answer {
+            Some(AuthMessage::Refused { reason }) => Err(refusal(&reason)),
+            Some(AuthMessage::Ok { trusted, mac }) if has_password => {
+                let tag = mac.as_deref().and_then(from_hex::<32>);
+                let proven = tag.is_some_and(|t| mac_ok(AGENT_LABEL, password, agent_nonce, client_nonce, cert_hash, &t));
+                // Proven but untrusted: an agent in click mode, it asks there.
+                if proven { Ok(trusted) } else { Err(ConnectError::NotProven) }
+            }
+            Some(AuthMessage::Ok { trusted: false, .. }) => Ok(false),
+            Some(AuthMessage::Ok { trusted: true, .. }) => Err(ConnectError::NotProven),
+            _ => Err(ConnectError::Protocol("unexpected answer to the password proof".into())),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // The same vectors are in agent/src/direct/handshake.rs; computed
+        // independently (Python hmac/hashlib).
+        const PASSWORD: &str = "abcd-efgh-ijkl";
+        const CERT_HASH_HEX: &str = "fc105ce3018116bb697b777e09fd7ce7039e628a31ad7aab6c9bbe02c3bf0d1d";
+        const CLIENT_MAC_HEX: &str = "5443f1e19d8c91e2256950e29b0476d5f90f9e9bba6ee2d799e271af115739cd";
+        const AGENT_MAC_HEX: &str = "a389673baba901cf246ec3b4b83db77a97e466384fc8c76897ddd2d3abe497e8";
+
+        #[test]
+        fn mac_test_vectors() {
+            let cert_hash = sha256(b"lunaris test certificate");
+            assert_eq!(to_hex(&cert_hash), CERT_HASH_HEX);
+            let (an, cn) = ([0x11u8; 32], [0x22u8; 32]);
+            assert_eq!(to_hex(&mac(CLIENT_LABEL, PASSWORD, &an, &cn, &cert_hash)), CLIENT_MAC_HEX);
+            assert_eq!(to_hex(&mac(AGENT_LABEL, PASSWORD, &an, &cn, &cert_hash)), AGENT_MAC_HEX);
+            assert_eq!(to_hex(&mac(CLIENT_LABEL, " abcd-efgh-ijkl\n", &an, &cn, &cert_hash)), CLIENT_MAC_HEX);
+            let tag = from_hex::<32>(AGENT_MAC_HEX).unwrap();
+            assert!(mac_ok(AGENT_LABEL, PASSWORD, &an, &cn, &cert_hash, &tag));
+            assert!(!mac_ok(CLIENT_LABEL, PASSWORD, &an, &cn, &cert_hash, &tag));
+            assert!(!mac_ok(AGENT_LABEL, PASSWORD, &an, &cn, &sha256(b"other"), &tag));
+        }
+
+        #[test]
+        fn message_test_vectors() {
+            let json = |m: &AuthMessage| serde_json::to_string(m).unwrap();
+            assert_eq!(json(&AuthMessage::Hello { version: 1 }), r#"{"auth":"hello","version":1}"#);
+            assert_eq!(json(&AuthMessage::Challenge { nonce: "ab".into() }), r#"{"auth":"challenge","nonce":"ab"}"#);
+            assert_eq!(
+                json(&AuthMessage::Proof { client_nonce: "cd".into(), mac: Some("ef".into()) }),
+                r#"{"auth":"proof","client_nonce":"cd","mac":"ef"}"#
+            );
+            assert_eq!(json(&AuthMessage::Proof { client_nonce: "cd".into(), mac: None }), r#"{"auth":"proof","client_nonce":"cd"}"#);
+            assert_eq!(json(&AuthMessage::Ok { trusted: false, mac: None }), r#"{"auth":"ok","trusted":false}"#);
+            assert_eq!(
+                json(&AuthMessage::Refused { reason: "too_many_attempts".into() }),
+                r#"{"auth":"refused","reason":"too_many_attempts"}"#
+            );
+            assert_eq!(refusal("unauthorized"), ConnectError::WrongPassword);
+        }
+
+        #[test]
+        fn with_a_password_only_the_agents_valid_mac_is_accepted() {
+            let (an, cn, ch) = ([1u8; 32], [2u8; 32], sha256(b"cert"));
+            let good = Some(to_hex(&mac(AGENT_LABEL, "pw", &an, &cn, &ch)));
+            let ok = |trusted: bool, mac: Option<String>| Some(AuthMessage::Ok { trusted, mac });
+            assert_eq!(judge_answer(ok(true, good.clone()), "pw", &an, &cn, &ch), Ok(true));
+            assert_eq!(judge_answer(ok(false, good.clone()), "pw", &an, &cn, &ch), Ok(false));
+            assert_eq!(judge_answer(ok(false, None), "pw", &an, &cn, &ch), Err(ConnectError::NotProven));
+            assert_eq!(judge_answer(ok(true, None), "pw", &an, &cn, &ch), Err(ConnectError::NotProven));
+            let client_side = Some(to_hex(&mac(CLIENT_LABEL, "pw", &an, &cn, &ch)));
+            assert_eq!(judge_answer(ok(true, client_side), "pw", &an, &cn, &ch), Err(ConnectError::NotProven));
+            let other_cert = Some(to_hex(&mac(AGENT_LABEL, "pw", &an, &cn, &sha256(b"other"))));
+            assert_eq!(judge_answer(ok(true, other_cert), "pw", &an, &cn, &ch), Err(ConnectError::NotProven));
+            assert_eq!(judge_answer(ok(false, None), "", &an, &cn, &ch), Ok(false));
+            assert_eq!(judge_answer(ok(true, good), "", &an, &cn, &ch), Err(ConnectError::NotProven));
+        }
+
+        /// An agent from before TLS: after the failed TLS hello, nothing
+        /// else (no plain request, no password) reaches it.
+        #[tokio::test]
+        async fn nothing_goes_over_plain_after_a_tls_failure() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Mutex;
+            use tokio::io::AsyncReadExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let seen: Arc<Mutex<Vec<u8>>> = Arc::default();
+            let conns = Arc::new(AtomicUsize::new(0));
+            let (seen2, conns2) = (seen.clone(), conns.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    conns2.fetch_add(1, Ordering::SeqCst);
+                    let seen = seen2.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        if let Ok(n) = stream.read(&mut buf).await {
+                            seen.lock().unwrap().extend_from_slice(&buf[..n]);
+                        }
+                    });
+                }
+            });
+            let err = connect(&addr, "/ws/server", "secret-pw", "name=srv").await.err().unwrap();
+            assert!(matches!(err, ConnectError::NotSecure(_)), "{:?}", err);
+            assert!(err.to_string().contains("update that agent"));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(conns.load(Ordering::SeqCst), 1);
+            let text = String::from_utf8_lossy(&seen.lock().unwrap()).to_string();
+            assert!(!text.contains("token=") && !text.contains("secret-pw") && !text.contains("GET "), "{}", text);
+        }
     }
 }
 

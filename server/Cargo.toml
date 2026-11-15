@@ -46,6 +46,15 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 # links.rs: connecting to agents added by address
 tokio-tungstenite = "0.30"
 urlencoding = "2.1"
+# links.rs: the password proof (HMAC-SHA256) and nonces of the direct-connection
+# handshake, same backend as tokio-rustls above.
+ring = "0.17"
+# Secrets (JWT key, agent token) from the OS random source; agent keys stored
+# as SHA-256; tokens and keys compared in constant time.
+getrandom = "0.4"
+sha2 = "0.11"
+hex = "0.4"
+subtle = "2.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

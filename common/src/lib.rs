@@ -281,6 +281,10 @@ pub enum SignalingMessage {
         ice_servers: Option<Vec<RtcIceServer>>,
         webtransport_port: Option<u16>,
         webtransport_cert_hash: Option<String>,
+        /// Agent -> client: the secret path of the WebTransport URL
+        /// (`https://host:port/<token>`); agents without it accept any path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        webtransport_token: Option<String>,
     },
     IceCandidate {
         target_id: String,

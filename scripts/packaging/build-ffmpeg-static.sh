@@ -19,30 +19,47 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 
+# Each tag is pinned to the commit it pointed to when chosen (checked after the clone);
+# when bumping a version, update the commit with it.
 NVCODEC_VERSION=n12.2.72.0
+NVCODEC_COMMIT=c69278340ab1d5559c7d7bf0edf615dc33ddbba7
 X264_BRANCH=stable
 SVTAV1_VERSION=v2.3.0
+SVTAV1_COMMIT=6e69def4ec283fe0b71195671245c3b768bebdef
 DAV1D_VERSION=1.5.1
+DAV1D_COMMIT=42b2b24fb8819f1ed3643aa9cf2a62f03868e3aa
 VPL_VERSION=v2.14.0
+VPL_COMMIT=025d43d086a3e663184cb49febe86152bf05409f
 FFMPEG_VERSION=n8.1
+FFMPEG_COMMIT=9047fa1b084f76b1b4d065af2d743df1b40dfb56
 
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 LIC="$PREFIX/share/licenses"
 mkdir -p "$LIC"
 
+# clone <url> <tag> <dir> [expected commit]
 # Retries: the git hosts (videolan.org especially) drop connections now and then.
 clone() {
-    local i
+    local i got
     for i in 1 2 3 4 5; do
         rm -rf "$3"
-        git clone -q --depth 1 -b "$2" "$1" "$3" && return 0
+        if git clone -q --depth 1 -b "$2" "$1" "$3"; then
+            if [ -n "${4:-}" ]; then
+                got="$(git -C "$3" rev-parse HEAD)"
+                if [ "$got" != "$4" ]; then
+                    echo "ERROR: $1 tag $2 is at $got, expected $4. The tag was moved or the host was tampered with; check it before updating the pinned commit." >&2
+                    exit 1
+                fi
+            fi
+            return 0
+        fi
         echo "git clone of $1 failed (attempt $i), retrying" >&2; sleep 15
     done
     return 1
 }
 
 echo "== nv-codec-headers $NVCODEC_VERSION"
-clone https://github.com/FFmpeg/nv-codec-headers.git "$NVCODEC_VERSION" nvcodec
+clone https://github.com/FFmpeg/nv-codec-headers.git "$NVCODEC_VERSION" nvcodec "$NVCODEC_COMMIT"
 make -C nvcodec PREFIX="$PREFIX" install >/dev/null
 install -Dm644 nvcodec/README "$LIC/nv-codec-headers/README"
 
@@ -56,7 +73,7 @@ git -C x264 rev-parse HEAD > "$LIC/x264/VERSION"
 # SVT-AV1 enables LTO in release builds; its objects would then be GCC LTO
 # bytecode that lld (Rust's default linker) cannot read, so turn LTO off.
 echo "== SVT-AV1 $SVTAV1_VERSION"
-clone https://gitlab.com/AOMediaCodec/SVT-AV1.git "$SVTAV1_VERSION" svtav1
+clone https://gitlab.com/AOMediaCodec/SVT-AV1.git "$SVTAV1_VERSION" svtav1 "$SVTAV1_COMMIT"
 cmake -S svtav1 -B svtav1/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF \
     -DBUILD_APPS=OFF -DBUILD_DEC=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -66,14 +83,14 @@ install -Dm644 svtav1/LICENSE.md "$LIC/svt-av1/LICENSE.md"
 install -Dm644 svtav1/PATENTS.md "$LIC/svt-av1/PATENTS.md"
 
 echo "== dav1d $DAV1D_VERSION"
-clone https://code.videolan.org/videolan/dav1d.git "$DAV1D_VERSION" dav1d
+clone https://code.videolan.org/videolan/dav1d.git "$DAV1D_VERSION" dav1d "$DAV1D_COMMIT"
 meson setup dav1d/build dav1d --prefix="$PREFIX" --libdir=lib --buildtype=release \
     --default-library=static -Denable_tools=false -Denable_tests=false >/dev/null
 ninja -C dav1d/build install >/dev/null
 install -Dm644 dav1d/COPYING "$LIC/dav1d/COPYING"
 
 echo "== oneVPL dispatcher $VPL_VERSION"
-clone https://github.com/intel/libvpl.git "$VPL_VERSION" vpl
+clone https://github.com/intel/libvpl.git "$VPL_VERSION" vpl "$VPL_COMMIT"
 cmake -S vpl -B vpl/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DINSTALL_EXAMPLES=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
@@ -81,7 +98,7 @@ ninja -C vpl/build install >/dev/null
 install -Dm644 vpl/LICENSE "$LIC/libvpl/LICENSE"
 
 echo "== FFmpeg $FFMPEG_VERSION"
-clone https://github.com/FFmpeg/FFmpeg.git "$FFMPEG_VERSION" ffmpeg
+clone https://github.com/FFmpeg/FFmpeg.git "$FFMPEG_VERSION" ffmpeg "$FFMPEG_COMMIT"
 (cd ffmpeg && exec ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" \
     --enable-static --disable-shared --enable-pic --pkg-config-flags=--static \
     --disable-programs --disable-doc --disable-debug --disable-autodetect --disable-everything \

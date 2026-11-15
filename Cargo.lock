@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "agent"
-version = "0.3.8"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -53,12 +53,17 @@ dependencies = [
  "num-derive 0.5.1",
  "num-traits",
  "once_cell",
+ "rcgen",
  "reqwest",
+ "ring",
  "rtc",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
@@ -74,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "agent-app"
-version = "0.3.8"
+version = "0.4.0"
 dependencies = [
  "agent",
  "cxx",
@@ -771,7 +776,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "client-desktop"
-version = "0.3.8"
+version = "0.4.0"
 dependencies = [
  "agent",
  "client-qml",
@@ -780,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "client-qml"
-version = "0.3.8"
+version = "0.4.0"
 dependencies = [
  "agent",
  "anyhow",
@@ -877,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.3.8"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -4816,7 +4821,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.3.8"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4826,6 +4831,8 @@ dependencies = [
  "chrono",
  "common",
  "futures-util",
+ "getrandom 0.4.3",
+ "hex",
  "hostname",
  "hyper",
  "hyper-util",
@@ -4835,12 +4842,15 @@ dependencies = [
  "num-traits",
  "once_cell",
  "rcgen",
+ "ring",
  "rtc",
  "rust-embed",
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "sqlx",
+ "subtle",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",

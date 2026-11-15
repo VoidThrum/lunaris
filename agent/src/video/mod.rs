@@ -17,3 +17,10 @@ pub fn trim_bytes_to_range(mut buf: BytesMut, range: Range<usize>) -> BytesMut {
 
     buf
 }
+
+/// The encoder's frame as a `BytesMut` without copying it (`Bytes::from(Vec)`
+/// keeps the allocation, and a unique `Bytes` converts back in place), so the
+/// NAL units split from it are views into the same buffer.
+pub fn frame_buffer(frame: Vec<u8>) -> BytesMut {
+    BytesMut::from(bytes::Bytes::from(frame))
+}

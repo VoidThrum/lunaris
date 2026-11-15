@@ -291,6 +291,7 @@ async fn main() -> Result<()> {
         ice_servers: None,
         webtransport_port: None,
         webtransport_cert_hash: None,
+        webtransport_token: None,
     })?;
 
     // Remote candidates, and the agent's EncoderStatus, until the deadline.

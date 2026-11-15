@@ -483,6 +483,9 @@ ApplicationWindow {
             window.raise();
             window.requestActivate();
 
+            // A link to a server the user is not signed in to asks first.
+            if (linkDialog.openIfPending()) return;
+
             if (url !== "") {
                 window.isStreamMode = true;
                 bridge.setVideoSink(videoOutput.videoSink);
@@ -1399,6 +1402,7 @@ ApplicationWindow {
             rootContainer.forceActiveFocus();
         } else {
             window.isStreamMode = false;
+            linkDialog.openIfPending();
         }
         bridge.checkForUpdates();
     }
@@ -1502,6 +1506,85 @@ ApplicationWindow {
                 }
                 SecondaryButton { text: I18n.t("Decline"); onClicked: approvalDialog.answer(false) }
                 PrimaryButton { text: I18n.t("Accept"); onClicked: approvalDialog.answer(true) }
+            }
+        }
+    }
+    // A lunaris:// link to a server other than the one this app is signed in
+    // to: nothing connects until the user says so.
+    DialogFrame {
+        id: linkDialog
+        property string server: ""
+        property string computer: ""
+        property bool answered: false
+        width: 460
+        function openIfPending() {
+            var raw = bridge.pendingLinkInfo();
+            if (raw === "") return false;
+            var info = {};
+            try { info = JSON.parse(raw); } catch (e) { bridge.answerPendingLink(false); return false; }
+            server = info.server || "";
+            computer = info.computer || "";
+            answered = false;
+            open();
+            return true;
+        }
+        function answer(accept) {
+            if (answered) return;
+            answered = true;
+            var ok = bridge.answerPendingLink(accept);
+            close();
+            if (accept && ok) {
+                window.isStreamMode = true;
+                bridge.setVideoSink(videoOutput.videoSink);
+                bridge.startStream();
+                bridge.requestSettings();
+                rootContainer.forceActiveFocus();
+            }
+        }
+        onOpened: linkCancelButton.forceActiveFocus()
+        onClosed: answer(false)
+        contentItem: ColumnLayout {
+            spacing: 12
+            Text {
+                Layout.fillWidth: true
+                text: I18n.t("Connect to another server?")
+                color: Theme.textStrong
+                font.pixelSize: 16
+                font.weight: Font.DemiBold
+                wrapMode: Text.WordWrap
+            }
+            Text {
+                Layout.fillWidth: true
+                text: I18n.t("A link wants to connect this app to %1. Only continue if you opened this link yourself.").arg(linkDialog.server)
+                color: Theme.text
+                font.pixelSize: 13
+                wrapMode: Text.WrapAnywhere
+            }
+            Text {
+                Layout.fillWidth: true
+                text: I18n.t("Computer: %1").arg(linkDialog.computer)
+                color: Theme.textMuted
+                font.pixelSize: 12
+                elide: Text.ElideRight
+            }
+            Text {
+                Layout.fillWidth: true
+                text: I18n.t("Clipboard and file transfer stay off in this session.")
+                color: Theme.textMuted
+                font.pixelSize: 12
+                wrapMode: Text.WordWrap
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Item { Layout.fillWidth: true }
+                SecondaryButton {
+                    id: linkCancelButton
+                    text: I18n.t("Cancel")
+                    focus: true
+                    onClicked: linkDialog.answer(false)
+                }
+                SecondaryButton { text: I18n.t("Connect"); danger: true; onClicked: linkDialog.answer(true) }
             }
         }
     }

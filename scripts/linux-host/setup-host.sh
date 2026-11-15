@@ -44,6 +44,7 @@ install -Dm644 "$HERE/60-lunaris.conf" "$MODULES_DST"
 modprobe uinput
 reload_udev
 echo "Installed $RULES_DST and $MODULES_DST; uinput loaded."
+echo "This lets the user on the local seat and members of the 'input' group create virtual keyboards/mice through /dev/uinput (input injection into the whole session); undo with --uninstall."
 
 if [[ -n "${AGENT_BIN:-}" ]]; then
     command -v setcap >/dev/null || die "setcap not found (install libcap2-bin / libcap)"

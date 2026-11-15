@@ -182,6 +182,272 @@ fn service_config_path() -> PathBuf {
     data_dir().join("agent_config.json")
 }
 
+/// Whether this process runs as LocalSystem (S-1-5-18), as the service and
+/// its agent do.
+pub fn running_as_local_system() -> bool {
+    use windows::Win32::Security::{
+        GetTokenInformation, IsWellKnownSid, TokenUser, WinLocalSystemSid, TOKEN_QUERY, TOKEN_USER,
+    };
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        // TOKEN_USER and the SID after it (at most 68 bytes); u64 for alignment.
+        let mut buf = [0u64; 32];
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            std::mem::size_of_val(&buf) as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        if !ok {
+            return false;
+        }
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        IsWellKnownSid(user.User.Sid, WinLocalSystemSid).as_bool()
+    }
+}
+
+// ---- Permissions of the data folder ----
+//
+// It holds the service's config (access password, server token, agent key)
+// and its log. Owner Administrators; only SYSTEM and Administrators have
+// access, and nothing is inherited from ProgramData (where every user may
+// create folders). The app or agent run by a user keeps its own config in
+// that user's profile (pairing.rs `default_config_path`), not here.
+
+use windows::Win32::Foundation::{LocalFree, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HLOCAL};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
+};
+use windows::Win32::Security::{
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACL, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+};
+use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+
+/// The folder: inherited by everything created in it.
+const DATA_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// Files already in it.
+const DATA_FILE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+
+/// A self-relative security descriptor made from SDDL (freed with LocalFree).
+struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl SecurityDescriptor {
+    fn from_sddl(sddl: &str) -> Result<Self, String> {
+        let wide = wide_z(OsStr::new(sddl));
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide.as_ptr()),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+        }
+        .map_err(|e| format!("security descriptor {sddl}: {e}"))?;
+        Ok(Self(sd))
+    }
+
+    /// Sets this owner and (protected) DACL on `path`.
+    fn apply(&self, path: &Path) -> Result<(), String> {
+        unsafe {
+            let mut owner = PSID::default();
+            let mut defaulted = windows::core::BOOL::default();
+            GetSecurityDescriptorOwner(self.0, &mut owner, &mut defaulted).map_err(|e| e.to_string())?;
+            let mut present = windows::core::BOOL::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted)
+                .map_err(|e| e.to_string())?;
+            let wide = wide_z(path.as_os_str());
+            let result = SetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                Some(owner),
+                None,
+                Some(dacl as *const ACL),
+                None,
+            );
+            if result != ERROR_SUCCESS {
+                return Err(format!(
+                    "cannot set the permissions of {}: {}",
+                    path.display(),
+                    std::io::Error::from_raw_os_error(result.0 as i32)
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.0 .0)));
+        }
+    }
+}
+
+/// Creates `%ProgramData%\Lunaris` for SYSTEM and Administrators only, or
+/// takes an existing one over (owner and permissions reset, also of the
+/// files in it: someone else may have made it before the service was
+/// installed). Refuses a folder that is, or holds, a link.
+pub fn secure_data_dir() -> Result<PathBuf, String> {
+    let dir = data_dir();
+    let dir_sd = SecurityDescriptor::from_sddl(DATA_DIR_SDDL)?;
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!("{} is a link: refusing to use it, remove it", dir.display()));
+        }
+        Ok(m) if !m.is_dir() => return Err(format!("{} is not a folder", dir.display())),
+        Ok(_) => {}
+        Err(_) => {
+            // Created with its permissions, so nobody can open it in between.
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: dir_sd.0 .0,
+                bInheritHandle: false.into(),
+            };
+            let wide = wide_z(dir.as_os_str());
+            if let Err(e) = unsafe { CreateDirectoryW(PCWSTR(wide.as_ptr()), Some(&attributes as *const SECURITY_ATTRIBUTES)) } {
+                if win32_error(&e) != ERROR_ALREADY_EXISTS.0 {
+                    return Err(format!("cannot create {}: {e}", dir.display()));
+                }
+            }
+        }
+    }
+    apply_or_already_locked(&dir_sd, &dir)?;
+    let file_sd = SecurityDescriptor::from_sddl(DATA_FILE_SDDL)?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| format!("{}: {e}", path.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!("{} is a link: refusing to use {}, remove it", path.display(), dir.display()));
+        }
+        if file_type.is_dir() {
+            apply_or_already_locked(&dir_sd, &path)?;
+        } else {
+            apply_or_already_locked(&file_sd, &path)?;
+        }
+    }
+    Ok(dir)
+}
+
+/// `sd.apply(path)`; when that fails, accepted only if `path` already has
+/// the owner (Administrators or SYSTEM) and a protected DACL.
+fn apply_or_already_locked(sd: &SecurityDescriptor, path: &Path) -> Result<(), String> {
+    match sd.apply(path) {
+        Ok(()) => Ok(()),
+        Err(_) if already_locked(path) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn already_locked(path: &Path) -> bool {
+    use windows::Win32::Security::Authorization::GetNamedSecurityInfoW;
+    use windows::Win32::Security::{
+        GetSecurityDescriptorControl, IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        SE_DACL_PROTECTED,
+    };
+    unsafe {
+        let wide = wide_z(path.as_os_str());
+        let mut owner = PSID::default();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let result = GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            Some(&mut owner as *mut PSID),
+            None,
+            None,
+            None,
+            &mut sd as *mut PSECURITY_DESCRIPTOR,
+        );
+        if result != ERROR_SUCCESS || sd.is_invalid() {
+            return false;
+        }
+        let sd = SecurityDescriptor(sd);
+        let owner_ok = !owner.is_invalid()
+            && (IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool()
+                || IsWellKnownSid(owner, WinLocalSystemSid).as_bool());
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        let protected = GetSecurityDescriptorControl(sd.0, &mut control, &mut revision).is_ok()
+            && control & SE_DACL_PROTECTED.0 != 0;
+        owner_ok && protected
+    }
+}
+
+/// Where the service says why it did not start when its data folder can't
+/// be used (its own log is in that folder):
+/// `%SystemRoot%\Temp\LunarisAgentService-error.log`, for SYSTEM and
+/// Administrators only.
+fn startup_error_log() -> PathBuf {
+    let base = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    Path::new(&base).join("Temp").join("LunarisAgentService-error.log")
+}
+
+fn record_startup_error(message: &str) {
+    use std::io::Write;
+    use std::os::windows::io::FromRawHandle;
+    let path = startup_error_log();
+    // Removed first and created new: never written through a file or link
+    // someone else put there.
+    let _ = std::fs::remove_file(&path);
+    let Ok(sd) = SecurityDescriptor::from_sddl(DATA_FILE_SDDL) else { return };
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0 .0,
+        bInheritHandle: false.into(),
+    };
+    let wide = wide_z(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            windows::Win32::Foundation::GENERIC_WRITE.0,
+            FILE_SHARE_READ,
+            Some(&attributes as *const SECURITY_ATTRIBUTES),
+            windows::Win32::Storage::FileSystem::CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    if let Ok(handle) = handle {
+        let mut file = unsafe { std::fs::File::from_raw_handle(handle.0) };
+        let _ = writeln!(file, "Lunaris agent service did not start: {message}");
+    }
+}
+
+/// Warns when the program sits outside the folders only administrators can
+/// change: the service runs it as SYSTEM, so whoever can replace it there
+/// controls the computer. (Whether a folder is writable by others can't be
+/// read reliably from its permissions, so this only warns.)
+fn warn_if_exe_outside_protected_folders(exe: &Path) {
+    let protected: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "SystemRoot"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect();
+    let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+    let exe_lower = lower(exe);
+    if !protected.iter().any(|dir| exe_lower.starts_with(&(lower(dir.as_path()).trim_end_matches('\\').to_string() + "\\"))) {
+        eprintln!(
+            "warning: {} is not under Program Files. The service runs it as SYSTEM at every start: \
+             make sure only administrators can change this file and its folder (install it under Program Files).",
+            exe.display()
+        );
+    }
+}
+
 // ---- HandlerEx, sunshinesvc.cpp:35-64 ----
 
 /// Port of `HandlerEx` (sunshinesvc.cpp:35-64): INTERROGATE, the one
@@ -511,6 +777,14 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     }
     let stop_event = handle_of(&STOP_EVENT);
     let session_change_event = handle_of(&SESSION_CHANGE_EVENT);
+
+    // Addition: the data folder (config with secrets, log) is for SYSTEM and
+    // Administrators only; not started with a folder that can't be locked.
+    if let Err(e) = secure_data_dir() {
+        record_startup_error(&e);
+        fail_to_start(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0);
+        return;
+    }
 
     // `log_file_handle` lives in this frame: the handle-list attribute below
     // keeps a pointer to it (UpdateProcThreadAttribute copies nothing).
@@ -851,14 +1125,15 @@ fn service_info(exe: PathBuf, start_type: ServiceStartType) -> ServiceInfo {
 /// file (adaptation 2).
 pub fn install_service(user_config: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // `windows-service` quotes the path when it holds spaces (shell_escape).
+    warn_if_exe_outside_protected_folders(&exe);
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )
     .map_err(scm_err)?;
 
-    let data = data_dir();
-    std::fs::create_dir_all(&data).map_err(|e| format!("{}: {e}", data.display()))?;
+    let data = secure_data_dir()?;
 
     // install-service.bat:20-30: an existing service is stopped and
     // reconfigured, otherwise created. start= demand until autostart below.
@@ -893,7 +1168,7 @@ pub fn install_service(user_config: &str) -> Result<(), String> {
             cmd.push(p);
         }
         println!(
-            "{} does not exist yet; to use the settings of this user, run once: {} --cli --config \"{}\" --import-config \"{}\" (stop it with Ctrl+C), then restart the service.",
+            "{} does not exist yet; to use the settings of this user, run once from this elevated prompt (the folder is for administrators only): {} --cli --config \"{}\" --import-config \"{}\" (stop it with Ctrl+C), then restart the service.",
             service_config.display(),
             cmd.to_string_lossy(),
             service_config.display(),

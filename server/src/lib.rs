@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -15,21 +15,20 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod admin;
 mod auth;
 pub mod bridge;
-pub mod buffer;
 mod db;
-pub mod input;
 mod links;
 mod paths;
+mod queue;
+mod security;
 mod service;
 mod tls;
 mod turn;
 mod web;
 
 pub mod signaling;
-pub mod video;
 
 use crate::{
-    auth::{create_jwt, verify_password, AuthenticatedUser},
+    auth::{create_jwt, verify_password_blocking, AuthenticatedUser, DUMMY_HASH},
     db::init_db,
     signaling::{agent_ws_handler, client_ws_handler, SignalingState},
 };
@@ -91,8 +90,9 @@ fn get_or_generate_agent_token() -> String {
         }
     }
 
-    // Generate a random token based on UUID
-    let generated = uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string();
+    // New installs: 128 bits from the OS random source. An existing
+    // server_token.txt (older, shorter tokens) keeps working above.
+    let generated = security::random_hex(16);
 
     if let Err(e) = paths::write_private(token_file, &generated) {
         error!("Failed to write server_token.txt: {:?}", e);
@@ -143,7 +143,7 @@ Commands:
 Environment: SERVER_PORT (default 8090), LUNARIS_HTTPS_PORT (default 8443,
 off to disable), LUNARIS_TLS_CERT + LUNARIS_TLS_KEY (PEM; default: a
 self-signed certificate kept in the data directory), LUNARIS_DATA_DIR (database, token,
-initial admin password; default: working directory), LUNARIS_TOKEN,
+sign-in key, initial admin password; default: working directory), LUNARIS_TOKEN, JWT_SECRET,
 LUNARIS_ADMIN_PASSWORD (first start only), DATABASE_URL, RUST_LOG.
 ";
 
@@ -244,9 +244,12 @@ pub(crate) async fn run_server(
     let pool = init_db(&database_url, &paths::data_file("initial_admin_password.txt")).await?;
 
     let agent_token = get_or_generate_agent_token();
-    info!("==================================================");
-    info!(" [Security] Agent Connection Token: {}", agent_token);
-    info!("==================================================");
+    // The token itself stays out of the log (logs get shared and collected).
+    if std::env::var("LUNARIS_TOKEN").map(|t| !t.trim().is_empty()).unwrap_or(false) {
+        info!("Agent connection token: set by LUNARIS_TOKEN");
+    } else {
+        info!("Agent connection token: in {:?}", paths::data_file("server_token.txt"));
+    }
 
     let turn = turn::TurnService::start_from_env().await;
     let signaling_state = Arc::new(SignalingState::new(pool.clone(), agent_token, turn));
@@ -267,6 +270,7 @@ pub(crate) async fn run_server(
         .route("/api/auth/me", get(admin::get_current_user))
         .route("/api/hosts", get(hosts_handler))
         .route("/api/hosts/{id}", delete(delete_host_handler))
+        .route("/api/admin/hosts/{id}/reset-key", post(admin::reset_host_key))
         .route("/api/hosts/address", post(add_host_by_address_handler))
         .route("/api/agent/token", get(agent_token_handler))
         .route("/api/server/ports", get(ports_handler))
@@ -317,7 +321,12 @@ pub(crate) async fn run_server(
         error!("No web client: 'web/dist' not found and none embedded. Build it with 'npm run build' in 'web/'.");
     }
 
-    let app = app.layer(cors).with_state(signaling_state);
+    let app = app
+        .layer(cors)
+        .layer(security_header(header::X_FRAME_OPTIONS, "DENY"))
+        .layer(security_header(header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
+        .layer(security_header(header::REFERRER_POLICY, "no-referrer"))
+        .with_state(signaling_state);
 
     let port = std::env::var("SERVER_PORT").unwrap_or_else(|_| "8090".to_string());
     let addr = format!("0.0.0.0:{}", port);
@@ -341,12 +350,42 @@ pub(crate) async fn run_server(
     Ok(())
 }
 
+use axum::http::header;
+
+fn security_header(
+    name: header::HeaderName,
+    value: &'static str,
+) -> tower_http::set_header::SetResponseHeaderLayer<axum::http::HeaderValue> {
+    tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+        name,
+        axum::http::HeaderValue::from_static(value),
+    )
+}
+
+fn too_many_attempts() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({ "error": "Too many failed sign-in attempts. Try again in a few minutes." })),
+    )
+}
+
 async fn login_handler(
     State(state): State<Arc<SignalingState>>,
+    ConnectInfo(addrs): ConnectInfo<signaling::ConnAddrs>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT id, password_hash, COALESCE(role, 'user') as role FROM users WHERE username = ?",
+    let now = std::time::Instant::now();
+    let ip_key = security::client_ip(addrs.remote.ip(), &headers).to_string();
+    // Per name *and* address: guessing from one address can't lock the
+    // account for everyone else.
+    let user_key = format!("{}\n{}", payload.username, ip_key);
+    if state.login_ip_limit.is_blocked(&ip_key, now) || state.login_user_limit.is_blocked(&user_key, now) {
+        return Err(too_many_attempts());
+    }
+
+    let row: Option<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, password_hash, COALESCE(role, 'user') as role, is_active FROM users WHERE username = ?",
     )
     .bind(&payload.username)
     .fetch_optional(&state.db)
@@ -359,20 +398,25 @@ async fn login_handler(
         )
     })?;
 
-    let (user_id, hash, role) = match row {
-        Some((id, hash, role)) => (id, hash, role),
-        None => {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": "Invalid username or password" })),
-            ));
-        }
+    // Unknown users are checked against a dummy hash: same time as a wrong password.
+    let (found, hash) = match &row {
+        Some((_, hash, _, _)) => (true, hash.clone()),
+        None => (false, DUMMY_HASH.to_string()),
     };
-
-    if !verify_password(&payload.password, &hash) {
+    let password_ok = verify_password_blocking(payload.password.clone(), hash).await;
+    let Some((user_id, _, role, is_active)) = row.filter(|_| found && password_ok) else {
+        state.login_ip_limit.record_failure(&ip_key, now);
+        state.login_user_limit.record_failure(&user_key, now);
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Invalid username or password" })),
+        ));
+    };
+    state.login_user_limit.reset(&user_key);
+    if is_active == 0 {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "This account is disabled" })),
         ));
     }
 
@@ -415,38 +459,25 @@ async fn hosts_handler(
     user: AuthenticatedUser,
     State(state): State<Arc<SignalingState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let rows: Vec<(String, String, String, Option<String>, Option<i64>)> = if user.role == "admin" {
-        // Admin sees all hosts
+    let db_error = |e: sqlx::Error| {
+        error!("Database error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Internal Database Error" })),
+        )
+    };
+    // Admins see every host, others the hosts of their groups (the same rule
+    // the signaling WebSocket applies).
+    let access = security::host_access(&state.db, &user.user_id).await.map_err(db_error)?;
+    let all: Vec<(String, String, String, Option<String>, Option<i64>)> =
         sqlx::query_as("SELECT id, name, status, ip_address, server_codec_mode_support FROM hosts")
             .fetch_all(&state.db)
             .await
-            .map_err(|e| {
-                error!("Database error: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": "Internal Database Error" })),
-                )
-            })?
-    } else {
-        // Regular user only sees hosts in their groups
-        sqlx::query_as(
-            "SELECT DISTINCT h.id, h.name, h.status, h.ip_address, h.server_codec_mode_support 
-             FROM hosts h
-             INNER JOIN host_groups hg ON h.id = hg.host_id
-             INNER JOIN user_groups ug ON hg.group_id = ug.group_id
-             WHERE ug.user_id = ?",
-        )
-        .bind(&user.user_id)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Internal Database Error" })),
-            )
-        })?
-    };
+            .map_err(db_error)?;
+    let rows: Vec<(String, String, String, Option<String>, Option<i64>)> = all
+            .into_iter()
+            .filter(|(id, ..)| access.allows(id))
+            .collect();
 
     let active_host_ids: std::collections::HashSet<String> = {
         let sessions = state.local_sessions.read().unwrap();
@@ -519,7 +550,7 @@ async fn hosts_handler(
                 h.link_error = link.error.clone();
                 h.needs_approval = link.needs_approval;
             }
-            None if user.role == "admin" => hosts.push(HostInfo {
+            None if access.is_all() => hosts.push(HostInfo {
                 id: format!("address:{}", link.address),
                 name: link.address.clone(),
                 status: HostStatus::Offline,
@@ -618,9 +649,121 @@ async fn delete_host_handler(
     StatusCode::OK.into_response()
 }
 
+/// The shared agent registration token: admins only (it lets a computer
+/// join as a host).
 async fn agent_token_handler(
-    _user: crate::auth::AuthenticatedUser,
+    _admin: crate::auth::AdminUser,
     State(state): State<Arc<SignalingState>>,
 ) -> impl IntoResponse {
     Json(serde_json::json!({ "token": state.agent_token }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::FromRequestParts;
+
+    async fn state_with_users() -> Arc<SignalingState> {
+        let db = security::tests::test_db().await;
+        let hash = bcrypt::hash("right-pw", 4).unwrap();
+        for (id, name, active) in [("u1", "alice", 1), ("u2", "carol", 0)] {
+            sqlx::query("INSERT INTO users (id, username, password_hash, role, is_active) VALUES (?, ?, ?, 'user', ?)")
+                .bind(id)
+                .bind(name)
+                .bind(&hash)
+                .bind(active)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        Arc::new(SignalingState::new(db, "t".into(), None))
+    }
+
+    async fn login_via(state: &Arc<SignalingState>, peer: &str, xff: Option<&str>, user: &str, pw: &str) -> StatusCode {
+        let addrs = signaling::ConnAddrs { local: None, remote: format!("{peer}:5000").parse().unwrap() };
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(x) = xff {
+            headers.insert("x-forwarded-for", x.parse().unwrap());
+        }
+        let req = LoginRequest { username: user.into(), password: pw.into() };
+        match login_handler(State(state.clone()), ConnectInfo(addrs), headers, Json(req)).await {
+            Ok(r) => r.into_response().status(),
+            Err((code, _)) => code,
+        }
+    }
+
+    async fn login(state: &Arc<SignalingState>, ip: &str, user: &str, pw: &str) -> StatusCode {
+        login_via(state, ip, None, user, pw).await
+    }
+
+    #[tokio::test]
+    async fn login_limit_and_inactive_users() {
+        let state = state_with_users().await;
+        assert_eq!(login(&state, "10.0.0.1", "alice", "right-pw").await, StatusCode::OK);
+        assert_eq!(login(&state, "10.0.0.1", "carol", "right-pw").await, StatusCode::FORBIDDEN);
+        assert_eq!(login(&state, "10.0.0.1", "carol", "wrong").await, StatusCode::UNAUTHORIZED);
+        for _ in 0..10 {
+            assert_eq!(login(&state, "10.0.0.2", "alice", "wrong").await, StatusCode::UNAUTHORIZED);
+        }
+        // The guessing address is blocked, even with the right password and
+        // for other names.
+        assert_eq!(login(&state, "10.0.0.2", "alice", "right-pw").await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(login(&state, "10.0.0.2", "carol", "right-pw").await, StatusCode::TOO_MANY_REQUESTS);
+        // The account itself is not locked for everyone else.
+        assert_eq!(login(&state, "10.0.0.3", "alice", "right-pw").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn login_limit_behind_local_proxy() {
+        let state = state_with_users().await;
+        for _ in 0..10 {
+            let code = login_via(&state, "127.0.0.1", Some("6.6.6.6, 203.0.113.9"), "alice", "wrong").await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED);
+        }
+        let blocked = login_via(&state, "127.0.0.1", Some("203.0.113.9"), "alice", "right-pw").await;
+        assert_eq!(blocked, StatusCode::TOO_MANY_REQUESTS);
+        // Another client through the same proxy is not affected.
+        let other = login_via(&state, "127.0.0.1", Some("203.0.113.10"), "alice", "right-pw").await;
+        assert_eq!(other, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_resets_a_host_key() {
+        let state = state_with_users().await;
+        sqlx::query("INSERT INTO hosts (id, name, status, agent_key_hash) VALUES ('h1', 'H1', 'Offline', 'abc')")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let admin = auth::AdminUser { user_id: "u1".into(), username: "alice".into() };
+        let r = admin::reset_host_key(admin, State(state.clone()), axum::extract::Path("h1".into())).await;
+        assert_eq!(r.into_response().status(), StatusCode::OK);
+        let hash: Option<String> = sqlx::query_scalar("SELECT agent_key_hash FROM hosts WHERE id = 'h1'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert!(hash.is_none());
+        let admin = auth::AdminUser { user_id: "u1".into(), username: "alice".into() };
+        let r = admin::reset_host_key(admin, State(state.clone()), axum::extract::Path("nope".into())).await;
+        assert_eq!(r.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn inactive_user_token_is_rejected() {
+        let state = state_with_users().await;
+        let parts = |token: String| {
+            axum::http::Request::builder()
+                .header("Authorization", format!("Bearer {token}"))
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let mut ok = parts(auth::create_jwt("u1", "alice", "user").unwrap());
+        assert!(AuthenticatedUser::from_request_parts(&mut ok, &state).await.is_ok());
+        let mut off = parts(auth::create_jwt("u2", "carol", "user").unwrap());
+        assert!(AuthenticatedUser::from_request_parts(&mut off, &state).await.is_err());
+        // The role claimed in the token is not trusted.
+        let mut forged_role = parts(auth::create_jwt("u1", "alice", "admin").unwrap());
+        assert!(auth::AdminUser::from_request_parts(&mut forged_role, &state).await.is_err());
+    }
 }

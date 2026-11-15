@@ -178,6 +178,9 @@ pub struct HardwareDecoder {
     dmabuf_layout_logged: bool,
     /// (BT.709, full range) of the last frame, to log changes.
     last_color: Option<(bool, bool)>,
+    /// The last presentation label with the (decode, present) names it was
+    /// built from; rebuilt only when they change.
+    presentation_label: std::sync::Mutex<(&'static str, &'static str, String)>,
 }
 
 unsafe impl Send for HardwareDecoder {}
@@ -370,6 +373,7 @@ impl HardwareDecoder {
             bgrx_key: (0, 0, -1, -1, -1),
             dmabuf_layout_logged: false,
             last_color: None,
+            presentation_label: std::sync::Mutex::new(("", "", String::new())),
         })
     }
 
@@ -390,6 +394,13 @@ impl HardwareDecoder {
     /// Explicit `LUNARIS_CLIENT_CUDA_GL=1` forces it on; `=0` forces it off.
     /// When unset, off: `lib.rs` sets it when OpenGL runs on an NVIDIA GPU.
     fn cuda_gl_requested() -> bool {
+        // lib.rs settles these variables at start-up, before any decoder
+        // exists, and nothing changes them afterwards: read once.
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(Self::cuda_gl_requested_from_env)
+    }
+
+    fn cuda_gl_requested_from_env() -> bool {
         match std::env::var("LUNARIS_CLIENT_CUDA_GL") {
             Ok(ref v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
             Ok(_) => false, // explicit "0" / "false" / etc.
@@ -407,6 +418,12 @@ impl HardwareDecoder {
     /// When unset, auto-enable on Linux (where VAAPI + EGL DMABUF may work),
     /// otherwise off.
     fn dmabuf_gl_requested() -> bool {
+        // Read once, like cuda_gl_requested.
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(Self::dmabuf_gl_requested_from_env)
+    }
+
+    fn dmabuf_gl_requested_from_env() -> bool {
         match std::env::var("LUNARIS_CLIENT_DMABUF_GL") {
             Ok(ref v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
             Ok(_) => false,
@@ -478,11 +495,19 @@ impl HardwareDecoder {
     }
 
     pub fn presentation_mode_label(&self) -> String {
-        format!(
-            "{} decode + {} present",
-            self.decode_backend_label(),
-            self.present_backend_label()
-        )
+        let decode = self.decode_backend_label();
+        let present = self.present_backend_label();
+        let mut cache = self
+            .presentation_label
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.0 != decode || cache.1 != present || cache.2.is_empty() {
+            *cache = (decode, present, format!("{} decode + {} present", decode, present));
+        }
+        // The signature returns an owned String, so this still allocates; the
+        // format! is what is saved. A caller that only compares labels could
+        // use a borrowed variant instead.
+        cache.2.clone()
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>, anyhow::Error> {

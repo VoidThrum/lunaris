@@ -1,9 +1,6 @@
-use std::{
-    io::{self, ErrorKind, Read},
-    ops::Range,
-};
+use std::{io, ops::Range};
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnexBStartCode {
@@ -33,131 +30,230 @@ pub struct AnnexBData {
     pub full: BytesMut,
 }
 
-pub struct AnnexBSplitter<R: Read> {
-    reader: R,
-    start_code_buffer: [u8; 4],
+/// Splits one encoded frame (already a single buffer) into its NAL units.
+/// Each unit is a view into the frame's buffer (`BytesMut::split_to`), not a
+/// copy. Bytes before the first start code are dropped; zero bytes that
+/// trail a unit stay in it, except the one a 4-byte start code takes.
+pub struct AnnexBSplitter {
+    /// The unread rest of the frame; when `current_start_code` is set it
+    /// begins with that start code.
+    data: BytesMut,
     current_start_code: Option<AnnexBStartCode>,
-    buffer: BytesMut,
 }
 
-impl<R> AnnexBSplitter<R>
-where
-    R: Read,
-{
-    pub fn new(reader: R, capacity: usize) -> Self {
+impl AnnexBSplitter {
+    pub fn new(data: BytesMut) -> Self {
         Self {
-            reader,
-            start_code_buffer: [2u8; 4],
+            data,
             current_start_code: None,
-            buffer: BytesMut::with_capacity(capacity),
         }
     }
 
     pub fn next(&mut self) -> Result<Option<AnnexBData>, io::Error> {
-        if self.current_start_code.is_none() {
-            if let Some(start_code) = self.next_annex_b_start_code(false)? {
-                self.current_start_code = Some(start_code);
-                self.reset_start_code_buffer();
+        let start_code = match self.current_start_code {
+            Some(start_code) => start_code,
+            None => match find_start_code(&self.data, 0) {
+                Some((at, start_code)) => {
+                    let _ = self.data.split_to(at);
+                    start_code
+                }
+                None => {
+                    self.data.clear();
+                    return Ok(None);
+                }
+            },
+        };
 
-                self.buffer.put(start_code.code());
-            } else {
-                return Ok(None);
-            }
-        }
-
-        #[allow(clippy::unwrap_used)]
-        let current_start_code = self.current_start_code.unwrap();
-
-        let result = self.next_annex_b_start_code(true);
-
-        match result {
-            Ok(None) => {
-                self.current_start_code = None;
-
-                Ok(Some(AnnexBData {
-                    payload_range: current_start_code.len()..self.buffer.len(),
-                    start_code: current_start_code,
-                    start_code_range: 0..current_start_code.len(),
-                    full: self.buffer.split(),
-                }))
-            }
-            Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
-                self.current_start_code = None;
-
-                Ok(Some(AnnexBData {
-                    payload_range: current_start_code.len()..self.buffer.len(),
-                    start_code: current_start_code,
-                    start_code_range: 0..current_start_code.len(),
-                    full: self.buffer.split(),
-                }))
-            }
-            Ok(Some(next_start_code)) => {
-                let mut full = self.buffer.split();
-                full.truncate(full.len() - next_start_code.len());
-
+        // The search for the next start code begins after this one, so its
+        // bytes cannot be part of the next.
+        let full = match find_start_code(&self.data, start_code.len()) {
+            Some((at, next_start_code)) => {
                 self.current_start_code = Some(next_start_code);
-                self.buffer.put(next_start_code.code());
-                self.reset_start_code_buffer();
-
-                Ok(Some(AnnexBData {
-                    payload_range: current_start_code.len()..full.len(),
-                    start_code: current_start_code,
-                    start_code_range: 0..current_start_code.len(),
-                    full,
-                }))
+                self.data.split_to(at)
             }
-            Err(err) => Err(err),
+            None => {
+                self.current_start_code = None;
+                self.data.split()
+            }
+        };
+
+        Ok(Some(AnnexBData {
+            payload_range: start_code.len()..full.len(),
+            start_code,
+            start_code_range: 0..start_code.len(),
+            full,
+        }))
+    }
+}
+
+/// The first `00 00 01` in `data` at or after `from`, as (offset of the start
+/// code, its kind): 4 bytes when a zero precedes it at or after `from`.
+fn find_start_code(data: &[u8], from: usize) -> Option<(usize, AnnexBStartCode)> {
+    let at = find_001(data, from)?;
+    if at > from && data[at - 1] == 0 {
+        Some((at - 1, AnnexBStartCode::B4))
+    } else {
+        Some((at, AnnexBStartCode::B3))
+    }
+}
+
+/// Offset of the first `00 00 01` at or after `from`. Looks at the byte where
+/// a match would end: a byte above 1 there (or a 1 that does not end a
+/// match) rules out matches ending at it and the next two bytes.
+fn find_001(data: &[u8], from: usize) -> Option<usize> {
+    let mut end = from.checked_add(2)?;
+    while end < data.len() {
+        match data[end] {
+            0 => end += 1,
+            1 => {
+                if data[end - 1] == 0 && data[end - 2] == 0 {
+                    return Some(end - 2);
+                }
+                end += 3;
+            }
+            _ => end += 3,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn reset(&mut self, new_reader: R) {
-        // Read to end
-        while let Ok(Some(_)) = self.next() {}
-
-        self.reader = new_reader;
-    }
-
-    fn next_annex_b_start_code(
-        &mut self,
-        buffer_bytes: bool,
-    ) -> Result<Option<AnnexBStartCode>, io::Error> {
-        loop {
-            match &self.start_code_buffer {
-                [0, 0, 0, 1] => return Ok(Some(AnnexBStartCode::B4)),
-                [_, 0, 0, 1] => return Ok(Some(AnnexBStartCode::B3)),
-                _ => {}
-            }
-
-            let mut byte = [0u8; 1];
-            if self.reader.read(&mut byte)? == 0 {
-                return Ok(None);
-            }
-            let byte = byte[0];
-
-            if buffer_bytes {
-                self.buffer.put_u8(byte);
-            }
-
-            self.start_code_buffer.rotate_left(1);
-            self.start_code_buffer[3] = byte;
-        }
-    }
-    fn reset_start_code_buffer(&mut self) {
-        self.start_code_buffer.copy_from_slice(&[2u8; 4]);
-    }
+    None
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use bytes::{BufMut, Bytes};
+    use std::io::{Cursor, ErrorKind, Read};
+
+    fn splitter(data: &[u8]) -> AnnexBSplitter {
+        AnnexBSplitter::new(BytesMut::from(Bytes::from(data.to_vec())))
+    }
+
+    /// The byte-at-a-time splitter this module used before, kept as the
+    /// reference the slice-based one must match.
+    struct OldAnnexBSplitter<R: Read> {
+        reader: R,
+        start_code_buffer: [u8; 4],
+        current_start_code: Option<AnnexBStartCode>,
+        buffer: BytesMut,
+    }
+
+    impl<R: Read> OldAnnexBSplitter<R> {
+        fn new(reader: R, capacity: usize) -> Self {
+            Self {
+                reader,
+                start_code_buffer: [2u8; 4],
+                current_start_code: None,
+                buffer: BytesMut::with_capacity(capacity),
+            }
+        }
+
+        fn next(&mut self) -> Result<Option<AnnexBData>, io::Error> {
+            if self.current_start_code.is_none() {
+                if let Some(start_code) = self.next_annex_b_start_code(false)? {
+                    self.current_start_code = Some(start_code);
+                    self.reset_start_code_buffer();
+                    self.buffer.put(start_code.code());
+                } else {
+                    return Ok(None);
+                }
+            }
+            let current_start_code = self.current_start_code.unwrap();
+            let result = self.next_annex_b_start_code(true);
+            match result {
+                Ok(None) => {
+                    self.current_start_code = None;
+                    Ok(Some(AnnexBData {
+                        payload_range: current_start_code.len()..self.buffer.len(),
+                        start_code: current_start_code,
+                        start_code_range: 0..current_start_code.len(),
+                        full: self.buffer.split(),
+                    }))
+                }
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+                    self.current_start_code = None;
+                    Ok(Some(AnnexBData {
+                        payload_range: current_start_code.len()..self.buffer.len(),
+                        start_code: current_start_code,
+                        start_code_range: 0..current_start_code.len(),
+                        full: self.buffer.split(),
+                    }))
+                }
+                Ok(Some(next_start_code)) => {
+                    let mut full = self.buffer.split();
+                    full.truncate(full.len() - next_start_code.len());
+                    self.current_start_code = Some(next_start_code);
+                    self.buffer.put(next_start_code.code());
+                    self.reset_start_code_buffer();
+                    Ok(Some(AnnexBData {
+                        payload_range: current_start_code.len()..full.len(),
+                        start_code: current_start_code,
+                        start_code_range: 0..current_start_code.len(),
+                        full,
+                    }))
+                }
+                Err(err) => Err(err),
+            }
+        }
+
+        fn next_annex_b_start_code(
+            &mut self,
+            buffer_bytes: bool,
+        ) -> Result<Option<AnnexBStartCode>, io::Error> {
+            loop {
+                match &self.start_code_buffer {
+                    [0, 0, 0, 1] => return Ok(Some(AnnexBStartCode::B4)),
+                    [_, 0, 0, 1] => return Ok(Some(AnnexBStartCode::B3)),
+                    _ => {}
+                }
+                let mut byte = [0u8; 1];
+                if self.reader.read(&mut byte)? == 0 {
+                    return Ok(None);
+                }
+                let byte = byte[0];
+                if buffer_bytes {
+                    self.buffer.put_u8(byte);
+                }
+                self.start_code_buffer.rotate_left(1);
+                self.start_code_buffer[3] = byte;
+            }
+        }
+
+        fn reset_start_code_buffer(&mut self) {
+            self.start_code_buffer.copy_from_slice(&[2u8; 4]);
+        }
+    }
+
+    type Unit = (Vec<u8>, AnnexBStartCode, Range<usize>, Range<usize>);
+
+    fn units_new(data: &[u8]) -> Vec<Unit> {
+        let mut s = splitter(data);
+        let mut out = Vec::new();
+        while let Some(u) = s.next().unwrap() {
+            out.push((u.full.to_vec(), u.start_code, u.start_code_range, u.payload_range));
+        }
+        // Exhausted stays exhausted.
+        assert!(s.next().unwrap().is_none());
+        out
+    }
+
+    fn units_old(data: &[u8]) -> Vec<Unit> {
+        let mut s = OldAnnexBSplitter::new(Cursor::new(data.to_vec()), 0);
+        let mut out = Vec::new();
+        while let Some(u) = s.next().unwrap() {
+            out.push((u.full.to_vec(), u.start_code, u.start_code_range, u.payload_range));
+        }
+        assert!(s.next().unwrap().is_none());
+        out
+    }
+
+    fn assert_same(data: &[u8]) {
+        assert_eq!(units_new(data), units_old(data), "input {:?}", data);
+    }
 
     #[test]
     fn test_splitter_single_b3() {
         let data = vec![0, 0, 1, 0x42, 0x01, 0x02];
-        let mut splitter = AnnexBSplitter::new(Cursor::new(data.clone()), 16);
+        let mut splitter = splitter(&data);
 
         let nal = splitter.next().unwrap().unwrap();
         assert_eq!(nal.start_code, AnnexBStartCode::B3);
@@ -167,7 +263,7 @@ mod tests {
     #[test]
     fn test_splitter_single_b4() {
         let data = vec![0, 0, 0, 1, 0x44, 0x05];
-        let mut splitter = AnnexBSplitter::new(Cursor::new(data.clone()), 16);
+        let mut splitter = splitter(&data);
 
         let nal = splitter.next().unwrap().unwrap();
         assert_eq!(nal.start_code, AnnexBStartCode::B4);
@@ -177,7 +273,7 @@ mod tests {
     #[test]
     fn test_splitter_multiple_nalus() {
         let data = vec![0, 0, 0, 1, 0x42, 0x01, 0x02, 0, 0, 1, 0x44, 0x03, 0x04];
-        let mut splitter = AnnexBSplitter::new(Cursor::new(data.clone()), 32);
+        let mut splitter = splitter(&data);
 
         let nal1 = splitter.next().unwrap().unwrap();
         assert_eq!(nal1.start_code, AnnexBStartCode::B4);
@@ -191,7 +287,7 @@ mod tests {
     #[test]
     fn test_splitter_no_nalus() {
         let data = vec![0x01, 0x02, 0x03];
-        let mut splitter = AnnexBSplitter::new(Cursor::new(data.clone()), 16);
+        let mut splitter = splitter(&data);
 
         let nal = splitter.next().unwrap();
         assert!(nal.is_none());
@@ -200,10 +296,92 @@ mod tests {
     #[test]
     fn test_splitter_edge_case_start_of_stream() {
         let data = vec![0, 0, 0, 1, 0x42];
-        let mut splitter = AnnexBSplitter::new(Cursor::new(data.clone()), 16);
+        let mut splitter = splitter(&data);
 
         let nal = splitter.next().unwrap().unwrap();
         assert_eq!(nal.start_code, AnnexBStartCode::B4);
         assert_eq!(&nal.full[nal.payload_range.clone()], &[0x42]);
+    }
+
+    #[test]
+    fn units_are_views_into_the_frame() {
+        let frame = Bytes::from(vec![0, 0, 0, 1, 0x65, 0xAA, 0, 0, 1, 0x41, 0xBB]);
+        let base = frame.as_ptr() as usize;
+        let mut s = AnnexBSplitter::new(BytesMut::from(frame));
+        let first = s.next().unwrap().unwrap();
+        let second = s.next().unwrap().unwrap();
+        assert_eq!(first.full.as_ptr() as usize, base);
+        assert_eq!(second.full.as_ptr() as usize, base + 6);
+    }
+
+    #[test]
+    fn same_units_as_the_byte_reader_on_edge_cases() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 0],
+            vec![0, 0, 1],
+            vec![0, 0, 0, 1],
+            vec![0, 0, 0, 0, 0, 1],
+            vec![1, 0, 0, 1],
+            vec![0, 1, 0, 0, 1, 7],
+            vec![9, 9, 0, 0, 1, 0x65, 1, 2, 3],
+            // Start codes back to back (empty units).
+            vec![0, 0, 1, 0, 0, 1, 0, 0, 1],
+            vec![0, 0, 0, 1, 0, 0, 0, 1, 0x41],
+            vec![0, 0, 1, 0, 0, 0, 1],
+            // Trailing zero bytes, at the end and before the next start code.
+            vec![0, 0, 1, 0x65, 0, 0],
+            vec![0, 0, 1, 0x65, 0, 0, 0],
+            vec![0, 0, 1, 0x65, 0, 0, 0, 0, 1, 0x41],
+            vec![0, 0, 1, 0x65, 0, 0, 0, 0, 0, 0, 1, 0x41, 0],
+            // A unit that is only a start code at the very end.
+            vec![0, 0, 1, 0x65, 0, 0, 0, 1],
+            vec![0, 0, 1, 0x65, 1, 0, 0, 1],
+            // Near misses.
+            vec![0, 0, 2, 0, 1, 0, 0, 1, 0x67, 0, 2, 0, 0, 2],
+            vec![0, 0, 0, 0, 0, 0],
+            vec![1, 1, 1, 1],
+        ];
+        for case in &cases {
+            assert_same(case);
+        }
+        // Every byte string of length up to 7 over {0, 1, 2}.
+        for len in 0..=7u32 {
+            for mut n in 0..3u32.pow(len) {
+                let mut data = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    data.push((n % 3) as u8);
+                    n /= 3;
+                }
+                assert_same(&data);
+            }
+        }
+    }
+
+    #[test]
+    fn same_units_as_the_byte_reader_on_random_frames() {
+        // xorshift64*: deterministic, no extra dependency.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..3000 {
+            let len = (next() % 400) as usize;
+            let mut data = Vec::with_capacity(len + 8);
+            while data.len() < len {
+                match next() % 10 {
+                    0 => data.extend_from_slice(&[0, 0, 1]),
+                    1 => data.extend_from_slice(&[0, 0, 0, 1]),
+                    2 | 3 => data.push(0),
+                    4 => data.push(1),
+                    _ => data.push((next() & 0xFF) as u8),
+                }
+            }
+            assert_same(&data);
+        }
     }
 }

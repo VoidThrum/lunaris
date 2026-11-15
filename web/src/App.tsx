@@ -129,56 +129,115 @@ const readThemeChoice = (): ThemeChoice => {
   }
 };
 
-/**
- * The desktop app opens the web console as `<server>/#session=<token>&user=<name>`
- * so its signed-in user is signed in here too. The fragment never reaches the
- * server or its logs; it is saved like a normal sign-in and removed from the
- * address bar before the app reads the session.
- */
-const adoptSessionFromApp = () => {
-  const hash = window.location.hash.replace(/^#/, '');
-  if (!hash.includes('session=')) return;
-  const params = new URLSearchParams(hash);
-  const session = params.get('session');
-  if (session) {
-    localStorage.setItem('lunaris_token', session);
-    localStorage.setItem('lunaris_username', params.get('user') || '');
-    // The role comes from /api/auth/me; this page's own server is the server.
-    localStorage.removeItem('lunaris_role');
-    localStorage.removeItem('lunaris_server_host');
-    // `connect=<host id>`: start remote control of that computer right away
-    // (the auto-launch keys App reads on load).
-    const connect = params.get('connect');
-    if (connect) {
-      localStorage.setItem('lunaris_auto_launch_host_id', connect);
-      localStorage.setItem('lunaris_auto_launch_host_name', params.get('name') || 'Remote computer');
-    }
-  }
-  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+/** A sign-in (and maybe a connection) asked for by a link. */
+type LinkRequest = {
+  session: string;
+  user: string;
+  /** Host id to remote-control right away. */
+  connect: string | null;
+  computer: string;
+  /** Stream settings a `?token=` link carries. */
+  settings: Record<string, string>;
+  codecSupport: string | null;
 };
-adoptSessionFromApp();
+
+/**
+ * Links that carry a session: the desktop app opens the web console as
+ * `<server>/#session=<token>&user=<name>[&connect=<host id>]`, and
+ * `?token=<token>&host_id=<id>` does the same. The fragment never reaches
+ * the server or its logs. The token is always removed from the address bar.
+ * Whoever makes the link chooses the account, so it is applied without a
+ * question only when this browser holds no login and no connection is asked;
+ * otherwise App asks first.
+ */
+const takeLinkFromUrl = (): LinkRequest | null => {
+  const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const query = new URLSearchParams(window.location.search);
+  let link: LinkRequest | null = null;
+  const session = hash.get('session');
+  if (session) {
+    link = {
+      session,
+      user: hash.get('user') || '',
+      connect: hash.get('connect') || null,
+      computer: hash.get('name') || '',
+      settings: {},
+      codecSupport: null,
+    };
+  } else if (query.get('token') && query.get('host_id')) {
+    const settings: Record<string, string> = {};
+    for (const k of ['res', 'fps', 'bitrate', 'codec']) {
+      const v = query.get(k);
+      if (v) settings[k] = v;
+    }
+    link = {
+      session: query.get('token') as string,
+      user: '',
+      connect: query.get('host_id'),
+      computer: query.get('host_name') || '',
+      settings,
+      codecSupport: query.get('codec_support'),
+    };
+  }
+  if (hash.has('session') || query.has('token') || query.has('host_id')) {
+    for (const k of ['token', 'host_id', 'host_name', 'codec_support', 'res', 'fps', 'bitrate', 'codec']) {
+      query.delete(k);
+    }
+    const qs = query.toString();
+    window.history.replaceState(null, '', window.location.pathname + (qs ? `?${qs}` : ''));
+  }
+  return link;
+};
+
+/** Make the link's login this browser's login (and queue its connection). */
+const applyLink = (link: LinkRequest) => {
+  localStorage.setItem('lunaris_token', link.session);
+  localStorage.setItem('lunaris_username', link.user);
+  // The role comes from /api/auth/me; this page's own server is the server.
+  localStorage.removeItem('lunaris_role');
+  localStorage.removeItem('lunaris_server_host');
+  // The auto-launch keys App reads on load.
+  localStorage.removeItem('lunaris_auto_launch_host_id');
+  localStorage.removeItem('lunaris_auto_launch_host_name');
+  localStorage.removeItem('lunaris_auto_launch_codec_support');
+  if (link.connect) {
+    localStorage.setItem('lunaris_auto_launch_host_id', link.connect);
+    localStorage.setItem('lunaris_auto_launch_host_name', link.computer || 'Remote computer');
+    if (link.codecSupport) localStorage.setItem('lunaris_auto_launch_codec_support', link.codecSupport);
+  }
+  for (const [k, v] of Object.entries(link.settings)) localStorage.setItem(`lunaris_stream_${k}`, v);
+};
+
+let pendingLink: LinkRequest | null = takeLinkFromUrl();
+if (pendingLink && !pendingLink.connect && !localStorage.getItem('lunaris_token')) {
+  applyLink(pendingLink);
+  pendingLink = null;
+}
 
 function App() {
+  // A link that wants to sign this browser in as someone else, or to connect.
+  const [linkRequest, setLinkRequest] = useState<LinkRequest | null>(pendingLink);
   const [token, setToken] = useState<string | null>(localStorage.getItem('lunaris_token'));
   const [username, setUsername] = useState<string | null>(localStorage.getItem('lunaris_username'));
 
   // Check for deep link query parameters or local storage auto-launch flags on load
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    let qToken = params.get('token') || localStorage.getItem('lunaris_token');
-    let qHostId = params.get('host_id') || localStorage.getItem('lunaris_auto_launch_host_id');
-    let qHostName = params.get('host_name') || localStorage.getItem('lunaris_auto_launch_host_name') || 'Remote Host';
-    let qCodecSupport = params.get('codec_support') || localStorage.getItem('lunaris_auto_launch_codec_support');
+    // Only this browser's own saved login and auto-launch keys: a link's
+    // token is dealt with (and confirmed) before the app starts.
+    const qToken = localStorage.getItem('lunaris_token');
+    const qHostId = localStorage.getItem('lunaris_auto_launch_host_id');
+    const qHostName = localStorage.getItem('lunaris_auto_launch_host_name') || 'Remote Host';
+    const qCodecSupport = localStorage.getItem('lunaris_auto_launch_codec_support');
 
     // Clear temporary auto-launch keys so they don't trigger again on reload
     localStorage.removeItem('lunaris_auto_launch_host_id');
     localStorage.removeItem('lunaris_auto_launch_host_name');
     localStorage.removeItem('lunaris_auto_launch_codec_support');
 
-    const qRes = params.get('res') || localStorage.getItem('lunaris_stream_res');
-    const qFps = params.get('fps') || localStorage.getItem('lunaris_stream_fps');
-    const qBitrate = params.get('bitrate') || localStorage.getItem('lunaris_stream_bitrate');
-    const qCodec = params.get('codec') || localStorage.getItem('lunaris_stream_codec');
+    const qRes = localStorage.getItem('lunaris_stream_res');
+    const qFps = localStorage.getItem('lunaris_stream_fps');
+    const qBitrate = localStorage.getItem('lunaris_stream_bitrate');
+    const qCodec = localStorage.getItem('lunaris_stream_codec');
 
     if (qToken && qHostId) {
       localStorage.setItem('lunaris_token', qToken);
@@ -251,6 +310,8 @@ function App() {
   const [hostsError, setHostsError] = useState<string | null>(null);
   const [selectedHost, setSelectedHost] = useState<Host | null>(null);
   const [agentToken, setAgentToken] = useState<string | null>(null);
+  // The server only gives the connection token to administrators.
+  const [agentTokenDenied, setAgentTokenDenied] = useState<boolean>(false);
 
 
   // Application view navigation states
@@ -343,17 +404,20 @@ function App() {
       if (response.ok) {
         const data = await response.json();
         setAgentToken(data.token);
+        setAgentTokenDenied(false);
+      } else if (response.status === 403 || response.status === 401) {
+        setAgentToken(null);
+        setAgentTokenDenied(true);
       }
     } catch (err) {
       console.error("Failed to fetch agent token:", err);
     }
   };
 
+  // Only for administrators (the role is known once /api/auth/me answered).
   useEffect(() => {
-    if (token) {
-      fetchAgentToken();
-    }
-  }, [token]);
+    if (token && userRole === 'admin') fetchAgentToken();
+  }, [token, userRole]);
 
   useEffect(() => {
     if (!viewingHost || !token) {
@@ -1100,7 +1164,21 @@ function App() {
                                         } else {
                                           const wsProtocol = getBackendProtocol().ws;
                                           const wsServerUrl = `${wsProtocol}//${serverHost}`;
-                                          window.location.href = `lunaris://connect?host_id=${hostToUse.id}&server=${wsServerUrl}&token=${token}&res=${resStr}&fps=${fps}&bitrate=${bitrate}&codec=${codec}&mouse_queue_limit=${mouseQueueLimit}&host_name=${encodeURIComponent(hostToUse.name)}&app_id=${app.id}&encoder=${encodeURIComponent(encoder)}&display=${encodeURIComponent(display)}&input_protocol=${encodeURIComponent(inputProtocol)}`;
+                                          window.location.href = `lunaris://connect?${new URLSearchParams({
+                                            host_id: hostToUse.id,
+                                            server: wsServerUrl,
+                                            token: token || '',
+                                            res: resStr,
+                                            fps: String(fps),
+                                            bitrate: String(bitrate),
+                                            codec: String(codec),
+                                            mouse_queue_limit: String(mouseQueueLimit),
+                                            host_name: hostToUse.name,
+                                            app_id: String(app.id),
+                                            encoder: String(encoder),
+                                            display: String(display),
+                                            input_protocol: String(inputProtocol),
+                                          }).toString()}`;
                                         }
                                       }}
                                       className="overlay-btn btn-launch-app"
@@ -1207,7 +1285,7 @@ function App() {
                           <div className="setup-field">
                             <span className="setup-field-label">Agent connection token</span>
                             <div className="setup-field-row">
-                              <code>{agentToken || "Loading..."}</code>
+                              <code>{agentToken || ((userRole && userRole !== 'admin') || agentTokenDenied ? t("Ask an administrator for the connection token.") : "Loading...")}</code>
                               <button
                                 type="button"
                                 className="icon-btn"
@@ -1392,6 +1470,33 @@ function App() {
           onClose={() => setFilesHost(null)}
         />
       )}
+      {linkRequest && (
+        <div className="host-confirm-overlay">
+          <div className="host-confirm-card" role="alertdialog" aria-modal="true" aria-labelledby="linkTitle">
+            <div className="host-confirm-content">
+              <h2 id="linkTitle">{linkRequest.connect ? t('Sign in and connect?') : t('Sign in?')}</h2>
+              <p>
+                {linkRequest.connect
+                  ? t('Sign in as %1 and connect to %2?', linkRequest.user || t('another account'), linkRequest.computer || linkRequest.connect)
+                  : t('Sign in as %1?', linkRequest.user || t('another account'))}
+              </p>
+              <p>{t('This replaces the account this browser is signed in to (%1). Only continue if you opened this link yourself.', window.location.host)}</p>
+            </div>
+            <div className="host-confirm-actions">
+              <button
+                className="btn-secondary"
+                autoFocus
+                onClick={() => { pendingLink = null; setLinkRequest(null); }}
+              >{t('Cancel')}</button>
+              <button
+                className="btn-danger"
+                onClick={() => { applyLink(linkRequest); pendingLink = null; window.location.reload(); }}
+              >{linkRequest.connect ? t('Sign in and connect') : t('Sign in')}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {pendingDeleteHost && (
         <div className="host-confirm-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget && !deleteHostLoading) setPendingDeleteHost(null); }}>
           <div className="host-confirm-card" role="dialog" aria-modal="true" aria-labelledby="deleteHostTitle">

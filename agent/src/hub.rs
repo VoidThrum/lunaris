@@ -232,6 +232,7 @@ pub fn from_direct_client(sig: SignalingMessage, conn_id: &str) -> Option<Signal
             ice_servers: None,
             webtransport_port,
             webtransport_cert_hash,
+            webtransport_token: None,
         }),
         sig @ (IceCandidate { .. }
         | EndSession { .. }
@@ -296,6 +297,7 @@ mod tests {
             ice_servers: None,
             webtransport_port: None,
             webtransport_cert_hash: None,
+            webtransport_token: None,
         };
         let out = from_direct_client(answer, "direct-1").unwrap();
         assert_eq!(target_of(&out), Some("direct-1"));

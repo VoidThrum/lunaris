@@ -31,7 +31,13 @@ pub fn set_options(clipboard: bool, files: bool) {
 
 /// Settings > Clipboard and files > File transfer (files.rs asks).
 pub fn files_enabled() -> bool {
-    FILES_ENABLED.load(Ordering::Relaxed)
+    FILES_ENABLED.load(Ordering::Relaxed) && !crate::deeplink::session_is_untrusted()
+}
+
+/// Clipboard sync is off for a session started from a link to a server the
+/// user is not signed in to.
+pub fn clipboard_enabled() -> bool {
+    CLIPBOARD_ENABLED.load(Ordering::Relaxed) && !crate::deeplink::session_is_untrusted()
 }
 
 pub fn take_status() -> Option<String> {
@@ -63,7 +69,7 @@ pub fn attach_clipboard(channel: Arc<dyn DataChannel>) {
         if msg.is_string {
                 if let Ok(v) = serde_json::from_slice::<Value>(&msg.data) {
                     match v.get("type").and_then(Value::as_str) {
-                        Some("clipboard") if CLIPBOARD_ENABLED.load(Ordering::Relaxed) => {
+                        Some("clipboard") if clipboard_enabled() => {
                             if let Some(text) = v.get("text").and_then(Value::as_str) {
                                 if text.len() <= MAX_CLIPBOARD_BYTES {
                                     let _ = set_tx.lock().unwrap().send(text.to_string());
@@ -85,7 +91,7 @@ pub fn attach_clipboard(channel: Arc<dyn DataChannel>) {
     let ch = channel.clone();
     tokio::spawn(async move {
         while let Some(text) = changed_rx.recv().await {
-            if !CLIPBOARD_ENABLED.load(Ordering::Relaxed) || !matches!(ch.ready_state().await, Ok(RTCDataChannelState::Open)) {
+            if !clipboard_enabled() || !matches!(ch.ready_state().await, Ok(RTCDataChannelState::Open)) {
                 continue;
             }
             if let Err(e) = ch.send_text(&json!({"type": "clipboard", "text": text}).to_string()).await {
@@ -117,7 +123,7 @@ fn clipboard_thread(set_rx: std_mpsc::Receiver<String>, changed_tx: tokio::sync:
                 }
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                if !CLIPBOARD_ENABLED.load(Ordering::Relaxed) {
+                if !clipboard_enabled() {
                     continue;
                 }
                 if let Ok(text) = clipboard.get_text() {

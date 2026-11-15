@@ -368,6 +368,17 @@ Rectangle {
                         homeView.refreshHost();
                     }
                 }
+                CheckRow {
+                    // Off: file transfer only reaches the home folder.
+                    text: I18n.t("Allow access to the whole disk (not only the home folder)")
+                    checked: !!homeView && homeView.hostStatus.full_disk_access === true
+                    onToggled: {
+                        homeView.hostError = typeof bridge.hostSetFileAccess === "function"
+                            ? bridge.hostSetFileAccess(checked)
+                            : "This version of the app cannot change it";
+                        homeView.refreshHost();
+                    }
+                }
             }
 
             Card {

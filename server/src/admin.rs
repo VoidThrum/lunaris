@@ -13,7 +13,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
-    auth::{hash_password, AdminUser, AuthenticatedUser},
+    auth::{hash_password_blocking, AdminUser, AuthenticatedUser},
     signaling::SignalingState,
 };
 
@@ -164,7 +164,7 @@ pub async fn create_user(
         ));
     }
 
-    let hashed = hash_password(&payload.password).map_err(|e| {
+    let hashed = hash_password_blocking(payload.password.clone()).await.map_err(|e| {
         error!("Hashing error: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -258,6 +258,10 @@ pub async fn update_user(
                     Json(serde_json::json!({ "error": "Failed to update user" })),
                 )
             })?;
+        if !is_active {
+            // A disabled account loses its open sessions now, not at next sign-in.
+            state.close_user_connections(&user_id);
+        }
     }
 
     if let Some(ref password) = payload.password {
@@ -267,7 +271,7 @@ pub async fn update_user(
                 Json(serde_json::json!({ "error": "Password must be at least 6 characters" })),
             ));
         }
-        let hashed = hash_password(password).map_err(|e| {
+        let hashed = hash_password_blocking(password.clone()).await.map_err(|e| {
             error!("Hashing error: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -400,8 +404,39 @@ pub async fn delete_user(
             )
         })?;
 
+    state.close_user_connections(&user_id);
     info!("Admin deleted user: {}", user_id);
 
+    Ok(StatusCode::OK)
+}
+
+// POST /api/admin/hosts/:id/reset-key
+/// Forgets a host's agent key (e.g. the agent lost its config): the next
+/// agent registering with this id and a key stores a new one. The host keeps
+/// its groups.
+pub async fn reset_host_key(
+    admin: AdminUser,
+    State(state): State<Arc<SignalingState>>,
+    Path(host_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let done = sqlx::query("UPDATE hosts SET agent_key_hash = NULL WHERE id = ?")
+        .bind(&host_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            error!("Database error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal Database Error" })),
+            )
+        })?;
+    if done.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Host not found" })),
+        ));
+    }
+    info!("Admin {} reset the agent key of host {}", admin.username, host_id);
     Ok(StatusCode::OK)
 }
 

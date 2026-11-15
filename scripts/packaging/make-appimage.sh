@@ -85,16 +85,19 @@ cat > "$WORK/AppRun" <<EOF
 #!/bin/sh
 HERE="\$(dirname "\$(readlink -f "\$0")")"
 if [ "\$1" = "--setup-host" ]; then
-    # The AppImage mount is not readable by root, so stage the files first.
-    tmp="\$(mktemp -d)"
-    cp "\$HERE"/usr/share/$NAME/* "\$tmp/"
+    # The AppImage mount is not readable by root, so the files travel through a pipe
+    # and root unpacks them into its own temp directory, then runs the script from
+    # there (a directory the user owns could be swapped between copy and run).
     shift
-    if [ "\$(id -u)" -eq 0 ]; then bash "\$tmp/setup-host.sh" "\$@"
+    root_run='d=\$(mktemp -d) && tar -C "\$d" -x && bash "\$d/setup-host.sh" "\$@"; rc=\$?; rm -rf "\$d"; exit \$rc'
+    if [ "\$(id -u)" -eq 0 ]; then
+        tar -C "\$HERE/usr/share/$NAME" -c . | sh -c "\$root_run" sh "\$@"
     elif command -v pkexec >/dev/null 2>&1 && [ -n "\$DISPLAY\$WAYLAND_DISPLAY" ]; then
-        pkexec env SUDO_USER="\$(id -un)" bash "\$tmp/setup-host.sh" "\$@"
-    else sudo bash "\$tmp/setup-host.sh" "\$@"
+        tar -C "\$HERE/usr/share/$NAME" -c . | pkexec env SUDO_USER="\$(id -un)" sh -c "\$root_run" sh "\$@"
+    else
+        tar -C "\$HERE/usr/share/$NAME" -c . | sudo sh -c "\$root_run" sh "\$@"
     fi
-    rc=\$?; rm -rf "\$tmp"; exit \$rc
+    exit \$?
 fi
 if [ "\$1" = "--licenses" ]; then
     echo "Third-party licences: \$HERE/usr/share/licenses"

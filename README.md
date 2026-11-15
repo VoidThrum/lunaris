@@ -90,11 +90,12 @@ firewall rule, data in `%ProgramData%\Lunaris`).
 
 ```bash
 docker compose up -d          # or: docker build -t lunaris-server . && docker run -d -p 8090:8090 -v lunaris-data:/data lunaris-server
-docker logs lunaris-server    # initial admin password and agent token
+docker exec lunaris-server cat /data/initial_admin_password.txt   # initial admin password
+docker exec lunaris-server cat /data/server_token.txt             # agent token
 ```
 
-Then open `http://<server>:8090`, sign in as `admin` with the printed password
-and change it. Running `lunaris-server` without a command starts it in the
+Then open `http://<server>:8090`, sign in as `admin` with that password
+and change it (the server does not write it or the token to its log). Running `lunaris-server` without a command starts it in the
 foreground instead.
 
 ### Install the app

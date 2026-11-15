@@ -37,12 +37,18 @@ private:
     void cleanupFrameLocked();
     void cleanupGlResources();
     bool ensureGlResources();
-    bool importPendingFrameLocked();
+    bool importPendingFrame(bool &moreQueued);
 
     QMutex m_mutex;
     bool m_dmabufActive = false;
     bool m_texturesInitialized = false;
     bool m_haveImportedFrame = false;
+    bool m_texParamsSet = false;
+    bool m_staticStateSet = false;
+    int m_locYTexture = -1;
+    int m_locUvTexture = -1;
+    int m_locRange = -1;
+    int m_locCoef = -1;
     int m_videoWidth = 0;
     int m_videoHeight = 0;
     unsigned int m_yTexture = 0;

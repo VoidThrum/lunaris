@@ -21,6 +21,27 @@ pub fn register_protocol() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// The program in a desktop entry `Exec=` line: in double quotes, with the
+/// characters the spec reserves escaped (once for Exec, once more for the
+/// desktop file's own string escapes) and `%` doubled.
+#[cfg(any(target_os = "linux", test))]
+fn desktop_exec_quote(path: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in path.chars() {
+        match ch {
+            '"' | '`' | '$' => {
+                out.push_str("\\\\");
+                out.push(ch);
+            }
+            '\\' => out.push_str("\\\\\\\\"),
+            '%' => out.push_str("%%"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(target_os = "linux")]
 fn register_linux(exe_path: &str) -> Result<(), anyhow::Error> {
     let home = std::env::var("HOME")?;
@@ -44,12 +65,12 @@ fn register_linux(exe_path: &str) -> Result<(), anyhow::Error> {
         r#"[Desktop Entry]
 Type=Application
 Name=Lunaris Client
-Exec='{}' %u
+Exec={} %u
 Terminal=false
 MimeType=x-scheme-handler/lunaris;
 Categories=Network;
 "#,
-        exe_path
+        desktop_exec_quote(exe_path)
     );
 
     std::fs::write(&dest_file, content)?;
@@ -118,4 +139,16 @@ fn register_windows(exe_path: &str) -> Result<(), anyhow::Error> {
 
     info!("Registered Windows registry entry for lunaris://");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::desktop_exec_quote;
+
+    #[test]
+    fn exec_path_is_quoted() {
+        assert_eq!(desktop_exec_quote("/opt/Lunaris App/client"), "\"/opt/Lunaris App/client\"");
+        assert_eq!(desktop_exec_quote("/a\"b$c"), "\"/a\\\\\"b\\\\$c\"");
+        assert_eq!(desktop_exec_quote("/100%"), "\"/100%%\"");
+    }
 }

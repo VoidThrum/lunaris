@@ -50,11 +50,20 @@ struct PendingDmabufFrame {
 // enough), so frames that arrive close together would otherwise be lost:
 // measured with the pointer moving at 1000 Hz, 4-8 of 75 frames per second
 // (16 in the worst second) against 0.1 with the pointer at rest.
-// All guarded by g_frameMutex.
+// Locking: g_frameMutex (taken by the decoder thread in deliver_dmabuf_frame,
+// by the render thread only to take the next frame out of the queue, and by
+// the stream stop) guards g_pacingQueue, g_pacingQueueHistory, g_streamFps*,
+// g_streamGeneration and the stats counters' reset. The frame on screen
+// (g_displayedOwner, the item's images and textures, g_gl) belongs to the
+// render thread alone: nothing else frees it, so the render thread can import
+// and draw without the mutex.
 QMutex g_frameMutex;
 std::deque<PendingDmabufFrame> g_pacingQueue;      // Pacer::m_PacingQueue
 std::deque<int> g_pacingQueueHistory;              // Pacer::m_PacingQueueHistory
-uint64_t g_displayedOwner = 0;                     // the frame on screen
+uint64_t g_displayedOwner = 0;                     // the frame on screen (render thread only)
+// Bumped by every stream stop (under g_frameMutex), so the render thread can
+// tell that a stop came while it was importing the frame it had taken.
+uint64_t g_streamGeneration = 0;
 // Frames per second of the stream, measured over the last second
 // (Pacer::m_MaxVideoFps comes from the stream configuration there).
 int g_streamFps = 0;
@@ -64,11 +73,11 @@ std::chrono::steady_clock::time_point g_streamFpsSince = std::chrono::steady_clo
 // every V-sync; this render callback does not run while the window is hidden).
 constexpr size_t MAX_PACING_QUEUE = 8;
 const bool g_statsEnabled = qEnvironmentVariableIsSet("LUNARIS_CLIENT_STATS");
-int g_statDelivered = 0, g_statShown = 0, g_statReplaced = 0;
+std::atomic_int g_statDelivered{0}, g_statShown{0}, g_statReplaced{0};
 std::chrono::steady_clock::time_point g_statSince = std::chrono::steady_clock::now();
-VaapiDmabufVideoItem *g_activeItem = nullptr;
+std::atomic<VaapiDmabufVideoItem *> g_activeItem{nullptr};
 std::atomic_bool g_dmabufRenderFailed{false};
-bool g_dmabufStreamActive = false;
+std::atomic_bool g_dmabufStreamActive{false};
 QOpenGLFunctions *g_gl = nullptr;
 
 #if defined(Q_OS_LINUX)
@@ -116,8 +125,8 @@ void clearPacingQueueLocked() {
 void markDmabufFailed(const char *reason) {
     g_dmabufRenderFailed.store(true, std::memory_order_release);
     std::cerr << "Lunaris: DMABUF renderer disabled: " << reason << std::endl;
-    if (g_activeItem) {
-        QMetaObject::invokeMethod(g_activeItem, "setDmabufActive", Qt::QueuedConnection, Q_ARG(bool, false));
+    if (VaapiDmabufVideoItem *item = g_activeItem.load()) {
+        QMetaObject::invokeMethod(item, "setDmabufActive", Qt::QueuedConnection, Q_ARG(bool, false));
     }
 }
 
@@ -178,6 +187,7 @@ VaapiDmabufVideoItem::VaapiDmabufVideoItem(QQuickItem *parent) : QQuickItem(pare
 
 VaapiDmabufVideoItem::~VaapiDmabufVideoItem() {
     g_activeItem = nullptr;
+    // Waits for a render pass in progress (renderNative holds m_mutex).
     QMutexLocker locker(&m_mutex);
     cleanupGlResources();
 }
@@ -318,7 +328,13 @@ bool VaapiDmabufVideoItem::ensureGlResources() {
             markDmabufFailed("shader link failed");
             return false;
         }
+        m_locYTexture = g_gl->glGetUniformLocation(m_program, "yTexture");
+        m_locUvTexture = g_gl->glGetUniformLocation(m_program, "uvTexture");
+        m_locRange = g_gl->glGetUniformLocation(m_program, "uRange");
+        m_locCoef = g_gl->glGetUniformLocation(m_program, "uCoef");
         m_texturesInitialized = true;
+        m_staticStateSet = false;
+        m_texParamsSet = false;
     }
     return true;
 #else
@@ -356,6 +372,8 @@ void VaapiDmabufVideoItem::cleanupGlResources() {
         m_uvTexture = 0;
         m_vbo = 0;
         m_texturesInitialized = false;
+        m_staticStateSet = false;
+        m_texParamsSet = false;
         return;
     }
     cleanupFrameLocked();
@@ -368,44 +386,58 @@ void VaapiDmabufVideoItem::cleanupGlResources() {
     m_uvTexture = 0;
     m_vbo = 0;
     m_texturesInitialized = false;
+    m_staticStateSet = false;
+    m_texParamsSet = false;
 }
 
-bool VaapiDmabufVideoItem::importPendingFrameLocked() {
+bool VaapiDmabufVideoItem::importPendingFrame(bool &moreQueued) {
 #if defined(Q_OS_LINUX)
-    // Pacer::handleVsync (pacer.cpp:215-262), run once per rendered frame.
-    // "If the queue length history entries are large, be strict about
-    // dropping excess frames."
-    size_t frameDropTarget = 1;
+    moreQueued = false;
+    // The screen query stays outside the lock.
     const int displayFps = (window() && window()->screen()) ? qRound(window()->screen()->refreshRate()) : 0;
-    // "If we may get more frames per second than we can display, use frame
-    // history to drop frames only if consistently above the one queued frame
-    // mark."
-    if (displayFps > 0 && g_streamFps >= displayFps) {
-        for (int queueHistoryEntry : g_pacingQueueHistory) {
-            if (queueHistoryEntry <= 1) {
-                // "Be lenient as long as the queue length resolves before
-                // the end of frame history"
-                frameDropTarget = 3;
-                break;
+    PendingDmabufFrame frame;
+    uint64_t generation = 0;
+    {
+        // The lock covers only the queue: the import and the release of the
+        // previous frame below can take long, and the decoder thread waits on
+        // this mutex to deliver.
+        QMutexLocker locker(&g_frameMutex);
+        // Pacer::handleVsync (pacer.cpp:215-262), run once per rendered frame.
+        // "If the queue length history entries are large, be strict about
+        // dropping excess frames."
+        size_t frameDropTarget = 1;
+        // "If we may get more frames per second than we can display, use frame
+        // history to drop frames only if consistently above the one queued frame
+        // mark."
+        if (displayFps > 0 && g_streamFps >= displayFps) {
+            for (int queueHistoryEntry : g_pacingQueueHistory) {
+                if (queueHistoryEntry <= 1) {
+                    // "Be lenient as long as the queue length resolves before
+                    // the end of frame history"
+                    frameDropTarget = 3;
+                    break;
+                }
             }
+            // "Keep a rolling 500 ms window of pacing queue history"
+            if (static_cast<int>(g_pacingQueueHistory.size()) >= displayFps / 2) {
+                g_pacingQueueHistory.pop_front();
+            }
+            g_pacingQueueHistory.push_back(static_cast<int>(g_pacingQueue.size()));
         }
-        // "Keep a rolling 500 ms window of pacing queue history"
-        if (static_cast<int>(g_pacingQueueHistory.size()) >= displayFps / 2) {
-            g_pacingQueueHistory.pop_front();
+        // "Catch up if we're several frames ahead"
+        while (g_pacingQueue.size() > frameDropTarget) {
+            dropFrame(g_pacingQueue.front());
+            g_pacingQueue.pop_front();
+            g_statReplaced++;
         }
-        g_pacingQueueHistory.push_back(static_cast<int>(g_pacingQueue.size()));
-    }
-    // "Catch up if we're several frames ahead"
-    while (g_pacingQueue.size() > frameDropTarget) {
-        dropFrame(g_pacingQueue.front());
+        if (g_pacingQueue.empty()) {
+            return m_haveImportedFrame;
+        }
+        frame = g_pacingQueue.front();
         g_pacingQueue.pop_front();
-        g_statReplaced++;
+        moreQueued = !g_pacingQueue.empty();
+        generation = g_streamGeneration;
     }
-    if (g_pacingQueue.empty()) {
-        return m_haveImportedFrame;
-    }
-    PendingDmabufFrame frame = g_pacingQueue.front();
-    g_pacingQueue.pop_front();
 
     if (frame.fourcc != DRM_FORMAT_NV12) {
         dropFrame(frame);
@@ -448,22 +480,38 @@ bool VaapiDmabufVideoItem::importPendingFrameLocked() {
     m_videoWidth = frame.width;
     m_videoHeight = frame.height;
 
+    // The sampling parameters belong to the texture object and survive
+    // respecifying its image: set once, when the textures are first bound.
     g_gl->glBindTexture(GL_TEXTURE_2D, m_yTexture);
-    g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (!m_texParamsSet) {
+        g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     glEGLImageTargetTexture2DOESFn(GL_TEXTURE_2D, m_yImage);
 
     g_gl->glBindTexture(GL_TEXTURE_2D, m_uvTexture);
-    g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (!m_texParamsSet) {
+        g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        g_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        m_texParamsSet = true;
+    }
     glEGLImageTargetTexture2DOESFn(GL_TEXTURE_2D, m_uvImage);
 
     m_haveImportedFrame = true;
-    setDmabufActive(true);
+    // A stop that came while this frame was being imported has already queued
+    // "inactive"; do not undo it.
+    bool stopped;
+    {
+        QMutexLocker locker(&g_frameMutex);
+        stopped = (generation != g_streamGeneration);
+    }
+    if (!stopped) {
+        setDmabufActive(true);
+    }
     return true;
 #else
     return false;
@@ -475,11 +523,16 @@ void VaapiDmabufVideoItem::renderNative() {
     if (!g_dmabufStreamActive || g_dmabufRenderFailed.load(std::memory_order_acquire) || !window()) {
         return;
     }
-    QMutexLocker locker(&g_frameMutex);
-    if (!ensureGlResources() || !importPendingFrameLocked()) {
+    // Held for the whole pass: keeps the destructor and the scene-graph
+    // teardown (which free the images and the displayed frame) from running
+    // under the import and the draw. g_frameMutex is NOT held here, only
+    // briefly inside importPendingFrame (lock order: m_mutex, then g_frameMutex).
+    QMutexLocker itemLocker(&m_mutex);
+    bool moreQueued = false;
+    if (!ensureGlResources() || !importPendingFrame(moreQueued)) {
         return;
     }
-    if (!g_pacingQueue.empty()) {
+    if (moreQueued) {
         // More frames wait: render again on the next refresh.
         QMetaObject::invokeMethod(this, [this]() { update(); }, Qt::QueuedConnection);
     }
@@ -491,13 +544,6 @@ void VaapiDmabufVideoItem::renderNative() {
     int w = static_cast<int>(width() * dpr);
     int h = static_cast<int>(height() * dpr);
 
-    const float vertices[] = {
-        -1.0f, -1.0f, 0.0f, 1.0f,
-         1.0f, -1.0f, 1.0f, 1.0f,
-        -1.0f,  1.0f, 0.0f, 0.0f,
-         1.0f,  1.0f, 1.0f, 0.0f,
-    };
-
     window()->beginExternalCommands();
     g_gl->glDisable(GL_DEPTH_TEST);
     g_gl->glDisable(GL_CULL_FACE);
@@ -506,17 +552,30 @@ void VaapiDmabufVideoItem::renderNative() {
     g_gl->glUseProgram(m_program);
     g_gl->glActiveTexture(GL_TEXTURE0);
     g_gl->glBindTexture(GL_TEXTURE_2D, m_yTexture);
-    g_gl->glUniform1i(g_gl->glGetUniformLocation(m_program, "yTexture"), 0);
+    if (!m_staticStateSet) {
+        // Constant for the item's lifetime (the viewport does the layout):
+        // the sampler units and the quad. Set inside the external-commands
+        // bracket so Qt's state tracking is not disturbed.
+        const float vertices[] = {
+            -1.0f, -1.0f, 0.0f, 1.0f,
+             1.0f, -1.0f, 1.0f, 1.0f,
+            -1.0f,  1.0f, 0.0f, 0.0f,
+             1.0f,  1.0f, 1.0f, 0.0f,
+        };
+        g_gl->glUniform1i(m_locYTexture, 0);
+        g_gl->glUniform1i(m_locUvTexture, 1);
+        g_gl->glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+        g_gl->glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+        m_staticStateSet = true;
+    }
     g_gl->glActiveTexture(GL_TEXTURE1);
     g_gl->glBindTexture(GL_TEXTURE_2D, m_uvTexture);
-    g_gl->glUniform1i(g_gl->glGetUniformLocation(m_program, "uvTexture"), 1);
     {
         const YuvCoefficients c = video_yuv_coefficients();
-        g_gl->glUniform4f(g_gl->glGetUniformLocation(m_program, "uRange"), c.y_offset, c.y_scale, c.c_scale, 0.0f);
-        g_gl->glUniform4f(g_gl->glGetUniformLocation(m_program, "uCoef"), c.rv, c.gu, c.gv, c.bu);
+        g_gl->glUniform4f(m_locRange, c.y_offset, c.y_scale, c.c_scale, 0.0f);
+        g_gl->glUniform4f(m_locCoef, c.rv, c.gu, c.gv, c.bu);
     }
     g_gl->glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
-    g_gl->glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
     g_gl->glEnableVertexAttribArray(0);
     g_gl->glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), nullptr);
     g_gl->glEnableVertexAttribArray(1);
@@ -586,12 +645,8 @@ extern "C" bool deliver_dmabuf_frame(int fd0,
     frame.owner = owner;
     g_pacingQueue.push_back(frame);
     g_dmabufStreamActive = true;
-    if (g_activeItem) {
-        QMetaObject::invokeMethod(g_activeItem, [item = g_activeItem]() {
-            if (item) {
-                item->update();
-            }
-        }, Qt::QueuedConnection);
+    if (VaapiDmabufVideoItem *item = g_activeItem.load()) {
+        QMetaObject::invokeMethod(item, [item]() { item->update(); }, Qt::QueuedConnection);
     }
     return true;
 #else
@@ -608,10 +663,15 @@ extern "C" bool dmabuf_render_failed() {
 extern "C" void set_dmabuf_stream_active(bool active) {
     g_dmabufStreamActive = active;
     if (!active) {
+        // Only the queue is cleared here. The frame being imported or drawn
+        // is owned by the render thread (it is out of the queue), and the one
+        // on screen is freed by the render thread alone, so a stop cannot
+        // free it under the draw.
         QMutexLocker locker(&g_frameMutex);
         clearPacingQueueLocked();
-        if (g_activeItem) {
-            QMetaObject::invokeMethod(g_activeItem, "setDmabufActive", Qt::QueuedConnection, Q_ARG(bool, false));
+        g_streamGeneration++;
+        if (VaapiDmabufVideoItem *item = g_activeItem.load()) {
+            QMetaObject::invokeMethod(item, "setDmabufActive", Qt::QueuedConnection, Q_ARG(bool, false));
         }
     }
 }

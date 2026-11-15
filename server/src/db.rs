@@ -15,12 +15,14 @@ pub async fn init_db(
     // If it's a file database, ensure parent directories exist
     if database_url.starts_with("sqlite://") {
         let path = database_url.trim_start_matches("sqlite://");
-        if path != ":memory:" {
+        let path = path.split('?').next().unwrap_or(path);
+        if path != ":memory:" && !path.is_empty() {
             if let Some(parent) = std::path::Path::new(path).parent() {
                 if !parent.as_os_str().is_empty() {
                     fs::create_dir_all(parent).unwrap_or_default();
                 }
             }
+            make_private(std::path::Path::new(path));
         }
     }
 
@@ -155,6 +157,12 @@ pub async fn init_db(
             .execute(&pool)
             .await?;
     }
+    // SHA-256 (hex) of the agent's own key: only that agent may use the host id.
+    if !columns.iter().any(|c| c == "agent_key_hash") {
+        sqlx::query("ALTER TABLE hosts ADD COLUMN agent_key_hash TEXT;")
+            .execute(&pool)
+            .await?;
+    }
 
     // Perform migrations for users table if columns don't exist
     let user_columns: Vec<String> =
@@ -199,11 +207,51 @@ pub async fn init_db(
         if let Err(e) = crate::paths::write_private(admin_password_file, &format!("{password}\n")) {
             tracing::error!("Cannot save the admin password to {:?}: {}", admin_password_file, e);
         }
+        // The password stays out of the log; it is in the file only.
         tracing::info!("==================================================");
-        tracing::info!(" Created admin account: admin / {}", password);
-        tracing::info!(" (saved to {:?}; change it after signing in)", admin_password_file);
+        tracing::info!(" Created admin account 'admin'; its password is in {:?}", admin_password_file);
+        tracing::info!(" (change it after signing in)");
         tracing::info!("==================================================");
     }
 
     Ok(pool)
+}
+
+/// The database holds password hashes and keys: only the owner may read it.
+/// Creates the file with mode 0600 (SQLite gives its journal files the same
+/// mode) and tightens an existing one.
+fn make_private(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if path.exists() {
+            if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+                tracing::warn!("Cannot restrict permissions of {:?}: {}", path, e);
+            }
+        } else if let Err(e) = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+            tracing::warn!("Cannot create {:?}: {}", path, e);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[tokio::test]
+    async fn database_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("lunaris-db-{}", crate::security::random_hex(8)));
+        let db = dir.join("lunaris.db");
+        let pool = super::init_db(&format!("sqlite://{}", db.display()), &dir.join("pw.txt")).await.unwrap();
+        let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('hosts')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "agent_key_hash"));
+        assert_eq!(std::fs::metadata(&db).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(dir.join("pw.txt")).unwrap().permissions().mode() & 0o777, 0o600);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

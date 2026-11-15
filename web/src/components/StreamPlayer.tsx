@@ -201,6 +201,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
   const agentIpsRef = useRef<string[]>([]);
   const wtPortRef = useRef<number | undefined>(undefined);
   const wtCertHashRef = useRef<string | undefined>(undefined);
+  const wtTokenRef = useRef<string | undefined>(undefined);
   const wtConnectingRef = useRef<boolean>(false);
 
   // Mobile gesture and keyboard refs
@@ -1385,7 +1386,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
                 payload.sdp.sdp,
                 payload.ice_servers,
                 payload.webtransport_port,
-                payload.webtransport_cert_hash
+                payload.webtransport_cert_hash,
+                payload.webtransport_token
               );
             }
             break;
@@ -1932,6 +1934,9 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     wtConnectingRef.current = true;
     const port = wtPortRef.current;
     const certHash = wtCertHashRef.current;
+    // Newer agents accept only the session's token (hex) as the URL path.
+    const token = wtTokenRef.current;
+    const path = token && /^[0-9a-fA-F]+$/.test(token) ? `/${token}` : '/';
     
     // The agent address ICE connected to comes first (it is reachable);
     // then the agent's other candidate addresses and the server's host.
@@ -1947,8 +1952,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     
     for (const ip of ips) {
       try {
-        const url = `https://${ip}:${port}/`;
-        addLog(`WebTransport: Connecting to ${url}...`);
+        const url = `https://${ip}:${port}${path}`;
+        addLog(`WebTransport: Connecting to https://${ip}:${port}...`);
         const transport = new (window as any).WebTransport(url, {
           serverCertificateHashes: [
             {
@@ -1959,18 +1964,26 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         });
         
         await transport.ready;
-        addLog(`WebTransport: Connected successfully to ${url}!`);
+        addLog(`WebTransport: Connected successfully to https://${ip}:${port}!`);
         
         wtRef.current = transport;
         wtDatagramWriterRef.current = transport.datagrams.writable.getWriter();
         setIsWebTransportConnected(true);
         
-        // Handle transport close to revert to WebRTC automatically
+        // Handle transport close to revert to WebRTC automatically: the
+        // channel wrappers send over WebTransport only while wtRef is set.
+        const revertToWebRtc = () => {
+          if (wtRef.current === transport) {
+            wtRef.current = null;
+            wtDatagramWriterRef.current = null;
+          }
+          setIsWebTransportConnected(false);
+        };
         transport.closed.then(() => {
           addLog("WebTransport: Connection closed, reverting to WebRTC.");
-          setIsWebTransportConnected(false);
+          revertToWebRtc();
         }).catch(() => {
-          setIsWebTransportConnected(false);
+          revertToWebRtc();
         });
         
         // Wrap existing data channels to send via WebTransport
@@ -2105,12 +2118,14 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     offerSdp: string, 
     iceServers?: { urls: string[], username?: string, credential?: string }[],
     webtransportPort?: number,
-    webtransportCertHash?: string
+    webtransportCertHash?: string,
+    webtransportToken?: string
   ) => {
     setStatus("Establishing WebRTC...");
     
     wtPortRef.current = webtransportPort;
     wtCertHashRef.current = webtransportCertHash;
+    wtTokenRef.current = webtransportToken;
     // WebTransport starts once ICE is connected (oniceconnectionstatechange):
     // the selected candidate pair then tells which agent address works.
     

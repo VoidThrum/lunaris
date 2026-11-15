@@ -53,7 +53,7 @@ fn settings_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let dir = home.join(".lunaris");
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = crate::secure_fs::create_private_dir(&dir);
     dir.join("local_server.json")
 }
 
@@ -67,7 +67,7 @@ fn load_settings() -> Settings {
 fn save_settings(settings: &Settings) -> Result<(), String> {
     STATUS.invalidate();
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(settings_path(), json).map_err(|e| e.to_string())
+    crate::secure_fs::write_private(&settings_path(), json).map_err(|e| e.to_string())
 }
 
 /// Database, agent token and admin password of the app's server.
@@ -75,7 +75,8 @@ pub fn data_dir() -> PathBuf {
     let dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("lunaris-server");
-    let _ = std::fs::create_dir_all(&dir);
+    // 0700, also when an older version created it open.
+    let _ = crate::secure_fs::create_private_dir(&dir);
     dir
 }
 
@@ -157,7 +158,8 @@ pub fn start() -> Result<(), String> {
 
 fn spawn(port: u16) -> Result<(), String> {
     let dir = data_dir();
-    let log = std::fs::File::create(dir.join("server.log")).map_err(|e| e.to_string())?;
+    // The log has held the first admin password: owner-only.
+    let log = crate::secure_fs::create_private_file(&dir.join("server.log")).map_err(|e| e.to_string())?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(exe);
