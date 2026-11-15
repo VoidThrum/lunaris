@@ -82,7 +82,7 @@ const vi: Record<string, string> = {
   'Which screen of the remote computer to show.': 'Màn hình nào của máy kia được hiển thị.',
   'Video decoding': 'Giải mã video',
   'Canvas renderer': 'Vẽ bằng canvas',
-  'Draws frames on a canvas as soon as they are decoded, for lower latency. Not available in every browser.': 'Vẽ khung hình lên canvas ngay khi giải mã xong để giảm độ trễ. Không phải trình duyệt nào cũng hỗ trợ.',
+  'Draws frames on a canvas as soon as they are decoded. Can lower latency, but uses about twice the CPU. Not available in every browser.': 'Vẽ khung hình lên canvas ngay khi giải mã xong. Có thể giảm độ trễ nhưng tốn CPU gấp khoảng hai lần. Không phải trình duyệt nào cũng hỗ trợ.',
   'Desktop app': 'Ứng dụng desktop',
   'Open sessions in the Lunaris desktop app instead of this browser.': 'Mở phiên bằng ứng dụng Lunaris trên máy tính thay vì trình duyệt này.',
   'Mouse and keyboard': 'Chuột và bàn phím',

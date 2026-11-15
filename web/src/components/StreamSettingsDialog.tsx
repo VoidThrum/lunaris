@@ -211,7 +211,7 @@ export default function StreamSettingsDialog({
 
                 <h3 className="ssd-section">{t('Decoding')}</h3>
                 <div className="ssd-card">
-                  <Row title={t('Canvas renderer')} hint={t('Draws frames on a canvas as soon as they are decoded, for lower latency. Not available in every browser.') + (canvasSupported ? '' : ' ' + t('(not supported by this browser)'))}>
+                  <Row title={t('Canvas renderer')} hint={t('Draws frames on a canvas as soon as they are decoded. Can lower latency, but uses about twice the CPU. Not available in every browser.') + (canvasSupported ? '' : ' ' + t('(not supported by this browser)'))}>
                     <Switch label={t('Canvas renderer')} checked={values.useCanvasRenderer && canvasSupported} disabled={!canvasSupported} onChange={(v) => onChange('useCanvasRenderer', v)} />
                   </Row>
                   {showNativeClient && (

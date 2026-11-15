@@ -365,11 +365,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       return false;
     }
     const hasProcessor = typeof (window as any).MediaStreamTrackProcessor !== 'undefined';
-    const saved = localStorage.getItem('lunaris_canvas_renderer');
-    if (saved === 'false') return false;
-    if (saved === 'true') return hasProcessor;
-    
-    return hasProcessor;
+    // Off unless chosen (see loadHostStreamSettings in App.tsx).
+    return hasProcessor && localStorage.getItem('lunaris_canvas_renderer_v2') === 'true';
   });
   const [draftUseCanvasRenderer, setDraftUseCanvasRenderer] = useState<boolean>(useCanvasRenderer);
 
@@ -2761,7 +2758,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     localStorage.setItem('lunaris_mouse_queue_limit', String(draftMouseQueueLimit));
     localStorage.setItem('lunaris_tauri_use_native', String(draftUseNativeClient));
     localStorage.setItem('lunaris_input_protocol', draftInputProtocol);
-    localStorage.setItem('lunaris_canvas_renderer', String(draftUseCanvasRenderer));
+    localStorage.setItem('lunaris_canvas_renderer_v2', String(draftUseCanvasRenderer));
     localStorage.setItem('lunaris_stream_encoder', draftEncoder);
     localStorage.setItem('lunaris_stream_display', draftDisplay);
     localStorage.setItem('lunaris_stream_chroma', draftChroma);
