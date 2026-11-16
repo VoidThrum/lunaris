@@ -80,6 +80,12 @@ build_ffmpeg() {
 
 build_binaries() {
     export PKG_CONFIG_PATH="$FFMPEG_PREFIX/lib/pkgconfig" QMAKE=/usr/bin/qmake6
+    # The client app's server embeds web/dist at build time; without it the
+    # web console answers 404. Build it first: (cd web && npm ci && npm run build).
+    if [[ ! -f web/dist/index.html ]]; then
+        echo "error: web/dist is missing: build the web client first (cd web && npm ci && npm run build)" >&2
+        exit 1
+    fi
     cargo build --release --locked -p agent-app --features static-ffmpeg --target-dir "$TARGET"
     cargo build --release --locked -p client-desktop --features static-ffmpeg --target-dir "$TARGET"
     for b in agent client-desktop; do

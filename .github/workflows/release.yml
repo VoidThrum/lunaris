@@ -143,6 +143,21 @@ jobs:
           path: /opt/lunaris-ffmpeg
           key: ffmpeg-static-${{ matrix.format }}-${{ hashFiles('scripts/packaging/build-ffmpeg-static.sh') }}
 
+      # The client app carries the server, and the server embeds web/dist: without
+      # this the packaged app answers 404 for the web console.
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build Web Frontend
+        run: |
+          cd web
+          npm ci
+          npm run build
+
       - name: Build packages
         run: bash scripts/packaging/linux/build-packages.sh ${{ matrix.format }} dist
 
