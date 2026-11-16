@@ -3089,12 +3089,10 @@ body {
     animation: drawer-mobile-fadeIn 0.25s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
-  .stream-viewport-wrapper {
-    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-  }
-
-  .stream-viewport-wrapper.keyboard-active {
-    transform: translateY(-140px);
+  /* The phone keyboard is open: the keys bar replaces the footer. */
+  .stream-container.keyboard-open .mobile-footer-bar,
+  .stream-container.keyboard-open .mobile-footer-pull-tab {
+    display: none;
   }
 
   .stream-stats-overlay {
@@ -3795,50 +3793,53 @@ button, input, select, textarea { font-family: inherit; }
   .fm-job-info { display: none; }
 }
 
-/* ---- Phone keys bar (above the on-screen keyboard) ----------------------- */
+/* ---- Phone keys bar (above the on-screen keyboard) -----------------------
+   The last row of the stream view, which is sized to the area the keyboard
+   leaves free. Eleven keys fill the width; the rest slide in from the right. */
+.stream-viewport-wrapper { min-height: 0; }
 .mobile-keys-bar {
-  position: fixed;
-  left: 0;
-  right: 0;
+  flex: 0 0 auto;
+  position: relative;
   z-index: 1200;
-  padding: 6px max(8px, env(safe-area-inset-left)) calc(6px + env(safe-area-inset-bottom, 0px));
-  background: var(--surface, #1b1d22);
-  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.1));
-  box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.25);
+  padding: 5px max(4px, env(safe-area-inset-right)) 5px max(4px, env(safe-area-inset-left));
+  background: #1c1c1e;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 .mobile-keys-row {
+  --keys-gap: 4px;
   display: flex;
-  gap: 6px;
+  gap: var(--keys-gap);
   overflow-x: auto;
+  overscroll-behavior-x: contain;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
 }
 .mobile-keys-row::-webkit-scrollbar { display: none; }
 .mobile-key {
-  flex: 0 0 auto;
-  min-width: 44px;
-  height: 40px;
-  padding: 0 12px;
-  border-radius: 8px;
-  border: 1px solid var(--border-strong, rgba(255, 255, 255, 0.16));
-  background: var(--surface-2, #262930);
-  color: var(--text, #e8e8ea);
-  font: 600 14px/1 inherit;
+  flex: 0 0 calc((100% - 10 * var(--keys-gap)) / 11);
+  min-width: 0;
+  height: 42px;
+  padding: 0;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #2c2c2e;
+  color: #f2f2f7;
+  font: 600 13px/1 inherit;
+  letter-spacing: -0.2px;
+  white-space: nowrap;
+  overflow: hidden;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
 }
-.mobile-key:active { background: var(--surface-3, #31353d); }
+.mobile-key.wide { flex-basis: auto; padding: 0 10px; }
+.mobile-key:active { background: #48484a; }
 .mobile-key.active {
   background: var(--accent, #2f6fed);
   border-color: var(--accent, #2f6fed);
   color: var(--on-accent, #fff);
 }
-.mobile-key.hide { font-size: 20px; }
-.mobile-key-sep {
-  flex: 0 0 1px;
-  align-self: stretch;
-  margin: 4px 2px;
-  background: var(--border, rgba(255, 255, 255, 0.12));
+@media (max-width: 380px) {
+  .mobile-key { font-size: 12px; }
 }
 
 /* ---- Phone controls sheet ------------------------------------------------- */

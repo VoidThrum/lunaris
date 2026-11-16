@@ -11,7 +11,10 @@
 //   and drag           the finger moves)
 //   2 finger tap       right click                    right click
 //   2 finger drag      scroll                         scroll
-//   pinch              zoom around the fingers        zoom around the fingers
+//   pinch              zoom around the cursor         zoom around the fingers
+//
+// Trackpad, zoomed in: the cursor stays in the middle of the view and the
+// picture moves under it (StreamPlayer's moveBy).
 
 export type TouchMode = 'trackpad' | 'direct';
 

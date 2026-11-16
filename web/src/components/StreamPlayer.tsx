@@ -9,6 +9,18 @@ import { TouchGestures, type GestureActions, type TouchPoint } from '../touchGes
 import { accessRefusal } from '../accessRequest';
 
 /** Windows virtual-key codes for the phone keys bar and keyboard keys. */
+/** The keys bar above the phone keyboard, in order. The first eleven are the
+ *  ones seen without sliding the row. */
+const MOBILE_KEYS: { label: string; key?: string; mod?: 'ctrl' | 'alt' | 'shift' | 'meta' }[] = [
+  { label: 'Win', mod: 'meta' }, { label: 'Esc', key: 'Escape' }, { label: 'Tab', key: 'Tab' },
+  { label: 'Shift', mod: 'shift' }, { label: 'Ctrl', mod: 'ctrl' }, { label: 'Alt', mod: 'alt' },
+  { label: 'Del', key: 'Delete' },
+  { label: '←', key: 'ArrowLeft' }, { label: '↑', key: 'ArrowUp' }, { label: '↓', key: 'ArrowDown' }, { label: '→', key: 'ArrowRight' },
+  { label: 'Home', key: 'Home' }, { label: 'End', key: 'End' }, { label: 'PgUp', key: 'PageUp' }, { label: 'PgDn', key: 'PageDown' },
+  { label: 'Ins', key: 'Insert' },
+  ...Array.from({ length: 12 }, (_, i) => ({ label: `F${i + 1}`, key: `F${i + 1}` })),
+];
+
 const PHONE_KEY_CODES: Record<string, number> = {
   Backspace: 8, Tab: 9, Enter: 13, Escape: 27, PageUp: 33, PageDown: 34, End: 35, Home: 36,
   ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Insert: 45, Delete: 46,
@@ -3223,13 +3235,23 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     };
   };
 
+  /** Puts the zoom on the picture element now (the state follows on the next
+   *  render with the same value), so the cursor drawn right after a move is
+   *  placed against the picture as it will be shown. */
+  const applyZoomNow = (scale: number, pan: { x: number; y: number }) => {
+    viewZoomRef.current = { scale, pan };
+    renderedZoomRef.current = { scale, pan };
+    const el = videoRef.current as HTMLElement | null;
+    if (el) el.style.transform = `translate(${pan.x}px, ${pan.y}px) scale(${scale})`;
+    setZoomScale(scale);
+    setZoomPan(pan);
+  };
+
   /** Sets the zoom, keeping the picture over the viewport. */
   const setTouchView = (scale: number, pan: { x: number; y: number }) => {
     const L = touchLayout();
     if (!L || scale <= 1) {
-      viewZoomRef.current = { scale: 1, pan: { x: 0, y: 0 } };
-      setZoomScale(1);
-      setZoomPan({ x: 0, y: 0 });
+      applyZoomNow(1, { x: 0, y: 0 });
       return;
     }
     const clampAxis = (value: number, origin: number, start: number, size: number, viewLo: number, viewHi: number) => {
@@ -3242,10 +3264,27 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       x: clampAxis(pan.x, L.originX, L.box.x, L.box.w, L.wrapper.left, L.wrapper.right),
       y: clampAxis(pan.y, L.originY, L.box.y, L.box.h, L.wrapper.top, L.wrapper.bottom),
     };
-    viewZoomRef.current = { scale, pan: clamped };
-    setZoomScale(scale);
-    setZoomPan(clamped);
+    applyZoomNow(scale, clamped);
   };
+
+  /** Touchpad mode, zoomed in: the cursor stays in the middle of the view and
+   *  the picture moves under it (like RustDesk). At the picture's edges the
+   *  view stops and the cursor goes on to the edge. */
+  const centerViewOnCursor = (scale: number) => {
+    const L = touchLayout();
+    if (!L || scale <= 1) {
+      setTouchView(1, { x: 0, y: 0 });
+      return;
+    }
+    const cur = localCursorPosRef.current;
+    const cx = (L.wrapper.left + L.wrapper.right) / 2;
+    const cy = (L.wrapper.top + L.wrapper.bottom) / 2;
+    setTouchView(scale, {
+      x: cx - L.originX - scale * (L.box.x + (cur.x / L.vidW) * L.box.w),
+      y: cy - L.originY - scale * (L.box.y + (cur.y / L.vidH) * L.box.h),
+    });
+  };
+  const touchpadOwnsView = () => touchModeRef.current === 'trackpad' && !isHardwareMouseActiveRef.current;
 
   const sendMouseAbsoluteNorm = (xNorm: number, yNorm: number) => {
     const channel = channelsRef.current["mouse_absolute"];
@@ -3287,19 +3326,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       const y = Math.max(0, Math.min(L.vidH - 1, cur.y + dy * gain * hostPerPx));
       localCursorPosRef.current = { x, y };
       sendMouseAbsoluteNorm(x / L.vidW, y / L.vidH);
-      if (z.scale > 1) {
-        // Zoomed in: the view follows the cursor when it nears an edge.
-        const margin = 48;
-        const sx = L.originX + z.pan.x + z.scale * (L.box.x + (x / L.vidW) * L.box.w);
-        const sy = L.originY + z.pan.y + z.scale * (L.box.y + (y / L.vidH) * L.box.h);
-        let px = z.pan.x;
-        let py = z.pan.y;
-        if (sx < L.wrapper.left + margin) px += L.wrapper.left + margin - sx;
-        else if (sx > L.wrapper.right - margin) px -= sx - (L.wrapper.right - margin);
-        if (sy < L.wrapper.top + margin) py += L.wrapper.top + margin - sy;
-        else if (sy > L.wrapper.bottom - margin) py -= sy - (L.wrapper.bottom - margin);
-        if (px !== z.pan.x || py !== z.pan.y) setTouchView(z.scale, { x: px, y: py });
-      }
+      // Zoomed in: the picture moves, the cursor stays in the middle.
+      if (z.scale > 1) centerViewOnCursor(z.scale);
       updateVirtualCursorDOM();
     },
     moveTo: (x, y) => sendTouchAbsolutePos(x, y),
@@ -3328,6 +3356,12 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       const L = touchLayout();
       if (!start || !L) return;
       const scale = Math.max(1, Math.min(5, start.scale * ratio));
+      if (touchpadOwnsView()) {
+        // Touchpad: zoom around the cursor, which stays in the middle.
+        centerViewOnCursor(scale);
+        updateVirtualCursorDOM();
+        return;
+      }
       // The picture point under the fingers when the pinch began stays
       // under them (and follows them as they move).
       const lx = (start.mid.x - L.originX - start.pan.x) / start.scale;
@@ -3557,13 +3591,21 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     };
   }, [status]);
 
-  // Keep the keys bar just above the phone's on-screen keyboard.
-  const [keysBarBottom, setKeysBarBottom] = useState(0);
+  // While the phone's keyboard is open the whole stream view takes the part
+  // of the screen the keyboard leaves free (the visual viewport: phones do
+  // not resize the page for the keyboard). The keys bar is the last row of
+  // that area, so it sits on top of the keyboard, and the picture is fitted
+  // into what is left above it.
+  const [keyboardArea, setKeyboardArea] = useState<{ top: number; height: number } | null>(null);
   useEffect(() => {
-    if (!isKeyboardActive) return;
+    if (!isKeyboardActive) { setKeyboardArea(null); return; }
     const vv = window.visualViewport;
     if (!vv) return;
-    const update = () => setKeysBarBottom(Math.max(0, window.innerHeight - (vv.height + vv.offsetTop)));
+    const update = () => {
+      const top = Math.max(0, Math.round(vv.offsetTop));
+      const height = Math.round(vv.height);
+      setKeyboardArea((prev) => (prev && prev.top === top && prev.height === height ? prev : { top, height }));
+    };
     update();
     vv.addEventListener('resize', update);
     vv.addEventListener('scroll', update);
@@ -3572,7 +3614,15 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       vv.removeEventListener('scroll', update);
     };
   }, [isKeyboardActive]);
-  const [showFnKeys, setShowFnKeys] = useState(false);
+  // The view changed size: fit the zoom to it again.
+  useLayoutEffect(() => {
+    const z = viewZoomRef.current;
+    if (z.scale > 1) {
+      if (touchpadOwnsView()) centerViewOnCursor(z.scale);
+      else setTouchView(z.scale, z.pan);
+    }
+    updateVirtualCursorDOM();
+  }, [isKeyboardActive, keyboardArea?.top, keyboardArea?.height]);
 
   // Send mouse position (absolute) — used only when pointer is NOT locked.
   // When pointer IS locked, the prediction cursor useEffect handles input via
@@ -3901,7 +3951,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
 
   return (
     <div
-      className="stream-container is-live"
+      className={`stream-container is-live ${isKeyboardActive ? 'keyboard-open' : ''}`}
+      style={keyboardArea ? { top: keyboardArea.top, height: keyboardArea.height } : undefined}
       ref={containerRef}
       onDragOver={(e) => { if (e.dataTransfer.types.includes('Files')) { e.preventDefault(); setIsDraggingFiles(true); } }}
       onDragLeave={(e) => { if (e.currentTarget === e.target) setIsDraggingFiles(false); }}
@@ -4282,7 +4333,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       {/* Main Stream Area */}
       <div 
         ref={viewportWrapperRef}
-        className={`stream-viewport-wrapper ${isKeyboardActive ? 'keyboard-active' : ''}`}
+        className="stream-viewport-wrapper"
       >
         {/* Hidden input for mobile virtual keyboard */}
         <input
@@ -4295,11 +4346,17 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
           enterKeyHint="enter"
           aria-label={t('Keyboard')}
           style={{
+            // Inside the view, so the phone does not scroll the page to
+            // reach it, and 16px, so iOS does not zoom in on focus.
             position: 'absolute',
-            top: '-100px',
-            left: '-100px',
-            width: '10px',
-            height: '10px',
+            top: 0,
+            left: 0,
+            width: '1px',
+            height: '1px',
+            padding: 0,
+            border: 0,
+            fontSize: '16px',
+            caretColor: 'transparent',
             opacity: 0,
             zIndex: -100,
             pointerEvents: 'none'
@@ -4606,55 +4663,6 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
               </div>
             )}
 
-            {/* Special keys above the phone keyboard (RustDesk-like). Buttons
-                keep the focus in the hidden field so the keyboard stays open. */}
-            {isKeyboardActive && (
-              <div
-                className="mobile-keys-bar"
-                style={{ bottom: keysBarBottom }}
-                onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
-                onTouchStart={(e) => e.stopPropagation()}
-                onTouchMove={(e) => e.stopPropagation()}
-                onTouchEnd={(e) => e.stopPropagation()}
-              >
-                <div className="mobile-keys-row">
-                  {([['ctrl', 'Ctrl'], ['alt', 'Alt'], ['shift', 'Shift'], ['meta', 'Win']] as const).map(([k, label]) => (
-                    <button
-                      key={k}
-                      type="button"
-                      className={`mobile-key mod ${modifierKeys[k] ? 'active' : ''}`}
-                      aria-pressed={modifierKeys[k]}
-                      onClick={() => setModifierKeys((prev) => {
-                        const next = { ...prev, [k]: !prev[k] };
-                        modifierKeysRef.current = next;
-                        return next;
-                      })}
-                    >{label}</button>
-                  ))}
-                  <span className="mobile-key-sep" />
-                  {showFnKeys
-                    ? Array.from({ length: 12 }, (_, i) => `F${i + 1}`).map((k) => (
-                      <button key={k} type="button" className="mobile-key" onClick={() => sendSpecialKeyRemote(k)}>{k}</button>
-                    ))
-                    : ([['Escape', 'Esc'], ['Tab', 'Tab'], ['ArrowLeft', '←'], ['ArrowUp', '↑'], ['ArrowDown', '↓'], ['ArrowRight', '→'],
-                      ['Home', 'Home'], ['End', 'End'], ['PageUp', 'PgUp'], ['PageDown', 'PgDn'], ['Delete', 'Del']] as const).map(([k, label]) => (
-                      <button key={k} type="button" className="mobile-key" aria-label={k} onClick={() => sendSpecialKeyRemote(k)}>{label}</button>
-                    ))}
-                  <button type="button" className={`mobile-key ${showFnKeys ? 'active' : ''}`} onClick={() => setShowFnKeys((v) => !v)}>
-                    {showFnKeys ? '⇠' : 'F1–12'}
-                  </button>
-                  <button type="button" className="mobile-key" onClick={() => pressKeyRemote(46, { ctrl: true, alt: true })}>Ctrl+Alt+Del</button>
-                  <button
-                    type="button"
-                    className="mobile-key hide"
-                    aria-label={t('Hide keyboard')}
-                    title={t('Hide keyboard')}
-                    onClick={() => { keyboardInputRef.current?.blur(); setIsKeyboardActive(false); }}
-                  >⌄</button>
-                </div>
-              </div>
-            )}
-
             {/* Pull tab to show footer when collapsed */}
             {!isMobileFooterVisible && (
               <button
@@ -4889,6 +4897,45 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
           </div>
         )}
       </div>
+
+      {/* Keys the phone keyboard lacks, in a row right above it. Buttons keep
+          the focus in the hidden field so the keyboard stays open. The first
+          eleven fill the width; the rest are reached by sliding the row. */}
+      {isStreaming && isKeyboardActive && (
+        <div
+          className="mobile-keys-bar"
+          onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+          onTouchStart={(e) => e.stopPropagation()}
+          onTouchMove={(e) => e.stopPropagation()}
+          onTouchEnd={(e) => e.stopPropagation()}
+        >
+          <div className="mobile-keys-row">
+            {MOBILE_KEYS.map((key) => (key.mod ? (
+              <button
+                key={key.label}
+                type="button"
+                className={`mobile-key ${modifierKeys[key.mod] ? 'active' : ''}`}
+                aria-pressed={modifierKeys[key.mod]}
+                onClick={() => setModifierKeys((prev) => {
+                  const next = { ...prev, [key.mod!]: !prev[key.mod!] };
+                  modifierKeysRef.current = next;
+                  return next;
+                })}
+              >{key.label}</button>
+            ) : (
+              <button key={key.label} type="button" className="mobile-key" aria-label={key.key} onClick={() => sendSpecialKeyRemote(key.key!)}>{key.label}</button>
+            )))}
+            <button type="button" className="mobile-key wide" onClick={() => pressKeyRemote(46, { ctrl: true, alt: true })}>Ctrl+Alt+Del</button>
+            <button
+              type="button"
+              className="mobile-key"
+              aria-label={t('Hide keyboard')}
+              title={t('Hide keyboard')}
+              onClick={() => { keyboardInputRef.current?.blur(); setIsKeyboardActive(false); }}
+            >⌄</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
