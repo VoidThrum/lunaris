@@ -1489,7 +1489,9 @@ async fn run_session_logic(
                         displays,
                         encoders,
                         gpu_info: if own_screen { lunaris_media::encode::describe_host_gpu(None) } else { None },
-                        host_os: Some(std::env::consts::OS.to_string()),
+                        // While another computer is shown, the viewer treats the
+                        // pointer by what that computer is.
+                        host_os: Some(crate::connector::media::source_os().unwrap_or_else(|| std::env::consts::OS.to_string())),
                         // The other computers this one shows: id and name only.
                         sources: crate::connector::configured_sources()
                             .into_iter()

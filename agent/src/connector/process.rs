@@ -87,6 +87,8 @@ pub enum EventHeader {
     /// Payload: RGBA pixels.
     CursorShape { width: u32, height: u32, hot_x: u32, hot_y: u32 },
     CursorPosition { x: i32, y: i32, visible: bool },
+    CursorEmbedded { embedded: bool },
+    Platform { os: String },
     /// Payload: the text, UTF-8.
     Clipboard,
     Displays { displays: Vec<DisplayInfo>, current: usize },
@@ -123,6 +125,8 @@ pub fn event_from_wire(header: EventHeader, payload: Bytes) -> Option<Event> {
             Event::CursorShape { width, height, hot_x, hot_y, rgba: payload }
         }
         EventHeader::CursorPosition { x, y, visible } => Event::CursorPosition { x, y, visible },
+        EventHeader::CursorEmbedded { embedded } => Event::CursorEmbedded { embedded },
+        EventHeader::Platform { os } => Event::Platform { os },
         EventHeader::Clipboard => Event::Clipboard { text: String::from_utf8(payload.to_vec()).ok()? },
         EventHeader::Displays { displays, current } => Event::Displays { displays, current },
         EventHeader::Closed { reason } => Event::Closed { reason },

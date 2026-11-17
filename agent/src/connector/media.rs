@@ -37,6 +37,127 @@ pub const TEST_NO_LOCAL_INPUT_ENV: &str = "LUNARIS_TEST_NO_LOCAL_INPUT";
 /// milliseconds, to measure how long one takes.
 pub const TEST_KEY_FRAME_EVERY_ENV: &str = "LUNARIS_CONNECTOR_TEST_KEY_FRAME_EVERY_MS";
 
+/// Test only: the connector answers the other computer's delay probes this
+/// many milliseconds late (to see what that computer's rate control does).
+pub const TEST_DELAY_REPLY_ENV: &str = "LUNARIS_CONNECTOR_TEST_DELAY_REPLY_MS";
+
+/// The kind of computer the source shown now is ("windows", ...), while a
+/// source is shown: what a viewer is told as the host's when it asks.
+static SOURCE_OS: Mutex<Option<String>> = Mutex::new(None);
+
+/// The platform of the source being shown, if one is.
+pub fn source_os() -> Option<String> {
+    SOURCE_OS.lock().unwrap().clone()
+}
+
+/// What a session's picture did, in numbers, for the log line at its end.
+#[derive(Default)]
+struct Counters {
+    received: u64,
+    forwarded: u64,
+    dropped: u64,
+    keys: u64,
+    key_requests: u64,
+    /// Frames in each whole second since the first.
+    per_second: Vec<u32>,
+    second_started: Option<Instant>,
+    in_second: u32,
+    last_arrival: Option<Instant>,
+    last_capture_ms: Option<u64>,
+    /// Gaps between arrivals, in tenths of a millisecond.
+    gaps: Vec<u32>,
+    /// The largest difference between the gap by the source's own times
+    /// and the gap between arrivals (ms).
+    worst_time_mismatch_ms: i64,
+    first_capture_ms: Option<u64>,
+    /// Whether the RTP times are (still) made of the source's own times.
+    capture_times_used: bool,
+    /// The viewer's input events and the commands made of them (counts).
+    input_events: u64,
+    input_commands: u64,
+}
+
+/// The line is written when the session's task ends, however it ends (the
+/// agent stops the task when the viewer leaves).
+impl Drop for Counters {
+    fn drop(&mut self) {
+        *SOURCE_OS.lock().unwrap() = None;
+        info!("Connector session: {}; input: {} events, {} commands", self.summary(self.capture_times_used), self.input_events, self.input_commands);
+    }
+}
+
+impl Counters {
+    fn frame(&mut self, now: Instant, capture_time_ms: Option<u64>, key: bool) {
+        self.received += 1;
+        self.keys += key as u64;
+        match self.second_started {
+            None => self.second_started = Some(now),
+            Some(started) if now.duration_since(started) >= Duration::from_secs(1) => {
+                self.per_second.push(self.in_second);
+                self.in_second = 0;
+                // Whole seconds without a frame count as such.
+                let mut next = started + Duration::from_secs(1);
+                while now.duration_since(next) >= Duration::from_secs(1) && self.per_second.len() < 100_000 {
+                    self.per_second.push(0);
+                    next += Duration::from_secs(1);
+                }
+                self.second_started = Some(next);
+            }
+            Some(_) => {}
+        }
+        self.in_second += 1;
+        if let Some(last) = self.last_arrival {
+            let gap = now.duration_since(last);
+            if self.gaps.len() < 1_000_000 {
+                self.gaps.push((gap.as_micros() / 100).min(u32::MAX as u128) as u32);
+            }
+            if let (Some(capture), Some(last_capture)) = (capture_time_ms, self.last_capture_ms) {
+                let mismatch = (capture as i64 - last_capture as i64) - gap.as_millis() as i64;
+                self.worst_time_mismatch_ms = self.worst_time_mismatch_ms.max(mismatch.abs());
+            }
+        }
+        self.last_arrival = Some(now);
+        self.last_capture_ms = capture_time_ms.or(self.last_capture_ms);
+        self.first_capture_ms = self.first_capture_ms.or(capture_time_ms);
+    }
+
+    /// One line of numbers: nothing of what was shown or typed.
+    fn summary(&self, capture_times_used: bool) -> String {
+        let mut seconds = self.per_second.clone();
+        seconds.sort_unstable();
+        let mut gaps = self.gaps.clone();
+        gaps.sort_unstable();
+        let gap = |p: f64| gaps.get(((gaps.len() as f64 * p) as usize).min(gaps.len().saturating_sub(1))).copied().unwrap_or(0) as f64 / 10.0;
+        let by_source = match (self.first_capture_ms, self.last_capture_ms) {
+            (Some(first), Some(last)) if last > first && self.received > 1 => format!("{:.1}", (self.received - 1) as f64 * 1000.0 / (last - first) as f64),
+            _ => "-".to_string(),
+        };
+        format!(
+            "frames: {} received, {} forwarded, {} dropped at the packager, {} key, {} key frames asked for; frames per second min {} median {} max {} over {} s ({} by the source's own times); gap between frames ms median {:.1} p95 {:.1} p99 {:.1} max {:.1}; source times {} (worst mismatch with arrival {} ms)",
+            self.received,
+            self.forwarded,
+            self.dropped,
+            self.keys,
+            self.key_requests,
+            seconds.first().copied().unwrap_or(0),
+            seconds.get(seconds.len() / 2).copied().unwrap_or(0),
+            seconds.last().copied().unwrap_or(0),
+            seconds.len(),
+            by_source,
+            gap(0.5),
+            gap(0.95),
+            gap(0.99),
+            gaps.last().copied().unwrap_or(0) as f64 / 10.0,
+            if capture_times_used { "used for RTP" } else { "not used (arrival times)" },
+            self.worst_time_mismatch_ms
+        )
+    }
+}
+
+/// How long a frame waits for room in the packager's queue before it is
+/// dropped (and a key frame asked for).
+const PACKAGER_WAIT: Duration = Duration::from_millis(50);
+
 /// How long the first picture may take after the login.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -160,6 +281,11 @@ const MAX_CAPTURE_DRIFT_MS: i64 = 1_000;
 impl Timeline {
     pub fn new(start: Instant) -> Self {
         Timeline { start, origin: None, last_capture_ms: 0, use_capture: true }
+    }
+
+    /// Whether the source's own times are (still) what the RTP times are made of.
+    pub fn uses_capture_times(&self) -> bool {
+        self.use_capture && self.origin.is_some()
     }
 
     /// The RTP time of a frame that arrived at `now`.
@@ -368,6 +494,7 @@ pub async fn run(source: Source, link: ViewerLink) {
     test_key_tick.tick().await;
     let mut report_at = Instant::now() + Duration::from_secs(5);
     let (mut frames, mut keys, mut bytes, mut dropped) = (0u64, 0u64, 0u64, 0u64);
+    let mut counters = Counters::default();
     let mut mapper = InputMapper::default();
     let mut cursor = lunaris_media::types::CursorState {
         x: 0,
@@ -418,6 +545,7 @@ pub async fn run(source: Source, link: ViewerLink) {
                     match viewer {
                         Some(ViewerInput::Packet(packet)) => {
                             input_events += 1;
+                            counters.input_events = input_events;
                             for command in mapper.commands(packet) {
                                 input_commands += 1;
                                 // Input is never dropped silently behind a slow
@@ -446,6 +574,7 @@ pub async fn run(source: Source, link: ViewerLink) {
                         }
                         Some(PipelineCommand::RequestKeyframe) => {
                             key_awaited.get_or_insert_with(Instant::now);
+                            counters.key_requests += 1;
                             Command::RequestKeyFrame
                         }
                         Some(PipelineCommand::SetFps(fps)) | Some(PipelineCommand::SetFrameLimit(fps)) => Command::Quality { fps, bitrate_kbps: 0 },
@@ -475,6 +604,8 @@ pub async fn run(source: Source, link: ViewerLink) {
                 if !connected.load(Ordering::Relaxed) {
                     continue;
                 }
+                counters.frame(now, capture_time_ms, key);
+                counters.capture_times_used = timeline.uses_capture_times();
                 frames += 1;
                 keys += key as u64;
                 bytes += data.len() as u64;
@@ -485,18 +616,28 @@ pub async fn run(source: Source, link: ViewerLink) {
                     }
                     arrivals.push_back((timestamp, now));
                 }
-                if video.try_send(VideoFramePayload { full_frame: data.to_vec(), timestamp }).is_err() {
+                // Frames from another computer come over a network, a few at
+                // once after a short stall: the packager gets a moment to
+                // take them (it works several times faster than they are
+                // shown) before one is given up. A stall longer than that is
+                // given up on, for a fresh whole picture.
+                let payload = VideoFramePayload { full_frame: data.to_vec(), timestamp };
+                if video.send_timeout(payload, PACKAGER_WAIT).await.is_err() {
                     if video.is_closed() {
                         let _ = commands.send(Command::Close).await;
                         break ("The viewer left".to_string(), false, "");
                     }
                     // The frames after a dropped one refer to it.
                     dropped += 1;
+                    counters.dropped += 1;
                     if last_key_request.is_none_or(|at| now.duration_since(at) >= Duration::from_millis(500)) {
                         last_key_request = Some(now);
+                        counters.key_requests += 1;
                         key_awaited.get_or_insert(now);
                         let _ = commands.try_send(Command::RequestKeyFrame);
                     }
+                } else {
+                    counters.forwarded += 1;
                 }
                 if now >= report_at {
                     info!(
@@ -546,11 +687,36 @@ pub async fn run(source: Source, link: ViewerLink) {
             Event::Clipboard { text } => {
                 let _ = clipboard.send(text);
             }
+            // The viewer treats the pointer by the kind of computer shown
+            // (it learns it from the encoder status, as of a Lunaris host).
+            Event::Platform { os } => {
+                info!("Connector: the computer is {}", os);
+                *SOURCE_OS.lock().unwrap() = Some(os.clone());
+                let _ = signaling.send(common::AgentMessage::Signaling(common::SignalingMessage::EncoderStatus {
+                    target_id: client_id.clone(),
+                    encoder: "remote".into(),
+                    hw_type: "connector".into(),
+                    gpu_info: None,
+                    requested_encoder: None,
+                    host_os: Some(os),
+                    display_id: None,
+                    display_name: None,
+                }));
+            }
+            // The pointer is in the picture: what a Lunaris host on Windows
+            // reports while a window is moved (`in_window_move_size`), and
+            // the viewers then do not draw their own.
+            Event::CursorEmbedded { embedded } => {
+                cursor.in_window_move_size = embedded;
+                let _ = media_events.try_send(MediaEvent::CursorUpdate(cursor.clone()));
+            }
             Event::Closed { reason } => break (reason, true, "ended"),
         }
     };
     MEASURING.store(false, Ordering::Relaxed);
-    info!("Connector: the source ended: {} ({} input events, {} commands)", reason, input_events, input_commands);
+    counters.input_events = input_events;
+    counters.input_commands = input_commands;
+    info!("Connector: the source ended: {}", reason);
     if by_source {
         // The viewer is told why, and the session is closed: no frozen picture.
         let _ = signaling.send(common::AgentMessage::Signaling(common::SignalingMessage::SourceStatus {

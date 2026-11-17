@@ -3293,7 +3293,11 @@ mod tests {
         let viewer = Viewer { codecs: vec![Wanted::H265, Wanted::H264], fps: 60 };
         let mut session = connector.connect(&connector_target(addr, PASSWORD), &viewer).await.expect("logged in");
 
-        // The displays of the PeerInfo come first.
+        // What kind of computer it is, then the displays of the PeerInfo.
+        match connector_event(&mut session).await {
+            Event::Platform { os } => assert!(["linux", "windows", "macos"].contains(&os.as_str()), "{}", os),
+            other => panic!("the platform first, not {:?}", other),
+        }
         match connector_event(&mut session).await {
             Event::Displays { displays, current } => {
                 assert_eq!(current, 0);

@@ -177,6 +177,12 @@ pub enum Event {
     /// The cursor's picture: RGBA, `width * height * 4` bytes.
     CursorShape { width: u32, height: u32, hot_x: u32, hot_y: u32, rgba: Bytes },
     CursorPosition { x: i32, y: i32, visible: bool },
+    /// The pointer is part of the picture now (`true`), so a viewer that
+    /// draws a pointer of its own would show two; or no longer (`false`).
+    CursorEmbedded { embedded: bool },
+    /// What kind of computer it is: "windows", "linux", "macos", "android"
+    /// (viewers treat the pointer differently by it).
+    Platform { os: String },
     /// The remote computer's clipboard text changed.
     Clipboard { text: String },
     /// The displays there are and the one shown.

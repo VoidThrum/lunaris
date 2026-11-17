@@ -141,10 +141,12 @@ impl Connector for RustdeskConnector {
 
         let (event_tx, events) = mpsc::channel::<Event>(64);
         let (commands, command_rx) = mpsc::channel::<Command>(64);
+        let _ = event_tx.try_send(Event::Platform { os: platform_of(&peer_info) });
         let _ = event_tx.try_send(displays_event(&peer_info));
         let wanted = viewer.codecs.clone();
+        let fps_percent = target.get(FPS_PERCENT_KEY).trim().parse::<u32>().ok().filter(|p| (100..=200).contains(p)).unwrap_or(100);
         tokio::spawn(async move {
-            let reason = run(conn, peer_info, wanted, &event_tx, command_rx).await;
+            let reason = run(conn, peer_info, wanted, fps_percent, &event_tx, command_rx).await;
             debug!("RustDesk connector: session with {} ended: {}", address, reason);
             let _ = event_tx.send(Event::Closed { reason }).await;
         });
@@ -305,9 +307,18 @@ const MOUSE_BUTTON_FORWARD: i32 = 0x10;
 const MAX_CURSOR_SIZE: i32 = 512;
 /// Cursor shapes kept to answer a `CursorId` (the host sends each once).
 const MAX_KEPT_CURSORS: usize = 64;
-/// The image quality is changed for the viewer's connection at most this
-/// often, and only by a tenth or more.
-const QUALITY_INTERVAL: Duration = Duration::from_secs(1);
+/// Whether the image quality is to be changed from `last` to `wanted` (per
+/// cent), `since` the last change. Each change makes the host set its
+/// encoder's bitrate anew and start its own rate control over, so the
+/// viewer's estimate is not followed in every wobble: down by 15 % or more,
+/// 2 s after the last change at the earliest; up by 25 % or more, 10 s after.
+fn quality_change_due(last: i32, wanted: i32, since: Duration) -> bool {
+    if wanted < last {
+        (last - wanted) * 100 >= last * 15 && since >= Duration::from_secs(2)
+    } else {
+        (wanted - last) * 100 >= last * 25 && since >= Duration::from_secs(10)
+    }
+}
 
 /// What the client knows of the host and of its own keyboard.
 struct Remote {
@@ -327,7 +338,58 @@ struct Remote {
     cursors: Vec<(u64, Event)>,
     quality_sent: Option<(i32, std::time::Instant)>,
     keys_unsendable_logged: bool,
+    /// Where the viewer's pointer is (display pixels), and its left button.
+    pointer: (i32, i32),
+    left_down: bool,
+    /// Where the left button went down, and whether the cursor was the
+    /// arrow then.
+    press: (i32, i32),
+    press_with_arrow: bool,
+    /// Whether the host's cursor is the arrow now.
+    cursor_is_arrow: bool,
+    /// Whether the viewer was told the pointer is in the picture.
+    embedded: bool,
+    /// Events a command or a cursor message gave rise to.
+    pending: Vec<Event>,
+    /// The host's delay probes: how long each answer took here (µs), and
+    /// what the host last said of the delay it measures (ms) and of its
+    /// bitrate (kbit/s).
+    /// The frame rate asked of the host, in per cent of the viewer's (see
+    /// `FPS_PERCENT_KEY`).
+    fps_percent: u32,
+    probe_answers_us: Vec<u32>,
+    probes_logged: bool,
+    host_delay_ms: u32,
+    host_bitrate_kbps: u32,
 }
+
+/// However the session ends, its numbers are written.
+impl Drop for Remote {
+    fn drop(&mut self) {
+        self.log_probes();
+    }
+}
+
+/// The platform of a host as the viewers are told it ("windows", "linux",
+/// "macos", "android"): `PeerInfo.platform` in lower case without spaces.
+fn platform_of(info: &PeerInfo) -> String {
+    let mut platform = info.platform.to_lowercase();
+    platform.retain(|c| !c.is_whitespace());
+    platform
+}
+
+/// A value of a source in the config file that no form shows (for trying
+/// out): the frame rate asked of the host in per cent of the viewer's, 100
+/// to 200. A RustDesk host paces its capture by sleeping the rest of each
+/// frame's time (server/video_service.rs `run`: `sleep(spf - elapsed)`),
+/// so what it delivers is somewhat under what it was asked for; asking for
+/// more can make up for that.
+pub const FPS_PERCENT_KEY: &str = "fps_percent";
+
+/// The left button held and the pointer moved this far (pixels) is a drag.
+const DRAG_PIXELS: i32 = 4;
+/// A cursor whose hot spot is this near its top left corner is the arrow.
+const ARROW_HOT_SPOT: u32 = 2;
 
 impl Remote {
     fn new(info: &PeerInfo) -> Self {
@@ -345,6 +407,18 @@ impl Remote {
             cursors: Vec::new(),
             quality_sent: None,
             keys_unsendable_logged: false,
+            pointer: (0, 0),
+            left_down: false,
+            press: (0, 0),
+            press_with_arrow: false,
+            cursor_is_arrow: true,
+            embedded: false,
+            pending: Vec::new(),
+            fps_percent: 100,
+            probe_answers_us: Vec::new(),
+            probes_logged: false,
+            host_delay_ms: 0,
+            host_bitrate_kbps: 0,
         }
     }
 
@@ -463,6 +537,52 @@ impl Remote {
         low
     }
 
+    /// The pointer in the picture while a window is moved on Windows.
+    ///
+    /// While a window is dragged by its title bar, Windows draws the
+    /// pointer into the desktop picture itself (so that pointer and window
+    /// move together), and the picture a host captures then has the pointer
+    /// in it. A Lunaris host says so (`in_window_move_size`, from
+    /// `GUI_INMOVESIZE`), and its viewers do not draw their own pointer
+    /// meanwhile. RustDesk's host says nothing of it: its cursor service
+    /// (server/input_service.rs `run_cursor`) sends a shape when the cursor's
+    /// handle changes and nothing when the pointer becomes part of the
+    /// picture, and its displays' `cursor_embedded` is fixed per display.
+    /// What is known here is the viewer's own input: the left button held
+    /// and the pointer dragged, begun while the cursor was the arrow, is
+    /// what moving a window looks like. That is told to the viewer as the
+    /// same state. It is a likeness, not knowledge: other drags that begin
+    /// on the arrow (a scroll bar, a selection frame on the desktop) are
+    /// taken for it too, and the viewer shows no pointer of its own during
+    /// them; drags that begin on another cursor (text, drawing) are not.
+    fn pointer_moved(&mut self) {
+        if self.platform != "windows" || !self.left_down || !self.press_with_arrow || self.embedded {
+            return;
+        }
+        let (dx, dy) = (self.pointer.0 - self.press.0, self.pointer.1 - self.press.1);
+        if dx.abs() >= DRAG_PIXELS || dy.abs() >= DRAG_PIXELS {
+            self.embedded = true;
+            self.pending.push(Event::CursorEmbedded { embedded: true });
+        }
+    }
+
+    fn left_button(&mut self, down: bool) {
+        self.left_down = down;
+        if down {
+            self.press = self.pointer;
+            self.press_with_arrow = self.cursor_is_arrow;
+        } else if self.embedded {
+            self.embedded = false;
+            self.pending.push(Event::CursorEmbedded { embedded: false });
+        }
+    }
+
+    fn note_cursor(&mut self, shape: &Event) {
+        if let Event::CursorShape { hot_x, hot_y, .. } = shape {
+            self.cursor_is_arrow = *hot_x <= ARROW_HOT_SPOT && *hot_y <= ARROW_HOT_SPOT;
+        }
+    }
+
     /// io_loop.rs `handle_msg_from_peer` for `CursorData`, with
     /// `decode_cursor_data`: the size, the hot spot and the length are
     /// checked before the pixels are taken.
@@ -490,6 +610,7 @@ impl Remote {
             self.cursors.remove(0);
         }
         self.cursors.push((data.id, event.clone()));
+        self.note_cursor(&event);
         Some(event)
     }
 
@@ -499,9 +620,20 @@ impl Remote {
         match command {
             // flutter input_model.dart: the position is on the host's
             // desktop (`x += rect.left`), the display's origin added.
-            Command::PointerMove { x, y } => vec![self.mouse(MOUSE_TYPE_MOVE, x + origin_x, y + origin_y)],
-            Command::PointerMoveRelative { dx, dy } => vec![self.mouse(MOUSE_TYPE_MOVE_RELATIVE, dx, dy)],
+            Command::PointerMove { x, y } => {
+                self.pointer = (x, y);
+                self.pointer_moved();
+                vec![self.mouse(MOUSE_TYPE_MOVE, x + origin_x, y + origin_y)]
+            }
+            Command::PointerMoveRelative { dx, dy } => {
+                self.pointer = (self.pointer.0 + dx, self.pointer.1 + dy);
+                self.pointer_moved();
+                vec![self.mouse(MOUSE_TYPE_MOVE_RELATIVE, dx, dy)]
+            }
             Command::PointerButton { button, down } => {
+                if button == Button::Left {
+                    self.left_button(down);
+                }
                 let button = match button {
                     Button::Left => MOUSE_BUTTON_LEFT,
                     Button::Right => MOUSE_BUTTON_RIGHT,
@@ -526,6 +658,7 @@ impl Remote {
                 let mut out = Vec::new();
                 // client.rs LoginConfigHandler::set_custom_fps.
                 if fps > 0 {
+                    let fps = (fps * self.fps_percent / 100).clamp(1, 120);
                     out.push(misc(misc::Union::Option(OptionMessage { custom_fps: fps as i32, ..Default::default() })));
                 }
                 // The protocol has no message for a bitrate. What a person
@@ -536,7 +669,7 @@ impl Remote {
                     let now = std::time::Instant::now();
                     let due = match self.quality_sent {
                         None => true,
-                        Some((last, at)) => now.duration_since(at) >= QUALITY_INTERVAL && (percent - last).abs() * 10 >= last,
+                        Some((last, at)) => quality_change_due(last, percent, now.duration_since(at)),
                     };
                     if due {
                         self.quality_sent = Some((percent, now));
@@ -566,6 +699,27 @@ impl Remote {
         }
     }
 
+    /// The delay probes of the session, in numbers, for the log (once).
+    fn log_probes(&mut self) {
+        if std::mem::replace(&mut self.probes_logged, true) {
+            return;
+        }
+        let mut answers = std::mem::take(&mut self.probe_answers_us);
+        if answers.is_empty() {
+            info!("RustDesk connector: no delay probe came from the computer");
+            return;
+        }
+        answers.sort_unstable();
+        info!(
+            "RustDesk connector: {} delay probes answered, each within median {} us, max {} us of being read; the computer last measured a delay of {} ms and aimed at {} kbit/s",
+            answers.len(),
+            answers[answers.len() / 2],
+            answers[answers.len() - 1],
+            self.host_delay_ms,
+            self.host_bitrate_kbps
+        );
+    }
+
     /// The platform as the host named it ("Windows", "Linux", "Mac OS").
     fn platform_name(&self) -> String {
         match self.platform.as_str() {
@@ -583,11 +737,15 @@ async fn run(
     mut conn: Conn,
     peer_info: PeerInfo,
     wanted: Vec<Codec>,
+    fps_percent: u32,
     events: &mpsc::Sender<Event>,
     mut commands: mpsc::Receiver<Command>,
 ) -> String {
     let mut remote = Remote::new(&peer_info);
+    remote.fps_percent = fps_percent;
     let mut channels: u8 = 2;
+    // Test only (see connector/media.rs): answer the host's delay probes late.
+    let test_reply_delay = std::env::var(super::media::TEST_DELAY_REPLY_ENV).ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_millis);
     loop {
         tokio::select! {
             msg = conn.next() => {
@@ -640,12 +798,26 @@ async fn run(
                         }
                     }
                     // client.rs handle_test_delay: the host's probe goes back as it came.
+                    // The host measures the way there and back with it and
+                    // sets its frame rate by what it measures (video_qos.rs
+                    // `user_network_delay`): answered at once, before
+                    // anything else is done with what was read.
                     Some(message::Union::TestDelay(delay)) => {
-                        if !delay.from_client && conn.send(&Message { union: Some(message::Union::TestDelay(delay)) }).await.is_err() {
-                            return "The connection to the computer broke".into();
+                        if !delay.from_client {
+                            let read_at = std::time::Instant::now();
+                            if let Some(wait) = test_reply_delay {
+                                tokio::time::sleep(wait).await;
+                            }
+                            remote.host_delay_ms = delay.last_delay;
+                            remote.host_bitrate_kbps = delay.target_bitrate;
+                            if conn.send(&Message { union: Some(message::Union::TestDelay(delay)) }).await.is_err() {
+                                return "The connection to the computer broke".into();
+                            }
+                            remote.probe_answers_us.push(read_at.elapsed().as_micros().min(u32::MAX as u128) as u32);
                         }
                     }
                     Some(message::Union::Misc(Misc { union: Some(misc::Union::CloseReason(reason)) })) => {
+                        remote.log_probes();
                         return if reason.is_empty() { "The computer closed the connection".into() } else { reason };
                     }
                     // io_loop.rs: the host shows another display, or the
@@ -671,7 +843,12 @@ async fn run(
                         }
                     }
                     Some(message::Union::CursorData(data)) => other = remote.cursor_shape(data),
-                    Some(message::Union::CursorId(id)) => other = remote.cursors.iter().find(|(known, _)| *known == id).map(|(_, shape)| shape.clone()),
+                    Some(message::Union::CursorId(id)) => {
+                        other = remote.cursors.iter().find(|(known, _)| *known == id).map(|(_, shape)| shape.clone());
+                        if let Some(shape) = other.as_ref() {
+                            remote.note_cursor(shape);
+                        }
+                    }
                     Some(message::Union::CursorPosition(position)) => {
                         let (origin_x, origin_y, _, _) = remote.shown();
                         // The newest position is enough: not waited for.
@@ -695,6 +872,7 @@ async fn run(
                         // io_loop.rs send_close_reason, then the connection ends.
                         let _ = conn.send(&misc(misc::Union::CloseReason(String::new()))).await;
                         let _ = conn.stream.shutdown().await;
+                        remote.log_probes();
                         return "Closed".into();
                     }
                     Some(command) => command,
@@ -704,7 +882,138 @@ async fn run(
                         return "The connection to the computer broke".into();
                     }
                 }
+                for event in std::mem::take(&mut remote.pending) {
+                    if events.send(event).await.is_err() {
+                        return "The viewer left".into();
+                    }
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote(platform: &str) -> Remote {
+        let mut display = crate::rustdesk::proto::DisplayInfo::default();
+        display.width = 1920;
+        display.height = 1080;
+        Remote::new(&PeerInfo { platform: platform.into(), version: "1.4.9".into(), displays: vec![display], ..Default::default() })
+    }
+
+    fn shape(id: u64, hot: (i32, i32)) -> CursorData {
+        let rgba = vec![255u8; 8 * 8 * 4];
+        CursorData { id, hotx: hot.0, hoty: hot.1, width: 8, height: 8, colors: Bytes::from(cursor::compress(&rgba)), ..Default::default() }
+    }
+
+    fn left(down: bool) -> Command {
+        Command::PointerButton { button: Button::Left, down }
+    }
+
+    /// What the viewer is told of the pointer being in the picture.
+    fn told(remote: &mut Remote) -> Vec<bool> {
+        std::mem::take(&mut remote.pending)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::CursorEmbedded { embedded } => Some(embedded),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dragging_with_the_arrow_on_windows_is_reported_as_the_pointer_in_the_picture() {
+        let mut r = remote("Windows");
+        // Before any shape came the cursor is taken for the arrow.
+        r.command(Command::PointerMove { x: 500, y: 20 });
+        r.command(left(true));
+        // Pressed, not moved yet: a click is not a drag.
+        r.command(Command::PointerMove { x: 502, y: 21 });
+        assert!(told(&mut r).is_empty());
+        r.command(Command::PointerMove { x: 540, y: 60 });
+        r.command(Command::PointerMove { x: 600, y: 90 });
+        assert_eq!(told(&mut r), [true], "told once, when the drag begins");
+        r.command(left(false));
+        assert_eq!(told(&mut r), [false], "and that it is over when the button is let go");
+        // Moving without the button says nothing; nor does another button.
+        r.command(Command::PointerMove { x: 100, y: 100 });
+        r.command(Command::PointerButton { button: Button::Right, down: true });
+        r.command(Command::PointerMove { x: 300, y: 300 });
+        r.command(Command::PointerButton { button: Button::Right, down: false });
+        assert!(told(&mut r).is_empty());
+        // A viewer that holds the pointer sends how far it moved.
+        r.command(left(true));
+        r.command(Command::PointerMoveRelative { dx: 3, dy: 0 });
+        assert!(told(&mut r).is_empty());
+        r.command(Command::PointerMoveRelative { dx: 3, dy: 0 });
+        assert_eq!(told(&mut r), [true]);
+        r.command(left(false));
+        assert_eq!(told(&mut r), [false]);
+    }
+
+    #[test]
+    fn a_drag_that_begins_on_another_cursor_or_on_another_system_is_not() {
+        let mut r = remote("Windows");
+        // The text cursor (hot spot in its middle), as a shape and later by its id.
+        assert!(r.cursor_shape(shape(1, (0, 0))).is_some());
+        assert!(r.cursor_is_arrow);
+        assert!(r.cursor_shape(shape(2, (4, 4))).is_some());
+        assert!(!r.cursor_is_arrow);
+        r.command(left(true));
+        r.command(Command::PointerMove { x: 200, y: 200 });
+        r.command(left(false));
+        assert!(told(&mut r).is_empty(), "selecting text keeps the viewer's pointer");
+        // Back to the arrow by its id (the host sends a shape once): a drag counts again.
+        let arrow = r.cursors.iter().find(|(id, _)| *id == 1).map(|(_, s)| s.clone()).unwrap();
+        r.note_cursor(&arrow);
+        r.command(left(true));
+        r.command(Command::PointerMove { x: 260, y: 260 });
+        assert_eq!(told(&mut r), [true]);
+        // The cursor changing during the drag (a window being moved keeps its
+        // state until the button is let go).
+        assert!(r.cursor_shape(shape(3, (4, 4))).is_some());
+        r.command(Command::PointerMove { x: 300, y: 300 });
+        assert!(told(&mut r).is_empty());
+        r.command(left(false));
+        assert_eq!(told(&mut r), [false]);
+
+        // A host that is not Windows draws no pointer into its picture this way.
+        for platform in ["Linux", "Mac OS", "Android"] {
+            let mut r = remote(platform);
+            r.command(left(true));
+            r.command(Command::PointerMove { x: 400, y: 400 });
+            r.command(left(false));
+            assert!(told(&mut r).is_empty(), "{}", platform);
+        }
+        assert_eq!(platform_of(&PeerInfo { platform: "Mac OS".into(), ..Default::default() }), "macos");
+        assert_eq!(platform_of(&PeerInfo { platform: "Windows".into(), ..Default::default() }), "windows");
+    }
+
+    #[test]
+    fn the_image_quality_follows_the_viewers_bitrate_calmly() {
+        let s = Duration::from_secs;
+        // Down: by 15 % or more, 2 s after the last change at the earliest.
+        assert!(quality_change_due(300, 250, s(2)));
+        assert!(!quality_change_due(300, 250, s(1)));
+        assert!(!quality_change_due(300, 270, s(60)));
+        // Up: by 25 % or more, 10 s after.
+        assert!(quality_change_due(200, 250, s(10)));
+        assert!(!quality_change_due(200, 250, s(9)));
+        assert!(!quality_change_due(200, 240, s(60)));
+        assert!(!quality_change_due(200, 200, s(60)));
+
+        // As commands: the first wish is sent, a wobble is not, a real drop is (later).
+        let mut r = remote("Windows");
+        r.codec = Some(Codec::H264);
+        let sent = |r: &mut Remote, kbps: u32| !r.command(Command::Quality { fps: 0, bitrate_kbps: kbps }).is_empty();
+        assert!(sent(&mut r, 15_000));
+        assert!(!sent(&mut r, 14_000));
+        assert!(!sent(&mut r, 6_000), "not within 2 s of the last change");
+        r.quality_sent = r.quality_sent.map(|(percent, at)| (percent, at - s(3)));
+        assert!(sent(&mut r, 6_000));
+        // The frame rate wanted goes as it is, every time.
+        assert_eq!(r.command(Command::Quality { fps: 60, bitrate_kbps: 0 }).len(), 1);
     }
 }

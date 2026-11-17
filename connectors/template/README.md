@@ -126,6 +126,8 @@ it cannot (wrong password, not reachable, no codec in common), it sends
 | `{"type":"audio","channels":2}` | one Opus packet | 48 kHz. |
 | `{"type":"cursor_shape","width":16,"height":16,"hot_x":0,"hot_y":0}` | `width * height * 4` bytes, RGBA | |
 | `{"type":"cursor_position","x":10,"y":20,"visible":true}` | – | In pixels of the display shown. |
+| `{"type":"cursor_embedded","embedded":true}` | – | The pointer is part of the picture now (`true`), so the viewer must not draw its own; or no longer (`false`). |
+| `{"type":"platform","os":"windows"}` | – | What kind of computer it is: `windows`, `linux`, `macos`, `android`. Once, at the start. |
 | `{"type":"clipboard"}` | the text, UTF-8 | The other computer's clipboard changed. |
 | `{"type":"displays","displays":[{"name":"1","width":1920,"height":1080}],"current":0}` | – | At the start, and when the list, a size or the display shown changes. |
 | `{"type":"closed","reason":"Wrong password"}` | – | The end. Nothing follows; the program exits. |
