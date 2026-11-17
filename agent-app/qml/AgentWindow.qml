@@ -6,22 +6,19 @@ import com.lunaris.agent 1.0
 
 ApplicationWindow {
     id: window
-    width: 460
-    height: baseHeight
+    // Wide rather than tall: two columns of cards side by side, one column
+    // when the window is made narrow; what does not fit scrolls.
+    width: 900
+    height: 660
     minimumWidth: 420
-    minimumHeight: baseHeight
+    minimumHeight: 460
     visible: false
     title: "Lunaris Agent"
     color: Theme.bg
     flags: Qt.Window
 
-    readonly property int baseHeight: directEnabled ? 880 : 760
-
-    // Grow the window while the activity log is open.
-    onShowLogChanged: {
-        if (showLog) { window.minimumHeight = baseHeight + 200; window.height = Math.max(window.height, baseHeight + 240) }
-        else { window.minimumHeight = baseHeight; window.height = baseHeight }
-    }
+    // Room for the activity log while it is open.
+    onShowLogChanged: { if (showLog && window.height < 820) window.height = 820 }
 
     // ── Bridge ──
     AgentBridge { id: bridge }
@@ -211,6 +208,25 @@ ApplicationWindow {
             }
         }
 
+        ScrollView {
+            id: scroll
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            contentWidth: availableWidth
+            clip: true
+
+        GridLayout {
+            width: scroll.availableWidth
+            columns: width >= 760 ? 2 : 1
+            columnSpacing: 14
+            rowSpacing: 14
+
+        ColumnLayout {
+            Layout.fillWidth: true
+            Layout.preferredWidth: 1
+            Layout.alignment: Qt.AlignTop
+            spacing: 14
+
         // This computer
         Card {
             Layout.fillWidth: true
@@ -272,6 +288,21 @@ ApplicationWindow {
             }
         }
 
+        // Options
+        ColumnLayout {
+            Layout.fillWidth: true
+            spacing: 2
+            Toggle { id: cbAutostart; text: "Start when I sign in" }
+            Toggle { id: cbCloseToTray; text: "Keep running in the tray when closed"; onCheckedChanged: window.closeToTray = checked }
+        }
+        }
+
+        ColumnLayout {
+            Layout.fillWidth: true
+            Layout.preferredWidth: 1
+            Layout.alignment: Qt.AlignTop
+            spacing: 14
+
         // Direct connections
         Card {
             Layout.fillWidth: true
@@ -298,18 +329,33 @@ ApplicationWindow {
                     visible: window.directEnabled
                     Layout.fillWidth: true
                     spacing: 4
-                    Text { text: "Address"; color: Theme.text; font.pixelSize: 12 }
-                    Repeater {
-                        model: window.directAddresses
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 8
-                            Text {
-                                text: modelData + ":" + window.directPort
-                                color: Theme.textStrong; font.pixelSize: 13; font.family: "monospace"
-                                Layout.fillWidth: true; elide: Text.ElideRight
+                    Text { text: "Addresses (click one to copy)"; color: Theme.text; font.pixelSize: 12 }
+                    // Click an address to copy it.
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        Repeater {
+                            model: window.directAddresses
+                            Rectangle {
+                                implicitHeight: 26
+                                implicitWidth: addrText.implicitWidth + 18
+                                radius: Theme.radiusSm
+                                color: addrMa.containsMouse ? Theme.surface2 : "transparent"
+                                border.width: 1
+                                border.color: Theme.borderStrong
+                                Text {
+                                    id: addrText
+                                    anchors.centerIn: parent
+                                    text: modelData + ":" + window.directPort
+                                    color: Theme.textStrong; font.pixelSize: 12; font.family: "monospace"
+                                }
+                                MouseArea {
+                                    id: addrMa
+                                    anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                    onClicked: { copyText(modelData + ":" + window.directPort); flash("Address copied", false) }
+                                    ToolTip.visible: containsMouse; ToolTip.delay: 400; ToolTip.text: "Copy"
+                                }
                             }
-                            LinkButton { text: "Copy"; onClicked: { copyText(modelData + ":" + window.directPort); flash("Address copied", false) } }
                         }
                     }
                     Text {
@@ -379,12 +425,8 @@ ApplicationWindow {
             }
         }
 
-        // Options
-        ColumnLayout {
-            Layout.fillWidth: true
-            spacing: 2
-            Toggle { id: cbAutostart; text: "Start when I sign in" }
-            Toggle { id: cbCloseToTray; text: "Keep running in the tray when closed"; onCheckedChanged: window.closeToTray = checked }
+        }
+        }
         }
 
         // Actions
@@ -443,7 +485,7 @@ ApplicationWindow {
 
         Rectangle {
             visible: window.showLog
-            Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 180
+            Layout.fillWidth: true; Layout.preferredHeight: 200; Layout.minimumHeight: 140
             color: Theme.surface2; border.color: Theme.border; border.width: 1; radius: Theme.radius
             ListView {
                 id: consoleView
@@ -461,7 +503,6 @@ ApplicationWindow {
             }
         }
 
-        Item { Layout.fillHeight: !window.showLog }
     }
 
     // ── Signals ──

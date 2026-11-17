@@ -304,7 +304,7 @@ pub(crate) fn hardware_encoder_opens_blocking(
     if let Some(ok) = cache.lock().unwrap().get(&key) {
         return *ok;
     }
-    let probed = lunaris_media::encode::probe_encoder(codec, width, height, fps);
+    let probed = lunaris_media::encode::probe_hardware_encoder(codec, width, height, fps);
     let ok = probed
         .as_ref()
         .is_some_and(|e| e.hw_type != lunaris_media::HwAccelType::Software);

@@ -825,7 +825,10 @@ pub async fn run(source: Source, link: ViewerLink) {
                     target_id: client_id.clone(),
                     encoder: "remote".into(),
                     hw_type: "connector".into(),
-                    gpu_info: None,
+                    // Said, not left out: the viewers keep the last GPU they
+                    // heard of otherwise, which is this computer's (the one
+                    // bridging), not the GPU of the computer shown.
+                    gpu_info: Some("Unknown (encoded on the remote computer)".into()),
                     requested_encoder: None,
                     host_os: Some(os),
                     display_id: None,
