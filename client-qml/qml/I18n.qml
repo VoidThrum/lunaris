@@ -23,6 +23,24 @@ QtObject {
         return text;
     }
 
+    // A message made by the agent, the server or a connector, some of which
+    // carry a name or a detail: "<label> is required", "<label> must be a
+    // port from 1 to 65535", "<sentence>: <detail>".
+    function tError(text) {
+        var message = String(text || "");
+        if (i18n.lang !== "vi" || i18n.vi[message] !== undefined) return t(message);
+        var required = /^(.+) is required$/.exec(message);
+        if (required) return t("%1 is required").arg(t(required[1]));
+        var port = /^(.+) must be a port from 1 to 65535$/.exec(message);
+        if (port) return t("%1 must be a port from 1 to 65535").arg(t(port[1]));
+        var cut = message.indexOf(": ");
+        if (cut > 0) {
+            var head = message.slice(0, cut) + ": %1";
+            if (i18n.vi[head] !== undefined) return t(head).arg(message.slice(cut + 2));
+        }
+        return message;
+    }
+
     readonly property var vi: ({
         "Accepting connections": "Chấp nhận kết nối",
         "How someone gets in. Restarts remote control.": "Cách người khác vào được máy này. Điều khiển từ xa sẽ khởi động lại.",
@@ -58,6 +76,61 @@ QtObject {
         "Nobody accepted the connection at the remote computer in time.": "Không ai chấp nhận kết nối ở máy bên kia kịp thời.",
         "Nobody can accept connections at the remote computer: enter its password.": "Không có ai ở máy bên kia để chấp nhận: hãy nhập mật khẩu.",
         "The remote computer refused the connection.": "Máy bên kia từ chối kết nối.",
+        // ---- Add computer with a type; computers of other types ----
+        "Type": "Loại",
+        "Name (optional)": "Tên (không bắt buộc)",
+        "Edit…": "Sửa…",
+        "Edit %1": "Sửa %1",
+        "Saving…": "Đang lưu…",
+        "A computer with the Lunaris app (remote control turned on). Its address and password are shown under \"This computer\" there.": "Một máy có app Lunaris (đã bật điều khiển từ xa). Địa chỉ và mật khẩu hiện ở mục \"Máy này\" trên máy đó.",
+        "Through which Lunaris computer": "Qua máy Lunaris nào",
+        "That computer connects to the new one and shows it. The address and password are kept there, not on the server.": "Máy đó sẽ kết nối tới máy mới và hiển thị nó. Địa chỉ và mật khẩu được lưu ở máy đó, không lưu trên server.",
+        "Choose the Lunaris computer it is reached through": "Hãy chọn máy Lunaris dùng để kết nối tới nó",
+        "Leave empty to keep the password": "Để trống để giữ mật khẩu cũ",
+        "Leave empty to keep it": "Để trống để giữ nguyên",
+        "Leave a field empty to keep it. The server never shows what is stored.": "Để trống ô nào thì giữ nguyên ô đó. Server không bao giờ hiển thị giá trị đã lưu.",
+        "Its other fields can be changed when the Lunaris computer it is reached through is online.": "Các ô khác chỉ sửa được khi máy Lunaris dùng để kết nối tới nó đang trực tuyến.",
+        "This type is not installed any more: only the name can be changed.": "Loại này không còn được cài nữa: chỉ đổi được tên.",
+        "%1 must be a port from 1 to 65535": "%1 phải là số từ 1 đến 65535",
+        "The computer could not be saved": "Không lưu được máy",
+        "Computers you add or connect to will show up here.": "Máy bạn thêm hoặc kết nối tới sẽ hiện ở đây.",
+        "via %1": "qua %1",
+        "Remove computer": "Xoá máy",
+        "Remove \"%1\"? It is removed from %2, which will no longer show it.": "Xoá \"%1\"? Máy này sẽ bị xoá khỏi %2, nên %2 không còn hiển thị nó nữa.",
+        "Removing…": "Đang xoá…",
+        "Display %1": "Màn hình %1",
+        "Which screen of the remote computer to show. Its screens are listed here after you have connected to it once.": "Chọn màn hình của máy bên kia để hiển thị. Danh sách màn hình sẽ có ở đây sau khi bạn kết nối tới máy đó một lần.",
+        "Admin access required": "Cần quyền quản trị",
+        // The server's answers when a computer is added through it
+        "That computer is offline": "Máy đó đang ngoại tuyến",
+        "That computer went offline": "Máy đó vừa ngoại tuyến",
+        "That computer did not answer": "Máy đó không trả lời",
+        "That computer did not say whether it worked": "Máy đó không cho biết đã làm được hay chưa",
+        "That computer is offline. It can be removed when it is back.": "Máy đó đang ngoại tuyến. Có thể xoá khi nó trực tuyến trở lại.",
+        "The Lunaris on that computer is too old for this. Update it first.": "Lunaris trên máy đó quá cũ để làm việc này. Hãy cập nhật trước.",
+        "That computer asks at its screen before each connection, so computers cannot be added to it from here. Add it in the Lunaris app on that computer.": "Máy đó hỏi tại màn hình trước mỗi kết nối nên không thể thêm máy cho nó từ đây. Hãy thêm trong app Lunaris trên máy đó.",
+        "The settings could not be saved": "Không lưu được cài đặt",
+        // Why a computer of another type could not be shown, or stopped
+        // (agent/src/connector, agent/src/lib.rs, own_computers.rs)
+        "Wrong password for the RustDesk computer": "Sai mật khẩu của máy RustDesk",
+        "The RustDesk computer does not accept a password (only a click at the computer)": "Máy RustDesk không nhận mật khẩu (chỉ chấp nhận khi có người bấm đồng ý tại máy)",
+        "The RustDesk computer cannot be reached (is it on, and is direct IP access switched on there?)": "Không kết nối được tới máy RustDesk (máy có đang bật không, và đã bật truy cập trực tiếp bằng IP trên máy đó chưa?)",
+        "The RustDesk computer does not answer": "Máy RustDesk không trả lời",
+        "The RustDesk computer did not answer the login": "Máy RustDesk không trả lời khi đăng nhập",
+        "The RustDesk computer closed the connection": "Máy RustDesk đã đóng kết nối",
+        "The connection to the RustDesk computer broke: %1": "Kết nối tới máy RustDesk bị đứt: %1",
+        "The connection to the computer broke: %1": "Kết nối tới máy bị đứt: %1",
+        "The computer closed the connection": "Máy đã đóng kết nối",
+        "The computer's IP address is missing": "Thiếu địa chỉ IP của máy",
+        "The viewer decodes no video codec": "Thiết bị xem không giải mã được codec video nào",
+        "This viewer decodes no video the computer could send": "Thiết bị này không giải mã được loại video nào mà máy kia gửi được",
+        "The computer sent no picture": "Máy không gửi hình ảnh",
+        "The connector ended": "Bộ kết nối đã dừng",
+        "That computer is not there any more": "Máy đó không còn nữa",
+        "No computer was chosen": "Chưa chọn máy nào",
+        "This computer cannot be reached that way": "Không kết nối tới máy này theo cách đó được",
+        "The helper for other computers did not start": "Trình trợ giúp cho các máy loại khác không khởi động được",
+        "cannot start the helper for other computers: %1": "không khởi động được trình trợ giúp cho các máy loại khác: %1",
         // ---- Home / navigation ----
         "Home": "Trang chủ",
         "Settings": "Cài đặt",
@@ -179,13 +252,6 @@ QtObject {
         "Default 21118, the port RustDesk uses for direct IP access. In RustDesk, connect to address:port.": "Mặc định 21118, cổng RustDesk dùng cho kết nối trực tiếp bằng IP. Trong RustDesk, nhập địa chỉ:cổng để kết nối.",
         "Port other computers use to reach this one. Allow it in the firewall to connect from your network.": "Cổng máy khác dùng để kết nối tới máy này. Hãy mở cổng này trong tường lửa để kết nối từ mạng nội bộ.",
         "Port": "Cổng",
-        "Other computers": "Máy tính khác",
-        "Computers this one can show to the people who connect to it, for example a RustDesk computer on your network.": "Những máy mà máy này hiển thị được cho người kết nối tới nó, ví dụ một máy RustDesk trong mạng của bạn.",
-        "Anyone who may use this computer may also use these computers.": "Ai được dùng máy này thì cũng dùng được các máy này.",
-        "The address and password stay on this computer; the server and the viewers only see the name.": "Địa chỉ và mật khẩu chỉ nằm trên máy này; server và người xem chỉ thấy tên.",
-        "No other computers yet.": "Chưa có máy nào khác.",
-        "What viewers see in their list.": "Tên người xem thấy trong danh sách.",
-        "Connect with": "Kết nối bằng",
         "IP address": "Địa chỉ IP",
         "RustDesk (by IP address)": "RustDesk (bằng địa chỉ IP)",
         "Give the computer a name": "Hãy đặt tên cho máy",

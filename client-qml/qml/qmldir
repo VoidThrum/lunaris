@@ -26,3 +26,5 @@ ApiClient 1.0 ApiClient.qml
 AdminUsers 1.0 AdminUsers.qml
 AdminGroups 1.0 AdminGroups.qml
 AdminTurnServers 1.0 AdminTurnServers.qml
+AddComputerDialog 1.0 AddComputerDialog.qml
+TypeBadge 1.0 TypeBadge.qml

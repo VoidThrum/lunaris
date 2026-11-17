@@ -221,6 +221,51 @@ pub struct SourceInfoMsg {
     pub connector: String,
 }
 
+/// A kind of computer a host can show through a connector, and what it
+/// takes to add one (the fields of the form).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorInfoMsg {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub fields: Vec<ConnectorFieldMsg>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorFieldMsg {
+    pub key: String,
+    pub label: String,
+    /// "text", "port" or "secret".
+    pub kind: String,
+    #[serde(default)]
+    pub default: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// What a server asks an agent to do with its sources. The fields of a
+/// source (address, password) pass through the server once, in this
+/// message, and are kept only by the agent.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SourceChange {
+    Add { name: String, connector: String, values: std::collections::BTreeMap<String, String> },
+    /// A field left out or empty keeps its value.
+    Update { id: String, name: String, values: std::collections::BTreeMap<String, String> },
+    Remove { id: String },
+}
+
+// The values include a password: they are never printed.
+impl std::fmt::Debug for SourceChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceChange::Add { connector, values, .. } => write!(f, "Add {{ connector: {:?}, fields: {:?} }}", connector, values.keys().collect::<Vec<_>>()),
+            SourceChange::Update { id, values, .. } => write!(f, "Update {{ id: {:?}, fields: {:?} }}", id, values.keys().collect::<Vec<_>>()),
+            SourceChange::Remove { id } => write!(f, "Remove {{ id: {:?} }}", id),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "payload")]
 pub enum SignalingMessage {
@@ -401,6 +446,27 @@ pub enum AgentMessage {
     },
     StatusUpdate { status: HostStatus },
     Signaling(SignalingMessage),
+    /// The other computers this agent shows and the kinds it can show, when
+    /// it connects and whenever they change. Servers from before this
+    /// message drop it.
+    Sources {
+        sources: Vec<SourceInfoMsg>,
+        connectors: Vec<ConnectorInfoMsg>,
+        /// Whether sources can be changed from the server (not on a
+        /// computer that asks at its screen before each connection).
+        #[serde(default)]
+        manageable: bool,
+    },
+    /// The answer to `ServerToAgentMessage::ChangeSource`.
+    SourceChanged {
+        request_id: String,
+        /// The source's id, when it worked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// Why not, in words for the person, when it did not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 // Message from Server to Agent via WebSocket
@@ -409,6 +475,16 @@ pub enum AgentMessage {
 pub enum ServerToAgentMessage {
     Registered { success: bool },
     Signaling(SignalingMessage),
+    /// Add, change or remove a source of this agent; answered with
+    /// `AgentMessage::SourceChanged`. Agents from before this message drop
+    /// it (the server then tells the person the computer is too old).
+    ChangeSource {
+        request_id: String,
+        change: SourceChange,
+        /// Who asked (user name), for the agent's log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requester: Option<String>,
+    },
 }
 
 // Message from Client to Server via WebSocket

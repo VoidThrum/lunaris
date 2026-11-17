@@ -7,6 +7,7 @@ import QtQuick.Layouts
 // computers on the right, and the settings.
 Rectangle {
     id: home
+    objectName: "home"
     color: Theme.bg
 
     signal startSessionRequested(string server, string token, string hostId, string hostName, int appId, string res, int fps, string codec, int bitrate, int queueLimit, bool disableCuda, string renderBackend, string inputProtocol, string encoder, string displayId, string sourceId)
@@ -34,8 +35,21 @@ Rectangle {
     property string serverError: ""
     property bool serverBusy: false
 
-    // Saved computers: [{ address, name, password, favorite, lastUsed, os }]
+    // Saved computers: [{ address, name, password, favorite, lastUsed, os }].
+    // A computer of another type (added with a connector) is
+    // { address: "source:<id>", name, type: <connector id>, sourceId, favorite,
+    // lastUsed }: its fields are kept by the app's helper, not here.
     property var peers: []
+    // The types a computer can be added with besides Lunaris (connectors):
+    // [{ id, name, fields }].
+    property var connectors: []
+    // The app's own computers of other types, as the helper's config has
+    // them: [{ id, name, connector, connector_name, values }] (no secrets).
+    property var ownSources: []
+    // The saved computer the running session is to ("" for one of the
+    // Server tab), and the source it shows, for the displays it lists.
+    property string sessionPeer: ""
+    property string sessionSource: ""
 
     // Defaults for new connections (Settings > Display), saved in app_settings.
     property var prefs: ({
@@ -99,7 +113,164 @@ Rectangle {
         if (lastAddress !== "" && findPeer(lastAddress) === null) {
             rememberPeer(lastAddress, bridge.savedDirectPassword(), true);
         }
+        refreshOwnComputers();
+        adoptOwnComputers();
         refreshHost();
+    }
+
+    // ---- Computers of other types (connectors) ----
+    function isSource(peer) {
+        return !!peer && String(peer.address || "").indexOf("source:") === 0;
+    }
+
+    function refreshOwnComputers() {
+        try { home.connectors = JSON.parse(bridge.bridgeConnectors()) || []; } catch (e) { console.log("connectors: " + e); }
+        try { home.ownSources = JSON.parse(bridge.bridgeSources()) || []; } catch (e) { console.log("own computers: " + e); }
+    }
+
+    // A computer the helper has but the list has not (the list was lost or
+    // comes from another copy) gets its card back.
+    function adoptOwnComputers() {
+        var list = home.peers.slice();
+        var added = false;
+        for (var i = 0; i < home.ownSources.length; i++) {
+            var s = home.ownSources[i];
+            if (findPeer("source:" + s.id) !== null) continue;
+            list.push({ address: "source:" + s.id, name: s.name, type: s.connector, sourceId: s.id, favorite: false, lastUsed: 0 });
+            added = true;
+        }
+        if (added) { home.peers = list; savePeers(); }
+    }
+
+    function ownSource(id) {
+        for (var i = 0; i < home.ownSources.length; i++)
+            if (home.ownSources[i].id === id) return home.ownSources[i];
+        return null;
+    }
+
+    function connectorById(id) {
+        for (var i = 0; i < home.connectors.length; i++)
+            if (home.connectors[i].id === id) return home.connectors[i];
+        return null;
+    }
+
+    // The name of a card's type, for its badge.
+    function typeName(peer) {
+        var c = connectorById(peer.type || "");
+        if (c) return c.name;
+        var s = ownSource(peer.sourceId || "");
+        return s ? s.connector_name : String(peer.type || "");
+    }
+
+    // What stands where a Lunaris card has its address: the first field of
+    // the computer that may be shown (for most types, where it is).
+    function sourceSummary(peer) {
+        var s = ownSource(peer.sourceId || "");
+        var c = connectorById(peer.type || "");
+        if (s && c) {
+            for (var i = 0; i < c.fields.length; i++) {
+                var value = s.values ? s.values[c.fields[i].key] : "";
+                if (c.fields[i].kind !== "secret" && value) return String(value);
+            }
+        }
+        return I18n.t(typeName(peer));
+    }
+
+    // "Add computer", type Lunaris: saved without connecting. Returns an
+    // error message or "".
+    function addLunarisPeer(address, password, name) {
+        var addr = normalizeAddress(address);
+        if (addr === "") return I18n.t("Enter the address of the computer");
+        var changes = { lastUsed: Date.now() };
+        if (name !== "") changes.name = name;
+        if (password !== "") changes.password = password;
+        if (findPeer(addr)) {
+            updatePeer(addr, changes);
+        } else {
+            var list = home.peers.slice();
+            list.push(Object.assign({ address: addr, name: "", password: "", favorite: false, os: "" }, changes));
+            home.peers = list;
+            savePeers();
+        }
+        home.peerTab = "recent";
+        return "";
+    }
+
+    // "Add computer" with a connector type (`sourceId` ""), or "Edit" of
+    // one. The fields go to the app's helper; the card keeps the name and
+    // the type. Returns an error message or "".
+    function saveSource(connectorId, sourceId, name, values) {
+        var answer;
+        try {
+            answer = JSON.parse(sourceId === ""
+                ? bridge.bridgeAddSource(name, connectorId, JSON.stringify(values))
+                : bridge.bridgeUpdateSource(sourceId, name, JSON.stringify(values)));
+        } catch (e) {
+            return I18n.t("The computer could not be saved");
+        }
+        if (!answer || answer.error || !answer.id) return I18n.tError(String((answer && answer.error) || "The computer could not be saved"));
+        refreshOwnComputers();
+        if (sourceId === "") {
+            var list = home.peers.slice();
+            list.push({ address: "source:" + answer.id, name: name, type: connectorId, sourceId: answer.id, favorite: false, lastUsed: Date.now() });
+            home.peers = list;
+            savePeers();
+            home.peerTab = "recent";
+        } else {
+            updatePeer("source:" + sourceId, { name: name });
+        }
+        return "";
+    }
+
+    function editSource(peer) {
+        refreshOwnComputers();
+        var s = ownSource(peer.sourceId || "");
+        addDialog.openEdit({
+            id: peer.sourceId, name: peer.name || (s ? s.name : ""),
+            connector: peer.type || (s ? s.connector : ""), connector_name: typeName(peer)
+        }, s ? s.values : ({}));
+    }
+
+    // Removes the card and what the helper keeps for it (its address and password).
+    function removeSourcePeer(peer) {
+        var error = bridge.bridgeRemoveSource(peer.sourceId || "");
+        if (error !== "") { setStatus(I18n.tError(error), true); return; }
+        removePeer(peer.address);
+        refreshOwnComputers();
+    }
+
+    // One click connects: the app's helper has the password.
+    function connectSource(peer) {
+        updatePeer(peer.address, { lastUsed: Date.now() });
+        var name = peer.name || I18n.t(typeName(peer));
+        setStatus(I18n.t("Connecting to %1…").arg(name), false);
+        var s = streamSettingsFor(peer);
+        home.sessionPeer = peer.address;
+        home.sessionSource = peer.sourceId || "";
+        home.startSessionRequested(
+            "bridge:", "", "direct", name, 0,
+            s.res, s.fps, s.codec, s.bitrate, s.queueLimit,
+            s.renderBackend === "software", s.renderBackend,
+            s.inputProtocol, s.encoder, s.displayId, peer.sourceId || "");
+    }
+
+    // From main.qml: the displays of the source being shown, for the
+    // display choice in that computer's stream settings.
+    function sourceDisplaysSeen(displaysJson, current) {
+        var list = [];
+        try { list = JSON.parse(displaysJson) || []; } catch (e) { return; }
+        if (home.sessionPeer === "") { serverDashboard.sourceDisplaysSeen(list); return; }
+        if (home.sessionSource === "") return;
+        updatePeer(home.sessionPeer, { sourceDisplays: { source: home.sessionSource, list: list } });
+    }
+
+    // The displays remembered for a card, as the stream settings take them:
+    // { "<source id>": [{ id, name, width, height }] }.
+    function seenDisplays(peer) {
+        var out = {};
+        if (peer && peer.sourceDisplays && peer.sourceDisplays.source)
+            out[peer.sourceDisplays.source] = peer.sourceDisplays.list || [];
+        return out;
     }
 
     function setPref(key, value) {
@@ -355,6 +526,8 @@ Rectangle {
 
     // Connect to a computer by address; asks for the password unless saved.
     function requestConnect(text) {
+        var known = findPeer(String(text || ""));
+        if (isSource(known)) { connectSource(known); return; }
         var addr = normalizeAddress(text);
         if (addr === "") {
             setStatus(I18n.t("Enter the address of the computer to control"), true);
@@ -376,6 +549,8 @@ Rectangle {
         setStatus(I18n.t("Connecting to %1…").arg(name), false);
         bridge.saveDirectTarget(addr, remember ? password : "");
         var s = streamSettingsFor(peer);
+        home.sessionPeer = addr;
+        home.sessionSource = s.sourceId || "";
         home.startSessionRequested(
             "ws://" + addr, password, "direct", name, 0,
             s.res, s.fps, s.codec, s.bitrate, s.queueLimit,
@@ -404,6 +579,8 @@ Rectangle {
     }
 
     function openPeerFiles(address) {
+        // A computer of another type has no Lunaris file transfer.
+        if (isSource(findPeer(address))) return;
         withPassword(address, function (password) {
             var peer = findPeer(address);
             fileManager.openFor("ws://" + address, password, "direct",
@@ -412,12 +589,30 @@ Rectangle {
     }
 
     function openPeerSettings(address) {
+        var known = findPeer(address);
+        if (isSource(known)) {
+            // No password to ask for and nothing to ask the computer: its
+            // displays are the ones its last session listed.
+            var own = streamSettingsFor(known);
+            peerSettings.address = address;
+            peerSettings.password = "";
+            peerSettings.hostName = known.name || I18n.t(typeName(known));
+            peerSettings.sourceOnly = true;
+            peerSettings.sourceDisplays = seenDisplays(known);
+            peerSettings.setCurrentSettings(own.res, own.fps, own.codec, own.bitrate, own.queueLimit,
+                own.renderBackend === "software", own.inputProtocol, own.encoder, own.displayId,
+                own.renderBackend, known.sourceId || "");
+            peerSettings.open();
+            return;
+        }
         withPassword(address, function (password) {
             var peer = findPeer(address);
             var s = streamSettingsFor(peer);
             peerSettings.address = address;
             peerSettings.password = password;
             peerSettings.hostName = (peer && peer.name) ? peer.name : displayAddress(address);
+            peerSettings.sourceOnly = false;
+            peerSettings.sourceDisplays = seenDisplays(peer);
             peerSettings.setCurrentSettings(s.res, s.fps, s.codec, s.bitrate, s.queueLimit,
                 s.renderBackend === "software", s.inputProtocol, s.encoder, s.displayId,
                 s.renderBackend, s.sourceId);
@@ -445,7 +640,9 @@ Rectangle {
         repeat: true
         triggeredOnStart: true
         onTriggered: {
-            for (var i = 0; i < home.peers.length; i++) bridge.probePeer(home.peers[i].address);
+            // Only Lunaris computers have a port of their own to check.
+            for (var i = 0; i < home.peers.length; i++)
+                if (!home.isSource(home.peers[i])) bridge.probePeer(home.peers[i].address);
             onlineRefresh.restart();
         }
     }
@@ -1051,7 +1248,35 @@ Rectangle {
                         PeerTab { text: I18n.t("Server"); iconName: "server"; current: home.peerTab === "server"; onClicked: home.peerTab = "server" }
                     }
 
+                    // Add a computer of any type without connecting to it.
+                    PrimaryButton {
+                        id: addComputerButton
+                        objectName: "addComputerButton"
+                        visible: home.peerTab !== "server"
+                        anchors.right: searchBox.left
+                        anchors.rightMargin: 10
+                        anchors.verticalCenter: searchBox.verticalCenter
+                        implicitHeight: 30
+                        leftPadding: 12
+                        rightPadding: 14
+                        text: I18n.t("Add computer")
+                        Accessible.name: I18n.t("Add computer")
+                        contentItem: Row {
+                            spacing: 6
+                            Icon { name: "plus"; size: 14; color: Theme.textOnAccent; anchors.verticalCenter: parent.verticalCenter }
+                            Text {
+                                text: addComputerButton.text
+                                color: Theme.textOnAccent
+                                font.pixelSize: 13
+                                font.weight: Font.DemiBold
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                        }
+                        onClicked: { home.refreshOwnComputers(); addDialog.openAdd(); }
+                    }
+
                     Rectangle {
+                        id: searchBox
                         visible: home.peerTab !== "server"
                         anchors.right: parent.right
                         anchors.verticalCenter: parent.verticalCenter
@@ -1089,6 +1314,7 @@ Rectangle {
 
                     GridView {
                         id: peerGrid
+                        objectName: "peerGrid"
                         anchors.fill: parent
                         anchors.leftMargin: 24
                         anchors.topMargin: 16
@@ -1131,7 +1357,7 @@ Rectangle {
                             anchors.horizontalCenter: parent.horizontalCenter
                             visible: home.searchText === ""
                             text: home.peerTab === "favorites" ? I18n.t("Add a computer to favorites from its ⋮ menu.")
-                                                              : I18n.t("Computers you connect to will show up here.")
+                                                              : I18n.t("Computers you add or connect to will show up here.")
                             color: Theme.textSubtle
                             font.pixelSize: 12
                         }
@@ -1170,6 +1396,9 @@ Rectangle {
                     anchors.fill: undefined
                     visible: home.peerTab === "server"
                     onStartSessionRequested: (server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId, sourceId) => {
+                        // Not to a saved computer: what the session lists belongs to the Server tab.
+                        home.sessionPeer = "";
+                        home.sessionSource = "";
                         home.setStatus(I18n.t("Connecting to %1…").arg(hostName), false);
                         home.startSessionRequested(server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId, sourceId);
                     }
@@ -1192,7 +1421,11 @@ Rectangle {
     // ---------------------------------------------------------------
     component PeerCard: Rectangle {
         id: card
+        objectName: "peerCard"
         property var peer: ({})
+        // A computer of another type: a badge says which, there is no
+        // address of its own to check or to show, and no Lunaris files.
+        readonly property bool isSource: home.isSource(peer)
         readonly property string title: peer.name ? peer.name : home.displayAddress(peer.address || "")
         readonly property var cardColors: ["#3b4a6b", "#4a3b6b", "#2f5560", "#5a4632", "#3e5a3a", "#5c3a4a"]
         radius: Theme.radius
@@ -1208,6 +1441,7 @@ Rectangle {
 
         MouseArea {
             id: cardMa
+            objectName: "peerCardArea"
             anchors.fill: parent
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
@@ -1241,6 +1475,7 @@ Rectangle {
                 }
             }
             Icon {
+                id: favoriteStar
                 visible: !!card.peer.favorite
                 anchors.right: parent.right
                 anchors.top: parent.top
@@ -1248,6 +1483,15 @@ Rectangle {
                 name: "star"
                 size: 15
                 color: "#fcd34d"
+            }
+            TypeBadge {
+                visible: card.isSource
+                anchors.left: parent.left
+                anchors.top: parent.top
+                anchors.margins: 9
+                onColor: true
+                typeName: card.isSource ? home.typeName(card.peer) : ""
+                maxWidth: card.width - 18 - (favoriteStar.visible ? 26 : 0)
             }
         }
 
@@ -1260,7 +1504,7 @@ Rectangle {
             anchors.rightMargin: 6
             spacing: 6
             Rectangle {
-                readonly property int online: home.peerOnline(card.peer.address || "")
+                readonly property int online: card.isSource ? -1 : home.peerOnline(card.peer.address || "")
                 visible: online >= 0
                 width: 8; height: 8; radius: 4
                 color: online === 1 ? "#22c55e" : Theme.textMuted
@@ -1270,13 +1514,14 @@ Rectangle {
             }
             Text {
                 Layout.fillWidth: true
-                text: home.displayAddress(card.peer.address || "")
+                text: card.isSource ? home.sourceSummary(card.peer) : home.displayAddress(card.peer.address || "")
                 color: Theme.textStrong
                 font.pixelSize: 13
                 font.weight: Font.DemiBold
                 elide: Text.ElideRight
             }
             IconButton {
+                visible: !card.isSource
                 iconName: "folder"
                 tip: I18n.t("Files")
                 onClicked: home.openPeerFiles(card.peer.address)
@@ -1288,6 +1533,7 @@ Rectangle {
             }
             IconButton {
                 id: moreBtn
+                objectName: "peerMoreButton"
                 iconName: "more"
                 tip: I18n.t("More")
                 onClicked: peerMenu.popup(moreBtn, 0, moreBtn.height)
@@ -1296,21 +1542,44 @@ Rectangle {
 
         ThemedMenu {
             id: peerMenu
+            objectName: "peerMenu"
             MenuItem { text: I18n.t("Connect"); onTriggered: home.requestConnect(card.peer.address) }
             MenuItem {
                 text: card.peer.favorite ? I18n.t("Remove from favorites") : I18n.t("Add to favorites")
                 onTriggered: home.updatePeer(card.peer.address, { favorite: !card.peer.favorite })
             }
-            MenuItem { text: I18n.t("Files"); onTriggered: home.openPeerFiles(card.peer.address) }
-            MenuItem { text: I18n.t("Stream settings"); onTriggered: home.openPeerSettings(card.peer.address) }
-            MenuItem { text: I18n.t("Rename…"); onTriggered: renameDialog.openFor(card.peer) }
+            // What a card of another type has not is left out, not greyed.
             MenuItem {
+                visible: !card.isSource
+                height: visible ? implicitHeight : 0
+                text: I18n.t("Files")
+                onTriggered: home.openPeerFiles(card.peer.address)
+            }
+            MenuItem { text: I18n.t("Stream settings"); onTriggered: home.openPeerSettings(card.peer.address) }
+            MenuItem {
+                visible: !card.isSource
+                height: visible ? implicitHeight : 0
+                text: I18n.t("Rename…")
+                onTriggered: renameDialog.openFor(card.peer)
+            }
+            MenuItem {
+                visible: card.isSource
+                height: visible ? implicitHeight : 0
+                text: I18n.t("Edit…")
+                onTriggered: home.editSource(card.peer)
+            }
+            MenuItem {
+                visible: !card.isSource
+                height: visible ? implicitHeight : 0
                 text: I18n.t("Forget password")
                 enabled: !!card.peer.password
                 onTriggered: home.updatePeer(card.peer.address, { password: "" })
             }
             MenuSeparator {}
-            MenuItem { text: I18n.t("Remove"); onTriggered: home.removePeer(card.peer.address) }
+            MenuItem {
+                text: I18n.t("Remove")
+                onTriggered: card.isSource ? home.removeSourcePeer(card.peer) : home.removePeer(card.peer.address)
+            }
         }
     }
 
@@ -1415,6 +1684,24 @@ Rectangle {
         }
     }
 
+    // "Add computer" (button above the list) and "Edit…" of a computer of
+    // another type.
+    AddComputerDialog {
+        id: addDialog
+        objectName: "addComputerDialog"
+        connectors: home.connectors
+        onLunarisSubmitted: (address, password, name) => {
+            var error = home.addLunarisPeer(address, password, name);
+            if (error !== "") { addDialog.error = error; return; }
+            addDialog.close();
+        }
+        onSourceSubmitted: (connectorId, hostId, sourceId, name, values) => {
+            var error = home.saveSource(connectorId, sourceId, name, values);
+            if (error !== "") { addDialog.error = error; return; }
+            addDialog.close();
+        }
+    }
+
     DialogFrame {
         id: customPasswordDialog
         property string error: ""
@@ -1451,6 +1738,7 @@ Rectangle {
     // Stream settings of a saved computer (gear on its card), kept with it.
     Settings {
         id: peerSettings
+        objectName: "peerSettings"
         property string address: ""
         property string password: ""
         anchors.fill: parent

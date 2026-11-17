@@ -14,6 +14,7 @@ pub mod files;
 pub mod gamepad;
 pub mod host;
 pub mod local_server;
+pub mod own_computers;
 pub mod input;
 pub mod protocol;
 pub mod secure_fs;
@@ -506,5 +507,6 @@ pub fn run() {
     // Clean up local agent if running
     bridge::stop_local_agent();
     host::shutdown();
+    own_computers::shutdown();
     local_server::shutdown();
 }

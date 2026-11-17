@@ -414,6 +414,11 @@ pub static STREAM_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::ne
 /// on it (starts the session again, or tells QML).
 pub static PENDING_SOURCE_STATUS: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
+/// The displays of the source being shown and the current one's id, as the
+/// host listed them on the general data channel; `poll_cursor` passes them
+/// to QML (`source_displays_updated`).
+pub static PENDING_SOURCE_DISPLAYS: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
 /// Restarts a source asked for in a row, and when the last one was.
 static SOURCE_RESTARTS: std::sync::Mutex<(u32, Option<std::time::Instant>)> = std::sync::Mutex::new((0, None));
 
@@ -446,9 +451,25 @@ fn decode_codecs_for_request(decodable: Vec<String>, chosen: &str) -> Vec<String
     codecs
 }
 
+/// Why a session to one of the app's own computers of other types could
+/// not start: already a sentence for the user.
+#[derive(Debug)]
+struct BridgeSessionError(String);
+
+impl std::fmt::Display for BridgeSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BridgeSessionError {}
+
 /// A message for the user from a stream task error.
 fn describe_stream_error(e: &anyhow::Error) -> String {
     use tokio_tungstenite::tungstenite::Error as WsError;
+    if let Some(bridge) = e.downcast_ref::<BridgeSessionError>() {
+        return bridge.0.clone();
+    }
     // Direct connections: already full sentences (e.g. an agent too old for TLS).
     if let Some(direct) = e.downcast_ref::<agent::direct::ConnectError>() {
         return direct.to_string();
@@ -945,6 +966,12 @@ pub mod qobject {
         #[qsignal]
         fn source_status(self: Pin<&mut StreamBridge>, status: QString, reason: QString);
 
+        /// The displays of the source being shown (a computer shown through
+        /// a connector): `[{id, name, width, height}]` and the id of the one
+        /// shown now. The id is what a session asks for as its display.
+        #[qsignal]
+        fn source_displays_updated(self: Pin<&mut StreamBridge>, displays_json: QString, current: QString);
+
         /// Clipboard/file sharing news for the user (progress, saved, error).
         #[qsignal]
         fn share_status(self: Pin<&mut StreamBridge>, message: QString);
@@ -1191,21 +1218,30 @@ pub mod qobject {
         #[qinvokable]
         fn host_set_rustdesk(self: Pin<&mut StreamBridge>, enabled: bool, port: i32) -> QString;
 
-        /// The sources of this computer (other computers it shows) and the
-        /// connectors to add one with, as JSON: `{"connectors": [{id, name,
-        /// fields: [{key, label, kind, default, required}]}], "sources":
-        /// [{id, name, connector, connector_name}]}`. No field values.
+        /// The types a computer can be added with besides Lunaris, as JSON:
+        /// `[{id, name, fields: [{key, label, kind, default, required}]}]`.
         #[qinvokable]
-        fn host_sources(self: Pin<&mut StreamBridge>) -> QString;
+        fn bridge_connectors(self: Pin<&mut StreamBridge>) -> QString;
 
-        /// Adds a source; `values_json` is `{"<field key>": "<value>"}`.
-        /// Returns an error message or "".
+        /// The computers of other types the app added for itself, as JSON:
+        /// `[{id, name, connector, connector_name, values}]`; `values` has
+        /// the fields that are not secrets.
         #[qinvokable]
-        fn host_add_source(self: Pin<&mut StreamBridge>, name: QString, connector: QString, values_json: QString) -> QString;
+        fn bridge_sources(self: Pin<&mut StreamBridge>) -> QString;
 
-        /// Removes the source `id`; returns an error message or "".
+        /// Adds one; `values_json` is `{"<field key>": "<value>"}`. Returns
+        /// `{"id": ...}` or `{"error": ...}`.
         #[qinvokable]
-        fn host_remove_source(self: Pin<&mut StreamBridge>, id: QString) -> QString;
+        fn bridge_add_source(self: Pin<&mut StreamBridge>, name: QString, connector: QString, values_json: QString) -> QString;
+
+        /// Changes one: its name and its fields (an empty or missing field
+        /// keeps its value). Returns `{"id": ...}` or `{"error": ...}`.
+        #[qinvokable]
+        fn bridge_update_source(self: Pin<&mut StreamBridge>, id: QString, name: QString, values_json: QString) -> QString;
+
+        /// Removes one; returns an error message or "".
+        #[qinvokable]
+        fn bridge_remove_source(self: Pin<&mut StreamBridge>, id: QString) -> QString;
 
         /// The app's own Lunaris server, as JSON: enabled, running, ours,
         /// port, local_url, lan_url, admin_password, data_dir, error.
@@ -1760,6 +1796,14 @@ impl qobject::StreamBridge {
                 cxx_qt_lib::QString::from(&caps.gpu_info),
                 cxx_qt_lib::QString::from(&caps.host_os),
                 cxx_qt_lib::QString::from(&caps.sources_json),
+            );
+        }
+
+        let source_displays = { PENDING_SOURCE_DISPLAYS.lock().unwrap().take() };
+        if let Some((displays_json, current)) = source_displays {
+            self.as_mut().source_displays_updated(
+                cxx_qt_lib::QString::from(&displays_json),
+                cxx_qt_lib::QString::from(&current),
             );
         }
     }
@@ -2359,6 +2403,12 @@ impl qobject::StreamBridge {
         let server_str = server.to_string();
         let token_str = token.to_string();
         let host_id_str = host_id.to_string();
+        // A computer the app added for itself has nothing to ask: its
+        // displays come with a session, and its helper is not started just
+        // to open the settings.
+        if crate::own_computers::is_bridge(&server_str) {
+            return;
+        }
 
         let mut rust_obj = self.rust_mut();
         let rt = rust_obj.get_or_init_runtime();
@@ -2589,6 +2639,7 @@ impl qobject::StreamBridge {
         // for begins anew, and what an earlier session's source said is forgotten.
         *SOURCE_RESTARTS.lock().unwrap() = (0, None);
         *PENDING_SOURCE_STATUS.lock().unwrap() = None;
+        *PENDING_SOURCE_DISPLAYS.lock().unwrap() = None;
 
         println!("Configuring session from dashboard. Launching stream...");
         self.as_mut().start_stream();
@@ -2892,17 +2943,24 @@ impl qobject::StreamBridge {
         QString::from(&result.err().unwrap_or_default())
     }
 
-    pub fn host_sources(self: Pin<&mut Self>) -> QString {
-        QString::from(&crate::host::sources_json())
+    pub fn bridge_connectors(self: Pin<&mut Self>) -> QString {
+        QString::from(&crate::own_computers::connectors_json())
     }
 
-    pub fn host_add_source(self: Pin<&mut Self>, name: QString, connector: QString, values_json: QString) -> QString {
-        let result = crate::host::add_source(&name.to_string(), &connector.to_string(), &values_json.to_string());
-        QString::from(&result.err().unwrap_or_default())
+    pub fn bridge_sources(self: Pin<&mut Self>) -> QString {
+        QString::from(&crate::own_computers::sources_json())
     }
 
-    pub fn host_remove_source(self: Pin<&mut Self>, id: QString) -> QString {
-        QString::from(&crate::host::remove_source(&id.to_string()).err().unwrap_or_default())
+    pub fn bridge_add_source(self: Pin<&mut Self>, name: QString, connector: QString, values_json: QString) -> QString {
+        QString::from(&crate::own_computers::add_source(&name.to_string(), &connector.to_string(), &values_json.to_string()))
+    }
+
+    pub fn bridge_update_source(self: Pin<&mut Self>, id: QString, name: QString, values_json: QString) -> QString {
+        QString::from(&crate::own_computers::update_source(&id.to_string(), &name.to_string(), &values_json.to_string()))
+    }
+
+    pub fn bridge_remove_source(self: Pin<&mut Self>, id: QString) -> QString {
+        QString::from(&crate::own_computers::remove_source(&id.to_string()))
     }
 
     pub fn host_set_port(self: Pin<&mut Self>, port: i32) -> QString {
@@ -2963,7 +3021,8 @@ impl qobject::StreamBridge {
     pub fn files_open_current(self: Pin<&mut Self>) -> bool {
         let args = ACTIVE_CONFIG.lock().unwrap().clone().or_else(|| APP_ARGS.get().cloned());
         match args {
-            Some(a) if !a.server_url.is_empty() => {
+            // The helper for the app's own computers of other types has no files.
+            Some(a) if !a.server_url.is_empty() && !crate::own_computers::is_bridge(&a.server_url) => {
                 crate::files::open(a.server_url, a.token, a.host_id, a.host_name);
                 true
             }
@@ -3615,7 +3674,12 @@ impl PeerConnectionEventHandler for ClientEventHandler {
                     while let Some(event) = d.poll().await {
                         match event {
                             DataChannelEvent::OnMessage(msg) => {
-                                handle_host_cursor_message(&msg.data);
+                                // A source lists its displays here too.
+                                if let Some(displays) = crate::own_computers::source_displays(&msg.data) {
+                                    *PENDING_SOURCE_DISPLAYS.lock().unwrap() = Some(displays);
+                                } else {
+                                    handle_host_cursor_message(&msg.data);
+                                }
                             }
                             DataChannelEvent::OnClose => {
                                 *PENDING_HOST_CURSOR.lock().unwrap() = Some(PendingHostCursor {
@@ -5019,6 +5083,22 @@ async fn run_webrtc_client_task(
     input_senders: Arc<Mutex<Option<super::input::InputSenders>>>,
     active_decoder: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 ) -> Result<(), anyhow::Error> {
+    // A computer the app added for itself ("bridge:"): the session goes to
+    // the app's helper on this computer, which is started now if it is not
+    // running. Its address and password are worked out here and never
+    // leave this task.
+    let (server_url, token) = if crate::own_computers::is_bridge(&server_url) {
+        let host = host_id.clone();
+        let source = source_id.clone();
+        let (address, password) =
+            tokio::task::spawn_blocking(move || crate::own_computers::session_endpoint(&host, source.as_deref()))
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?
+                .map_err(BridgeSessionError)?;
+        (format!("ws://{}", address), password)
+    } else {
+        (server_url, token)
+    };
     let ws_stream = if let Some(address) = direct_address(&server_url, &host_id) {
         // Straight to the agent: TLS and a password proof, no password in the URL.
         println!("Connecting directly to {}", address);

@@ -427,6 +427,18 @@ pub async fn run_listener(
     serve_listener(listener, config, hub, inbound_tx, asker).await
 }
 
+/// As `run_listener`, on a listener the caller bound (the bridge-only
+/// agent's, on 127.0.0.1).
+pub(crate) async fn run_listener_on(
+    listener: TcpListener,
+    config: DirectConfig,
+    hub: Arc<Hub>,
+    inbound_tx: mpsc::UnboundedSender<SignalingMessage>,
+) -> anyhow::Result<()> {
+    let asker: Asker = Arc::new(|requester, kind| Box::pin(async move { approval::ask(&requester, kind).await }));
+    serve_listener(listener, config, hub, inbound_tx, asker).await
+}
+
 /// Asks the person here (approval::ask; replaced in tests).
 type Asker = Arc<dyn Fn(String, Kind) -> std::pin::Pin<Box<dyn std::future::Future<Output = Decision> + Send>> + Send + Sync>;
 
@@ -814,6 +826,8 @@ async fn serve_link(ws: Ws, config: Arc<DirectConfig>, conn: Conn) {
         name: config.name.clone(),
         codec_support,
     });
+    // The other computers this one shows, and the kinds it can show.
+    let _ = tx.send(crate::connector::sources::announcement(conn.trusted));
     let conn = Arc::new(conn);
     // Client connections (on that server) the person here accepted, per kind.
     let accepted: Arc<Mutex<HashMap<String, Kinds>>> = Arc::default();
@@ -833,6 +847,25 @@ async fn serve_link(ws: Ws, config: Arc<DirectConfig>, conn: Conn) {
         let sig = match serde_json::from_str::<ServerToAgentMessage>(&text) {
             Ok(ServerToAgentMessage::Signaling(sig)) => sig,
             Ok(ServerToAgentMessage::Registered { .. }) => continue,
+            Ok(ServerToAgentMessage::ChangeSource { request_id, change, requester }) => {
+                // Only a server that proved the password may change the
+                // sources; one whose connections are accepted here one by
+                // one may not.
+                let result = if conn.trusted {
+                    info!("Sources: {:?} asked for by {} through server link {}", change, requester.as_deref().unwrap_or("someone"), link_id);
+                    crate::connector::sources::apply(&change)
+                } else {
+                    Err(crate::connector::sources::NOT_MANAGEABLE.to_string())
+                };
+                let (id, error) = match result {
+                    Ok(id) => (Some(id), None),
+                    Err(error) => (None, Some(error)),
+                };
+                // The new list first: the server has it when the answer is out.
+                let _ = tx.send(crate::connector::sources::announcement(conn.trusted));
+                let _ = tx.send(AgentMessage::SourceChanged { request_id, id, error });
+                continue;
+            }
             Err(e) => {
                 warn!("Ignoring malformed message from server link {}: {}", link_id, e);
                 continue;

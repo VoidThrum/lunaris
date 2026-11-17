@@ -77,6 +77,8 @@ pub struct SignalingState {
     pub local_sessions: RwLock<HashMap<String, Arc<crate::bridge::BridgeSession>>>,
     /// Computers added by address (the server connects to them).
     pub links: crate::links::Links,
+    /// Computers of other types that agents show (sources.rs).
+    pub sources: crate::sources::Registry,
     /// Failed sign-ins per client address and per (username, address).
     pub login_ip_limit: FailureLimiter,
     pub login_user_limit: FailureLimiter,
@@ -100,6 +102,7 @@ impl SignalingState {
             file_sessions: RwLock::new(HashMap::new()),
             local_sessions: RwLock::new(HashMap::new()),
             links: crate::links::Links::default(),
+            sources: crate::sources::Registry::default(),
             login_ip_limit: FailureLimiter::standard(),
             login_user_limit: FailureLimiter::standard(),
             // Higher: a stale agent retrying every few seconds must not lock
@@ -427,6 +430,12 @@ pub(crate) async fn agent_message(state: &Arc<SignalingState>, agent_id: &str, m
         AgentMessage::Signaling(sig) => {
             handle_agent_signaling(sig, agent_id, state.clone()).await;
         }
+        AgentMessage::Sources { sources, connectors, manageable } => {
+            crate::sources::announced(state, agent_id, sources, connectors, manageable).await;
+        }
+        AgentMessage::SourceChanged { request_id, id, error } => {
+            crate::sources::changed(state, agent_id, &request_id, id, error);
+        }
     }
 }
 
@@ -441,6 +450,7 @@ pub(crate) async fn agent_disconnected(state: &Arc<SignalingState>, agent_id: &s
             conn_map.remove(agent_id);
             state.agents.write().unwrap().remove(agent_id);
             state.agent_local_ips.write().unwrap().remove(agent_id);
+            crate::sources::agent_gone(state, agent_id);
             should_cleanup = true;
         }
     }

@@ -127,6 +127,21 @@ pub async fn init_db(
     .execute(&pool)
     .await?;
 
+    // Computers of other types that a Lunaris computer shows (sources.rs):
+    // what its agent announced. Nothing of how they are reached is here.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS host_sources (
+            host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+            source_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            connector TEXT NOT NULL,
+            connector_name TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (host_id, source_id)
+        );",
+    )
+    .execute(&pool)
+    .await?;
+
     // Perform migrations for hosts table if columns don't exist
     let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('hosts')")
         .fetch_all(&pool)

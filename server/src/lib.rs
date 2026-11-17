@@ -21,6 +21,7 @@ mod paths;
 mod queue;
 mod security;
 mod service;
+mod sources;
 mod tls;
 mod turn;
 mod web;
@@ -272,6 +273,14 @@ pub(crate) async fn run_server(
         .route("/api/hosts/{id}", delete(delete_host_handler))
         .route("/api/admin/hosts/{id}/reset-key", post(admin::reset_host_key))
         .route("/api/hosts/address", post(add_host_by_address_handler))
+        // Computers of other types, shown through a Lunaris computer (sources.rs).
+        .route("/api/sources", get(sources::list_sources))
+        .route("/api/connectors", get(sources::list_connectors))
+        .route("/api/hosts/{id}/sources", post(sources::add_source))
+        .route(
+            "/api/hosts/{id}/sources/{source_id}",
+            axum::routing::put(sources::update_source).delete(sources::remove_source),
+        )
         .route("/api/agent/token", get(agent_token_handler))
         .route("/api/server/ports", get(ports_handler))
         .route(

@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "agent"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "agent-app"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "agent",
  "cxx",
@@ -783,7 +783,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "client-desktop"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "agent",
  "client-qml",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "client-qml"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "agent",
  "anyhow",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -4996,7 +4996,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -64,12 +64,133 @@ Rectangle {
     // Connect straight to a computer's desktop (app 0, the only one an
     // agent offers) with the current stream settings.
     function connectHost(host) {
+        dashboardRoot.sessionHost = host.id;
+        dashboardRoot.sessionSource = dashboardRoot.sourceFor(host);
         dashboardRoot.startSessionRequested(
             dashboardRoot.serverUrl, dashboardRoot.token, host.id, host.name, 0,
             dashboardRoot.configRes, dashboardRoot.configFps, dashboardRoot.configCodec,
             dashboardRoot.configBitrate, dashboardRoot.configQueueLimit, dashboardRoot.configDisableCuda,
             dashboardRoot.configRenderBackend, dashboardRoot.configInputProtocol,
-            dashboardRoot.configEncoder, dashboardRoot.configDisplay, dashboardRoot.sourceFor(host));
+            dashboardRoot.configEncoder, dashboardRoot.displayFor(host.id), dashboardRoot.sourceFor(host));
+    }
+
+    // ---- Computers of other types, reached through a Lunaris computer ----
+    // (its sources: GET /api/sources). Each is a card of its own.
+    // [{ host_id, host_name, id, name, connector, connector_name, online }]
+    property var sourcesList: []
+    // What can be added through which computer (GET /api/connectors):
+    // [{ host_id, host_name, connectors: [{ id, name, fields }] }]
+    property var connectorHosts: []
+    // The types to offer in "Add computer": every connector some computer offers.
+    readonly property var connectorTypes: {
+        var types = [];
+        var seen = {};
+        for (var i = 0; i < connectorHosts.length; i++) {
+            var offered = connectorHosts[i].connectors || [];
+            for (var k = 0; k < offered.length; k++) {
+                if (seen[offered[k].id]) continue;
+                seen[offered[k].id] = true;
+                types.push(offered[k]);
+            }
+        }
+        return types;
+    }
+    // The grid: the Lunaris computers, then the computers shown through them.
+    readonly property var cards: hostsList.concat(sourcesList.map(function (s) { return Object.assign({ isSource: true }, s); }))
+    // The displays the sources listed in their sessions, by the computer
+    // they are reached through: { "<host id>": { "<source id>": [...] } }.
+    property var seenSourceDisplays: ({})
+    // The computer and the source of the session started last from here.
+    property string sessionHost: ""
+    property string sessionSource: ""
+
+    ApiClient { id: sourcesApi }
+    function refreshSources() {
+        // A server from before this answers 404: then there are no such
+        // cards and only the Lunaris type to add, and nothing to report.
+        sourcesApi.call("GET", "/api/sources", null, function (ok, data) {
+            dashboardRoot.sourcesList = ok && data instanceof Array ? data : [];
+        });
+        sourcesApi.call("GET", "/api/connectors", null, function (ok, data) {
+            dashboardRoot.connectorHosts = ok && data instanceof Array ? data : [];
+        });
+    }
+
+    // The message for a failed call: the server's own text when it sent one
+    // ({"error": ...}, or the plain text of a 403), else ApiClient's.
+    function apiError(err, status, text, data) {
+        if (data && data.error) return I18n.tError(String(data.error));
+        var plain = String(text || "").trim();
+        if (status === 403 && plain !== "" && plain.length < 200 && plain.charAt(0) !== "{" && plain.charAt(0) !== "<")
+            return I18n.t(plain);
+        return err;
+    }
+
+    function configKey(card) { return card.isSource ? card.host_id + "/source/" + card.id : card.id; }
+
+    // The display chosen in the stream settings is one of the computer they
+    // were opened for (see sourceFor).
+    function displayFor(key) {
+        if (dashboardRoot.activeConfigHost && dashboardRoot.activeConfigHost.id === key) return dashboardRoot.configDisplay;
+        // As before for the Lunaris computers among themselves; a source's
+        // display is never another computer's.
+        return dashboardRoot.activeConfigHost && dashboardRoot.activeConfigHost.isSource ? "default" : dashboardRoot.configDisplay;
+    }
+
+    // A session to a computer of another type: a normal session to the
+    // Lunaris computer it is reached through, naming it as the source.
+    function connectSource(source) {
+        dashboardRoot.sessionHost = source.host_id;
+        dashboardRoot.sessionSource = source.id;
+        var key = configKey(source);
+        dashboardRoot.startSessionRequested(
+            dashboardRoot.serverUrl, dashboardRoot.token, source.host_id, source.name, 0,
+            dashboardRoot.configRes, dashboardRoot.configFps, dashboardRoot.configCodec,
+            dashboardRoot.configBitrate, dashboardRoot.configQueueLimit, dashboardRoot.configDisableCuda,
+            dashboardRoot.configRenderBackend, dashboardRoot.configInputProtocol,
+            dashboardRoot.configEncoder,
+            dashboardRoot.activeConfigHost && dashboardRoot.activeConfigHost.id === key ? dashboardRoot.configDisplay : "default",
+            source.id);
+    }
+
+    // From Home: the displays of the source the session from here shows.
+    function sourceDisplaysSeen(list) {
+        if (dashboardRoot.sessionHost === "" || dashboardRoot.sessionSource === "") return;
+        var all = Object.assign({}, dashboardRoot.seenSourceDisplays);
+        var ofHost = Object.assign({}, all[dashboardRoot.sessionHost] || {});
+        ofHost[dashboardRoot.sessionSource] = list;
+        all[dashboardRoot.sessionHost] = ofHost;
+        dashboardRoot.seenSourceDisplays = all;
+    }
+
+    // Stream settings of a card (a Lunaris computer or a source).
+    function openStreamSettings(card) {
+        var key = configKey(card);
+        // Only reset to defaults when switching to a different computer
+        if (dashboardRoot.activeConfigHost === null || dashboardRoot.activeConfigHost.id !== key) {
+            dashboardRoot.configRes = "1920x1080";
+            dashboardRoot.configFps = StreamOptions.displayFps(bridge.screenRefreshRate());
+            dashboardRoot.configCodec = "auto";
+            dashboardRoot.configBitrate = 15000;
+            dashboardRoot.configQueueLimit = 256;
+            dashboardRoot.configDisableCuda = false;
+            dashboardRoot.configRenderBackend = "auto_gpu";
+            dashboardRoot.configInputProtocol = "webrtc";
+            dashboardRoot.configEncoder = "auto";
+            dashboardRoot.configDisplay = "default";
+            dashboardRoot.configSource = "";
+        }
+        dashboardRoot.activeConfigHost = card.isSource ? { id: key, name: card.name, isSource: true } : card;
+        settingsModal.hostName = card.name;
+        // A source card is that computer and no other; its displays are its own.
+        settingsModal.sourceOnly = !!card.isSource;
+        settingsModal.sourceDisplays = dashboardRoot.seenSourceDisplays[card.isSource ? card.host_id : card.id] || ({});
+        settingsModal.setCurrentSettings(dashboardRoot.configRes, dashboardRoot.configFps, dashboardRoot.configCodec, dashboardRoot.configBitrate, dashboardRoot.configQueueLimit, dashboardRoot.configDisableCuda, dashboardRoot.configInputProtocol, dashboardRoot.configEncoder, dashboardRoot.configDisplay, dashboardRoot.configRenderBackend, card.isSource ? card.id : dashboardRoot.configSource);
+        // Fetch encoder/display capabilities from agent
+        if (!card.isSource && dashboardRoot.serverUrl && dashboardRoot.token && card.id) {
+            bridge.fetchCapabilities(dashboardRoot.serverUrl, dashboardRoot.token, card.id);
+        }
+        settingsModal.open();
     }
 
     // The source chosen in the stream settings belongs to the computer they
@@ -196,6 +317,7 @@ Rectangle {
             if (success) {
                 dashboardRoot.hostsList = JSON.parse(hostsJson);
                 dashboardRoot.hostsError = "";
+                dashboardRoot.refreshSources();
             } else {
                 dashboardRoot.hostsError = errorMsg;
                 if (errorMsg === "Unauthorized") {
@@ -818,14 +940,22 @@ Rectangle {
                     topMargin: 8
                     cellWidth: 330
                     cellHeight: 190
-                    model: dashboardRoot.hostsList.length > 0 ? dashboardRoot.hostsList : 0
+                    model: dashboardRoot.cards.length > 0 ? dashboardRoot.cards : 0
 
                     delegate: Item {
                         id: hostDelegate
                         width: 290
                         height: 180
 
-                        property bool isHostHovered: cardMouseArea.containsMouse || webBtn.hovered || gearBtn.hovered || deleteBtn.hovered || connectBtn.hovered
+                        property bool isHostHovered: cardMouseArea.containsMouse || webBtn.hovered || gearBtn.hovered || editBtn.hovered || deleteBtn.hovered || connectBtn.hovered
+                        // A computer of another type, shown through a Lunaris
+                        // computer: online when that computer is.
+                        readonly property bool isSource: !!modelData.isSource
+                        readonly property string status: isSource ? (modelData.online ? "Online" : "Offline") : modelData.status
+                        function connect() {
+                            if (isSource) dashboardRoot.connectSource(modelData);
+                            else dashboardRoot.connectHost(modelData);
+                        }
 
                         // Static background click handler to avoid hover-translation flicker
                         MouseArea {
@@ -833,7 +963,7 @@ Rectangle {
                             width: 270; height: 160
                             hoverEnabled: true
                             onClicked: {
-                                if (modelData.status === "Online") dashboardRoot.connectHost(modelData);
+                                if (hostDelegate.status === "Online") hostDelegate.connect();
                             }
                         }
 
@@ -868,14 +998,34 @@ Rectangle {
                                         font.bold: true
                                         color: Theme.textStrong
                                         elide: Text.ElideRight
-                                        width: parent.width
+                                        width: parent.width - (typeBadge.visible ? typeBadge.width + 8 : 0)
                                     }
                                     Text {
-                                        text: "ID: " + modelData.id.substring(0, 8) + "..."
+                                        visible: !hostDelegate.isSource
+                                        text: hostDelegate.isSource ? "" : "ID: " + String(modelData.id).substring(0, 8) + "..."
                                         font.pixelSize: 11
                                         font.family: "monospace"
                                         color: Theme.textSubtle
                                     }
+                                    // Which Lunaris computer shows it
+                                    Text {
+                                        visible: hostDelegate.isSource
+                                        width: parent.width
+                                        text: hostDelegate.isSource ? I18n.t("via %1").arg(modelData.host_name) : ""
+                                        font.pixelSize: 11
+                                        color: Theme.textSubtle
+                                        elide: Text.ElideRight
+                                    }
+                                }
+
+                                TypeBadge {
+                                    id: typeBadge
+                                    visible: hostDelegate.isSource && shortName !== ""
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    anchors.topMargin: 3
+                                    typeName: hostDelegate.isSource ? String(modelData.connector_name || modelData.connector || "") : ""
+                                    maxWidth: 120
                                 }
 
                                 // Divider top
@@ -895,6 +1045,7 @@ Rectangle {
                                     spacing: 6
 
                                     Row {
+                                        visible: !hostDelegate.isSource
                                         width: parent.width
                                         Text { text: I18n.t("IP Address"); font.pixelSize: 11; color: Theme.textSubtle; width: 80 }
                                         Text {
@@ -921,13 +1072,13 @@ Rectangle {
                                             Rectangle {
                                                 width: 8; height: 8; radius: 4
                                                 anchors.verticalCenter: parent.verticalCenter
-                                                color: modelData.status === "Online" ? "#22c55e" : (modelData.status === "Busy" ? "#f59e0b" : "#ef4444")
+                                                color: hostDelegate.status === "Online" ? "#22c55e" : (hostDelegate.status === "Busy" ? "#f59e0b" : "#ef4444")
                                             }
                                             Text {
-                                                text: I18n.t(modelData.status)
+                                                text: I18n.t(hostDelegate.status)
                                                 font.pixelSize: 11
                                                 font.bold: true
-                                                color: modelData.status === "Online" ? "#22c55e" : (modelData.status === "Busy" ? "#f59e0b" : "#ef4444")
+                                                color: hostDelegate.status === "Online" ? "#22c55e" : (hostDelegate.status === "Busy" ? "#f59e0b" : "#ef4444")
                                             }
                                         }
                                     }
@@ -936,11 +1087,11 @@ Rectangle {
                                 // Primary action (matches the web client's "Connect")
                                 Button {
                                     id: connectBtn
-                                    visible: modelData.status === "Online"
+                                    visible: hostDelegate.status === "Online"
                                     anchors.left: parent.left
                                     anchors.bottom: parent.bottom
                                     z: 10
-                                    onClicked: dashboardRoot.connectHost(modelData)
+                                    onClicked: hostDelegate.connect()
                                     background: Rectangle {
                                         implicitWidth: Math.max(84, connectLabel.implicitWidth + 32); implicitHeight: 32; radius: Theme.radiusSm
                                         color: connectBtn.hovered ? Theme.accentHover : Theme.accent
@@ -967,7 +1118,7 @@ Rectangle {
                                     // Remote control in the browser (web console, signed in)
                                     Button {
                                         id: webBtn
-                                        visible: modelData.status === "Online"
+                                        visible: hostDelegate.status === "Online" && !hostDelegate.isSource
                                         hoverEnabled: true
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
@@ -989,7 +1140,7 @@ Rectangle {
                                     // Files of the computer (own connection, FileManager.qml)
                                     Button {
                                         id: filesBtn
-                                        visible: modelData.status === "Online" || modelData.status === "Busy"
+                                        visible: (hostDelegate.status === "Online" || hostDelegate.status === "Busy") && !hostDelegate.isSource
                                         hoverEnabled: true
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
@@ -1011,31 +1162,12 @@ Rectangle {
                                     // Settings Gear Icon (Sleek custom vector gear)
                                     Button {
                                         id: gearBtn
-                                        visible: modelData.status === "Online" || modelData.status === "Busy"
-                                        onClicked: {
-                                            // Only reset to defaults when switching to a different host
-                                            if (dashboardRoot.activeConfigHost === null || dashboardRoot.activeConfigHost.id !== modelData.id) {
-                                                dashboardRoot.configRes = "1920x1080";
-                                                dashboardRoot.configFps = StreamOptions.displayFps(bridge.screenRefreshRate());
-                                                dashboardRoot.configCodec = "auto";
-                                                dashboardRoot.configBitrate = 15000;
-                                                dashboardRoot.configQueueLimit = 256;
-                                                dashboardRoot.configDisableCuda = false;
-                                                dashboardRoot.configRenderBackend = "auto_gpu";
-                                                dashboardRoot.configInputProtocol = "webrtc";
-                                                dashboardRoot.configEncoder = "auto";
-                                                dashboardRoot.configDisplay = "default";
-                                                dashboardRoot.configSource = "";
-                                            }
-                                            dashboardRoot.activeConfigHost = modelData;
-                                            settingsModal.hostName = modelData.name;
-                                            settingsModal.setCurrentSettings(dashboardRoot.configRes, dashboardRoot.configFps, dashboardRoot.configCodec, dashboardRoot.configBitrate, dashboardRoot.configQueueLimit, dashboardRoot.configDisableCuda, dashboardRoot.configInputProtocol, dashboardRoot.configEncoder, dashboardRoot.configDisplay, dashboardRoot.configRenderBackend, dashboardRoot.configSource);
-                                            // Fetch encoder/display capabilities from agent
-                                            if (dashboardRoot.serverUrl && dashboardRoot.token && modelData.id) {
-                                                bridge.fetchCapabilities(dashboardRoot.serverUrl, dashboardRoot.token, modelData.id);
-                                            }
-                                            settingsModal.open();
-                                        }
+                                        visible: hostDelegate.status === "Online" || hostDelegate.status === "Busy"
+                                        ToolTip.visible: hovered
+                                        ToolTip.delay: 400
+                                        ToolTip.text: I18n.t("Stream settings")
+                                        Accessible.name: "Stream settings"
+                                        onClicked: dashboardRoot.openStreamSettings(modelData)
                                         background: Rectangle {
                                             implicitWidth: 32; implicitHeight: 32; radius: 6
                                             color: gearBtn.hovered ? Theme.accentA(0.1) : "transparent"
@@ -1048,11 +1180,39 @@ Rectangle {
                                         }
                                     }
 
+                                    // Name and fields of a computer of another type (administrators)
+                                    Button {
+                                        id: editBtn
+                                        visible: hostDelegate.isSource && dashboardRoot.isAdmin
+                                        hoverEnabled: true
+                                        ToolTip.visible: hovered
+                                        ToolTip.delay: 400
+                                        ToolTip.text: I18n.t("Edit")
+                                        Accessible.name: "Edit"
+                                        onClicked: addHostDialog.openEdit(modelData, ({}))
+                                        background: Rectangle {
+                                            implicitWidth: 32; implicitHeight: 32; radius: 6
+                                            color: editBtn.hovered ? Theme.accentA(0.1) : "transparent"
+                                            border.color: editBtn.hovered ? Theme.accentFg : Theme.border
+                                            border.width: 1
+                                        }
+                                        contentItem: Item {
+                                            implicitWidth: 16; implicitHeight: 16
+                                            Icon { anchors.centerIn: parent; name: "edit"; size: 17; color: editBtn.hovered ? Theme.accentFg : Theme.text }
+                                        }
+                                    }
+
                                     Button {
                                         id: deleteBtn
+                                        visible: !hostDelegate.isSource || dashboardRoot.isAdmin
+                                        hoverEnabled: true
+                                        ToolTip.visible: hovered
+                                        ToolTip.delay: 400
+                                        ToolTip.text: I18n.t("Remove")
+                                        Accessible.name: "Remove"
                                         onClicked: {
+                                            if (hostDelegate.isSource) { removeSourceDialog.openFor(modelData); return; }
                                             dashboardRoot.pendingDeleteHost = modelData;
-                                            deleteHostDialog.open();
                                         }
                                         background: Rectangle {
                                             implicitWidth: 32; implicitHeight: 32; radius: 6
@@ -1076,7 +1236,7 @@ Rectangle {
             // Empty state view
             Column {
                 anchors.centerIn: parent
-                visible: dashboardRoot.hostsList.length === 0 && !dashboardRoot.hostsLoading
+                visible: dashboardRoot.cards.length === 0 && !dashboardRoot.hostsLoading
                 spacing: 16
                 Text { text: I18n.t("No agents connected yet"); font.pixelSize: 16; font.bold: true; color: Theme.textMuted; anchors.horizontalCenter: parent.horizontalCenter }
                 Text { text: I18n.t("Agents will appear here automatically once registered"); font.pixelSize: 12; color: Theme.textSubtle; anchors.horizontalCenter: parent.horizontalCenter }
@@ -1527,60 +1687,85 @@ Rectangle {
         }
     }
 
-    // Add a computer by address: the server connects to the Lunaris app on
-    // it. Without its password, the person there accepts each connection.
+    // "Add computer" and "Edit" (administrators). Type Lunaris: by address,
+    // the server connects to the Lunaris app on it (without its password,
+    // the person there accepts each connection). Another type: through one
+    // of the server's Lunaris computers, which keeps its fields.
     ApiClient { id: addHostApi }
-    DialogFrame {
+    Timer { id: addHostRefresh; interval: 2500; onTriggered: bridge.fetchHosts() }
+    AddComputerDialog {
         id: addHostDialog
+        objectName: "serverAddDialog"
+        serverMode: true
+        connectors: dashboardRoot.connectorTypes
+        through: dashboardRoot.connectorHosts
+        function openDialog() {
+            dashboardRoot.refreshSources();
+            openAdd();
+        }
+        function done(ok, data, err, status, text) {
+            addHostDialog.busy = false;
+            if (!ok) { addHostDialog.error = dashboardRoot.apiError(err, status, text, data); return; }
+            addHostDialog.close();
+            bridge.fetchHosts();
+            addHostRefresh.restart();
+        }
+        onLunarisSubmitted: (address, password, name) => {
+            addHostDialog.busy = true;
+            addHostApi.call("POST", "/api/hosts/address", { address: address, password: password || null }, addHostDialog.done);
+        }
+        onSourceSubmitted: (connectorId, hostId, sourceId, name, values) => {
+            addHostDialog.busy = true;
+            var path = "/api/hosts/" + encodeURIComponent(hostId) + "/sources";
+            if (sourceId === "")
+                addHostApi.call("POST", path, { name: name, connector: connectorId, values: values }, addHostDialog.done);
+            else
+                addHostApi.call("PUT", path + "/" + encodeURIComponent(sourceId), { name: name, values: values }, addHostDialog.done);
+        }
+    }
+
+    // Remove a computer of another type (administrators): asked first.
+    DialogFrame {
+        id: removeSourceDialog
+        objectName: "removeSourceDialog"
         width: 440
+        property var source: null
         property bool busy: false
         property string error: ""
-        function openDialog() {
-            addrField.text = "";
-            addPwField.text = "";
+        function openFor(source) {
+            removeSourceDialog.source = source;
             error = "";
+            busy = false;
             open();
-            addrField.input.forceActiveFocus();
         }
-        function submit() {
-            if (busy) return;
-            if (addrField.text.trim() === "") { error = I18n.t("Enter the address of the computer"); return; }
+        function confirm() {
+            if (busy || !source) return;
             busy = true;
             error = "";
-            addHostApi.call("POST", "/api/hosts/address",
-                { address: addrField.text.trim(), password: addPwField.text.trim() || null },
-                function (ok, data, err) {
-                    addHostDialog.busy = false;
-                    if (!ok) { addHostDialog.error = err; return; }
-                    addHostDialog.close();
-                    bridge.fetchHosts();
-                    addHostRefresh.restart();
+            addHostApi.call("DELETE", "/api/hosts/" + encodeURIComponent(source.host_id) + "/sources/" + encodeURIComponent(source.id), null,
+                function (ok, data, err, status, text) {
+                    removeSourceDialog.busy = false;
+                    if (!ok) { removeSourceDialog.error = dashboardRoot.apiError(err, status, text, data); return; }
+                    removeSourceDialog.close();
+                    dashboardRoot.refreshSources();
                 });
         }
-        Timer { id: addHostRefresh; interval: 2500; onTriggered: bridge.fetchHosts() }
         contentItem: ColumnLayout {
             spacing: 12
-            Text { text: I18n.t("Add computer"); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
+            Text { text: I18n.t("Remove computer"); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
             Text {
                 Layout.fillWidth: true
-                text: I18n.t("The server connects to the Lunaris app on that computer (remote control turned on). Its address and password are shown under \"This computer\" there.")
-                color: Theme.textMuted
-                font.pixelSize: 12
-                wrapMode: Text.WordWrap
-            }
-            InputField { id: addrField; placeholder: I18n.t("Address, e.g. 192.168.1.20"); onAccepted: addHostDialog.submit() }
-            InputField { id: addPwField; placeholder: I18n.t("Password (optional)"); password: true; onAccepted: addHostDialog.submit() }
-            Text {
-                Layout.fillWidth: true
-                text: I18n.t("Without the password, the person at that computer is asked to accept each connection.")
-                color: Theme.textMuted
-                font.pixelSize: 11
+                text: removeSourceDialog.source
+                    ? I18n.t("Remove \"%1\"? It is removed from %2, which will no longer show it.").arg(removeSourceDialog.source.name).arg(removeSourceDialog.source.host_name)
+                    : ""
+                color: Theme.text
+                font.pixelSize: 13
                 wrapMode: Text.WordWrap
             }
             Text {
-                visible: addHostDialog.error !== ""
+                visible: removeSourceDialog.error !== ""
                 Layout.fillWidth: true
-                text: addHostDialog.error
+                text: removeSourceDialog.error
                 color: Theme.danger
                 font.pixelSize: 12
                 wrapMode: Text.WordWrap
@@ -1589,8 +1774,12 @@ Rectangle {
                 Layout.fillWidth: true
                 spacing: 8
                 Item { Layout.fillWidth: true }
-                SecondaryButton { text: I18n.t("Cancel"); onClicked: addHostDialog.close() }
-                PrimaryButton { text: addHostDialog.busy ? I18n.t("Adding…") : I18n.t("Add"); onClicked: addHostDialog.submit() }
+                SecondaryButton { text: I18n.t("Cancel"); onClicked: removeSourceDialog.close() }
+                SecondaryButton {
+                    danger: true
+                    text: removeSourceDialog.busy ? I18n.t("Removing…") : I18n.t("Remove")
+                    onClicked: removeSourceDialog.confirm()
+                }
             }
         }
     }

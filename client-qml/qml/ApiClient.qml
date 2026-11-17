@@ -1,8 +1,10 @@
 import QtQuick
 
 // Calls the signed-in server's REST API through the bridge (with the saved
-// token). call(method, path, body, cb) → cb(ok, data, error): `data` is the
-// parsed JSON answer, `error` a message for the user when !ok.
+// token). call(method, path, body, cb) → cb(ok, data, error, status, text):
+// `data` is the parsed JSON answer, `error` a message for the user when !ok,
+// `status` the HTTP status (0: the server was not reached) and `text` the
+// answer as it came.
 Item {
     id: api
     visible: false
@@ -33,7 +35,7 @@ Item {
                 else if (status === 403) err = I18n.t("Only administrators can do this");
                 else err = I18n.t("Error") + " (" + status + ")";
             }
-            cb(ok, data, err);
+            cb(ok, data, err, status, body);
         }
     }
 }

@@ -14,6 +14,7 @@ use webrtc::peer_connection::{PeerConnection, RTCIceCandidateInit, RTCSessionDes
 
 pub mod approval;
 mod bridge;
+pub mod bridge_agent;
 mod buffer;
 pub mod direct;
 mod files;
@@ -99,6 +100,11 @@ struct Args {
     /// stderr.
     #[arg(long)]
     approval_stdio: bool,
+
+    /// The Lunaris app's helper for computers of other types it added for
+    /// itself (see bridge_agent.rs): this computer only, sources only.
+    #[arg(long, hide = true)]
+    bridge_only: bool,
 
     /// Windows: started by the Service Control Manager (see win_service.rs)
     #[cfg(target_os = "windows")]
@@ -280,7 +286,7 @@ where
                 "info,agent=info,webrtc_sctp=off,dtls=error,rtc_sctp=off,rtc_dtls=error".into()
             }),
         ))
-        .with(tracing_subscriber::fmt::layer().with_writer(if args.approval_stdio {
+        .with(tracing_subscriber::fmt::layer().with_writer(if args.approval_stdio || args.bridge_only {
             tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
         } else {
             tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
@@ -301,6 +307,13 @@ where
     if args.pair {
         info!("lunaris-media is the streaming backend.");
         return Ok(());
+    }
+
+    if args.bridge_only {
+        // Its own config file, which may not be there yet (no computer
+        // added): then there is nothing to show, and every session says so.
+        let config = crate::pairing::load_config(&config_path).unwrap_or_else(|_| crate::pairing::new_config());
+        return bridge_agent::run(config, name).await;
     }
 
     // Load or create agent config
@@ -572,6 +585,11 @@ async fn connect_server_once(
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (server_tx, mut server_rx) = mpsc::unbounded_channel::<AgentMessage>();
     hub.set_server(Some(server_tx.clone()));
+    // The server is told which other computers this one shows, and which
+    // kinds it can show (again whenever it changes them).
+    let manageable = config.server_sessions.trim() != "ask";
+    let server_tx_for_sources = server_tx.clone();
+    let _ = server_tx.send(crate::connector::sources::announcement(manageable));
     let gate = ServerGate::new(config.server_sessions.trim() == "ask", server_tx, inbound_tx.clone());
 
     // Outbound: the hub routes the session logic's replies for server clients here.
@@ -603,7 +621,27 @@ async fn connect_server_once(
                 info!("Registration success: {}", success);
             }
             Ok(ServerToAgentMessage::Signaling(sig)) => gate.pass(sig),
-            Err(e) => error!("Failed to parse server message: {}. Payload: {}", e, text),
+            Ok(ServerToAgentMessage::ChangeSource { request_id, change, requester }) => {
+                // A computer that asks at its screen before each connection
+                // is not changed from the server: its sources are added in
+                // the Lunaris app on it.
+                let result = if manageable {
+                    info!("Sources: {:?} asked for by {} through the server", change, requester.as_deref().unwrap_or("someone"));
+                    crate::connector::sources::apply(&change)
+                } else {
+                    Err(crate::connector::sources::NOT_MANAGEABLE.to_string())
+                };
+                let (id, error) = match result {
+                    Ok(id) => (Some(id), None),
+                    Err(error) => (None, Some(error)),
+                };
+                // The new list first: the server has it when the answer is out.
+                let _ = server_tx_for_sources.send(crate::connector::sources::announcement(manageable));
+                let _ = server_tx_for_sources.send(AgentMessage::SourceChanged { request_id, id, error });
+            }
+            // What a newer server may send is not written out: it can hold
+            // what a person typed.
+            Err(e) => error!("A message from the server was not understood: {}", e),
         }
     }
 
@@ -1059,6 +1097,11 @@ async fn run_session_logic(
     while let Some(sig) = inbound.recv().await {
         // Answers, candidates and ends of file sessions go to them.
         let sig = match sig {
+            SignalingMessage::IncomingFileSession { client_id, .. } if bridge_agent::is_bridge_only() => {
+                // The bridge-only agent has no files to give.
+                warn!("File transfer asked of the bridge-only agent by {}: refused", client_id);
+                continue;
+            }
             SignalingMessage::IncomingFileSession { client_id, ice_servers, .. } => {
                 info!("File transfer session requested by {}", client_id);
                 if let Some(old) = file_sessions.remove(&client_id) {
@@ -1146,6 +1189,16 @@ async fn run_session_logic(
                 // A source asked for must be one this computer has: its own
                 // screen is never shown in place of one that is not there.
                 let source = match source_id.as_deref().filter(|id| !id.is_empty()) {
+                    // The bridge-only agent shows other computers, never this one.
+                    None if bridge_agent::is_bridge_only() => {
+                        warn!("Session without a source asked of the bridge-only agent: refused");
+                        let _ = agent_tx.send(AgentMessage::Signaling(SignalingMessage::SourceStatus {
+                            target_id: client_id.clone(),
+                            status: "failed".into(),
+                            reason: Some("That computer is not there any more".into()),
+                        }));
+                        continue;
+                    }
                     None => None,
                     Some(id) => match crate::connector::configured_sources().into_iter().find(|s| s.id == id) {
                         Some(found) => {
@@ -1388,7 +1441,10 @@ async fn run_session_logic(
                 // (NvFBC status only, no CUDA context) so opening the
                 // client settings no longer allocates/leaks GPU memory.
                 let mut displays = Vec::new();
-                match lunaris_media::capture::list_displays_for_capabilities().await {
+                // The bridge-only agent has nothing of this computer to tell:
+                // no displays, no encoders; only its sources.
+                let own_screen = !bridge_agent::is_bridge_only();
+                match if own_screen { lunaris_media::capture::list_displays_for_capabilities().await } else { Ok(Vec::new()) } {
                     Ok(display_list) => {
                         info!("[GetCapabilities] Discovered {} display(s)", display_list.len());
                         for d in &display_list {
@@ -1411,7 +1467,7 @@ async fn run_session_logic(
                 let mut encoders = Vec::new();
                 encoders.push("native".to_string());
                 encoders.push("ffmpeg".to_string());
-                let encoder_list = lunaris_media::encode::list_available_encoders();
+                let encoder_list = if own_screen { lunaris_media::encode::list_available_encoders() } else { Vec::new() };
                 for enc in encoder_list {
                     if !encoders.contains(&enc.name) {
                         encoders.push(enc.name.clone());
@@ -1432,7 +1488,7 @@ async fn run_session_logic(
                         target_id,
                         displays,
                         encoders,
-                        gpu_info: lunaris_media::encode::describe_host_gpu(None),
+                        gpu_info: if own_screen { lunaris_media::encode::describe_host_gpu(None) } else { None },
                         host_os: Some(std::env::consts::OS.to_string()),
                         // The other computers this one shows: id and name only.
                         sources: crate::connector::configured_sources()

@@ -149,6 +149,9 @@ interface StreamPlayerProps {
   serverCodecModeSupport?: number;
   onBack: () => void;
   appId?: number | null;
+  /** Another computer this host shows through a connector (a source card):
+   *  the session asks for it instead of the host's own screen. */
+  sourceId?: string;
 }
 
 /**
@@ -217,7 +220,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
   token,
   serverCodecModeSupport,
   onBack,
-  appId
+  appId,
+  sourceId
 }) => {
   const videoRef = useRef<HTMLVideoElement | HTMLCanvasElement>(null);
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
@@ -343,7 +347,9 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
   const [draftMouseQueueLimit, setDraftMouseQueueLimit] = useState<number>(mouseQueueLimit);
   const [draftInputProtocol, setDraftInputProtocol] = useState<string>(activeInputProtocol);
   const [activeEncoder, setActiveEncoder] = useState<string>(() => localStorage.getItem('lunaris_stream_encoder') || 'auto');
-  const [activeDisplay, setActiveDisplay] = useState<string>(() => localStorage.getItem('lunaris_stream_display') || 'default');
+  // The remembered display is one of the host's own: a source has other
+  // displays, so its session starts from the source's own choice.
+  const [activeDisplay, setActiveDisplay] = useState<string>(() => sourceId ? 'default' : (localStorage.getItem('lunaris_stream_display') || 'default'));
   const [draftEncoder, setDraftEncoder] = useState<string>(activeEncoder);
   const [draftDisplay, setDraftDisplay] = useState<string>(activeDisplay);
   // Chroma subsampling: '420' (default, every encoder) or '444' (sharper
@@ -363,12 +369,14 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     displayId: '',
     displayName: ''
   });
-  // The other computers this host shows (through connectors), and the one
-  // chosen for this host ('' = the host's own screen).
-  const [availableSources, setAvailableSources] = useState<{ id: string; name: string; connector?: string }[]>([]);
-  const [activeSource, setActiveSource] = useState<string>(() => {
-    try { return localStorage.getItem(`lunaris_stream_source_${hostId}`) || ''; } catch { return ''; }
-  });
+  // The computer shown: the host's own screen ('') or, from a source card,
+  // another computer the host shows through a connector. It is given by the
+  // card only: a choice remembered by 0.5.0 (lunaris_stream_source_<host>) is
+  // not read any more, and is cleared.
+  const activeSource = sourceId || '';
+  useEffect(() => {
+    try { localStorage.removeItem(`lunaris_stream_source_${hostId}`); } catch { /* private mode */ }
+  }, [hostId]);
   // A source that changed its video codec asks for the session to be started again.
   const [sourceRestart, setSourceRestart] = useState(0);
   const sourceRestartsRef = useRef(0);
@@ -1383,19 +1391,6 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
             // While a source is shown the display list is the source's own
             // (it comes on the general channel as "source_displays").
             if (payload.displays && !activeSource) setAvailableDisplays(payload.displays);
-            {
-              // No list: an agent or a server from before sources, which
-              // shows the host's own screen whatever was asked for.
-              const sources: any[] = Array.isArray(payload.sources) ? payload.sources : [];
-              setAvailableSources(sources);
-              // A source this host does not have (any more) is not asked for
-              // again: the choice goes back to the host's own screen.
-              if (activeSource && !sources.some((s: any) => s.id === activeSource)) {
-                addLog('The chosen source is not one of this host; showing the host itself.');
-                try { localStorage.removeItem(`lunaris_stream_source_${hostId}`); } catch { /* private mode */ }
-                setActiveSource('');
-              }
-            }
             if (payload.encoders) setAvailableEncoders(payload.encoders);
             if (payload.gpu_info) setAgentGpuInfo(payload.gpu_info);
             if (payload.host_os) setAgentHostOs(String(payload.host_os).toLowerCase());
@@ -2853,7 +2848,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     localStorage.setItem('lunaris_input_protocol', draftInputProtocol);
     localStorage.setItem('lunaris_canvas_renderer_v2', String(draftUseCanvasRenderer));
     localStorage.setItem('lunaris_stream_encoder', draftEncoder);
-    localStorage.setItem('lunaris_stream_display', draftDisplay);
+    if (!sourceId) localStorage.setItem('lunaris_stream_display', draftDisplay);
     localStorage.setItem('lunaris_stream_chroma', draftChroma);
     
     // Check if settings requiring reconnect changed
@@ -2930,22 +2925,9 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       setActiveInputProtocol(value);
       setDraftInputProtocol(value);
       if (value !== activeInputProtocol) setStatus("Connecting...");
-    } else if (key === 'source') {
-      try {
-        if (value) localStorage.setItem(`lunaris_stream_source_${hostId}`, value);
-        else localStorage.removeItem(`lunaris_stream_source_${hostId}`);
-      } catch { /* private mode */ }
-      if (value !== activeSource) {
-        // The displays are those of the computer shown: start from its own choice.
-        localStorage.setItem('lunaris_stream_display', 'default');
-        setActiveDisplay('default');
-        setAvailableDisplays([]);
-        sourceRestartsRef.current = 0;
-        setStatus("Connecting...");
-        setActiveSource(value);
-      }
     } else if (key === 'display') {
-      localStorage.setItem('lunaris_stream_display', value);
+      // A source's display is not remembered: the stored one is the host's.
+      if (!activeSource) localStorage.setItem('lunaris_stream_display', value);
       setActiveDisplay(value);
       setDraftDisplay(value);
       if (value !== activeDisplay) setStatus("Connecting...");
@@ -4230,21 +4212,6 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
             WebTransport
           </option>
         </select>
-
-        {/* Source Dropdown: the host's own screen or a computer it shows */}
-        {availableSources.length > 0 && (
-          <select
-            value={activeSource}
-            onChange={(e) => updateSetting('source', e.target.value)}
-            className="stream-select"
-            title={t('Computer to show')}
-          >
-            <option value="">{t('This computer')}</option>
-            {availableSources.map(s => (
-              <option key={s.id} value={s.id}>{s.name}</option>
-            ))}
-          </select>
-        )}
 
         {/* Display Dropdown */}
         <select

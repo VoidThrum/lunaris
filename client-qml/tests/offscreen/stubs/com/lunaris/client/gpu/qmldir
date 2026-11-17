@@ -1,0 +1,5 @@
+module com.lunaris.client.gpu
+GpuVideoItem 1.0 GpuVideoItem.qml
+D3D11VideoItem 1.0 D3D11VideoItem.qml
+VaapiDmabufVideoItem 1.0 VaapiDmabufVideoItem.qml
+HostCursor 1.0 HostCursor.qml

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { LANGUAGES, getLang, setLang, t, type Lang } from './i18n';
 import StreamSettingsDialog from './components/StreamSettingsDialog';
 import { DEFAULT_BITRATE, DEFAULT_CODEC, resolutionString } from './streamOptions';
@@ -22,6 +22,40 @@ interface Host {
   link_error?: string;
   /** Added without its password: each connection is accepted there. */
   needs_approval?: boolean;
+}
+
+/** One field of a connector's form ("kind": text, port or secret). */
+interface ConnectorField {
+  key: string;
+  label: string;
+  kind: string;
+  default?: string;
+  required?: boolean;
+}
+
+/** A type of computer other than Lunaris; its form is these fields. */
+interface Connector {
+  id: string;
+  name: string;
+  fields: ConnectorField[];
+}
+
+/** A Lunaris computer that can show other computers, and through what. */
+interface ConnectorHost {
+  host_id: string;
+  host_name: string;
+  connectors: Connector[];
+}
+
+/** A computer of another type, reached through the Lunaris computer `host_id`. */
+interface Source {
+  host_id: string;
+  host_name: string;
+  id: string;
+  name: string;
+  connector: string;
+  connector_name: string;
+  online: boolean;
 }
 
 /** "host:8091" -> "host" (the default port isn't worth showing). */
@@ -312,6 +346,10 @@ function App() {
   }, []);
   const [hostsError, setHostsError] = useState<string | null>(null);
   const [selectedHost, setSelectedHost] = useState<Host | null>(null);
+  // Computers of other types (sources), each reached through a Lunaris host.
+  const [sources, setSources] = useState<Source[]>([]);
+  const [selectedSource, setSelectedSource] = useState<Source | null>(null);
+  const [connectorHosts, setConnectorHosts] = useState<ConnectorHost[]>([]);
   const [agentToken, setAgentToken] = useState<string | null>(null);
   // The server only gives the connection token to administrators.
   const [agentTokenDenied, setAgentTokenDenied] = useState<boolean>(false);
@@ -357,6 +395,56 @@ function App() {
     } finally {
       setHostsLoading(false);
     }
+    fetchSources();
+  };
+
+  // The computers of other types. A server from before them answers 404:
+  // then there are none, and nothing is said about it.
+  const fetchSources = async () => {
+    if (!token) return;
+    try {
+      const response = await fetch(`${getBackendProtocol().http}//${getBackendHost()}/api/sources`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!response.ok) {
+        if (response.status === 404) setSources([]);
+        return;
+      }
+      const data = await response.json();
+      setSources(Array.isArray(data) ? data.filter((s: any) => s && typeof s.id === 'string' && typeof s.host_id === 'string') : []);
+    } catch {
+      // The host list reports a server that cannot be reached.
+    }
+  };
+
+  // The types a computer can be added as, per Lunaris computer. 404 (an
+  // older server) or nothing: only the "Lunaris" type is offered.
+  const fetchConnectors = async () => {
+    if (!token) return;
+    try {
+      const response = await fetch(`${getBackendProtocol().http}//${getBackendHost()}/api/connectors`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!response.ok) { setConnectorHosts([]); return; }
+      const data = await response.json();
+      const list: ConnectorHost[] = (Array.isArray(data) ? data : [])
+        .filter((h: any) => h && typeof h.host_id === 'string' && Array.isArray(h.connectors))
+        .map((h: any) => ({
+          host_id: h.host_id,
+          host_name: String(h.host_name || h.host_id),
+          connectors: h.connectors
+            .filter((c: any) => c && typeof c.id === 'string')
+            .map((c: any) => ({
+              id: c.id,
+              name: String(c.name || c.id),
+              fields: (Array.isArray(c.fields) ? c.fields : []).filter((f: any) => f && typeof f.key === 'string'),
+            })),
+        }))
+        .filter((h: ConnectorHost) => h.connectors.length > 0);
+      setConnectorHosts(list);
+    } catch {
+      setConnectorHosts([]);
+    }
   };
 
 
@@ -366,6 +454,7 @@ function App() {
   useEffect(() => {
     if (token) {
       fetchHosts();
+      fetchConnectors();
       // Periodically refresh host list
       const interval = setInterval(fetchHosts, 5000);
       return () => clearInterval(interval);
@@ -673,11 +762,172 @@ function App() {
   const [addHostBusy, setAddHostBusy] = useState(false);
   const [addHostError, setAddHostError] = useState('');
 
+  // The same dialog adds a computer of another type ('' = Lunaris, else a
+  // connector id) and edits one (`editSource`).
+  const [addType, setAddType] = useState('');
+  const [sourceName, setSourceName] = useState('');
+  const [sourceHostId, setSourceHostId] = useState('');
+  const [sourceValues, setSourceValues] = useState<Record<string, string>>({});
+  const [editSource, setEditSource] = useState<Source | null>(null);
+  const [pendingDeleteSource, setPendingDeleteSource] = useState<Source | null>(null);
+  const [deleteSourceBusy, setDeleteSourceBusy] = useState(false);
+  const [deleteSourceError, setDeleteSourceError] = useState('');
+
+  // One entry per connector id, whichever computers have it.
+  const connectorTypes: Connector[] = [];
+  connectorHosts.forEach(h => h.connectors.forEach(c => {
+    if (!connectorTypes.some(x => x.id === c.id)) connectorTypes.push(c);
+  }));
+  const dialogConnectorId = editSource ? editSource.connector : addType;
+  // The Lunaris computers that can reach a computer of the chosen type.
+  const dialogHosts = dialogConnectorId
+    ? connectorHosts.filter(h => h.connectors.some(c => c.id === dialogConnectorId))
+    : [];
+  const dialogHostId = editSource ? editSource.host_id : sourceHostId;
+  // The form of the chosen type, as the chosen Lunaris computer describes it
+  // (an edit of a computer whose Lunaris computer is not listed uses another
+  // computer's description of the same type, if there is one).
+  const dialogConnector: Connector | null = dialogConnectorId
+    ? (connectorHosts.find(h => h.host_id === dialogHostId)?.connectors.find(c => c.id === dialogConnectorId)
+      || (editSource ? connectorTypes.find(c => c.id === dialogConnectorId) : null)
+      || null)
+    : null;
+
+  const defaultsOf = (connector: Connector | null | undefined): Record<string, string> => {
+    const values: Record<string, string> = {};
+    (connector?.fields || []).forEach(f => { values[f.key] = f.default || ''; });
+    return values;
+  };
+
+  // A long form scrolls: what the server answered must not stay out of sight.
+  const addHostErrorRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (addHostError) addHostErrorRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [addHostError]);
+
   const openAddHost = () => {
     setAddHostAddress('');
     setAddHostPassword('');
     setAddHostError('');
+    setAddType('');
+    setEditSource(null);
+    setSourceName('');
+    setSourceHostId('');
+    setSourceValues({});
     setAddHostOpen(true);
+    fetchConnectors();
+  };
+
+  const chooseAddType = (type: string) => {
+    setAddType(type);
+    setAddHostError('');
+    const first = type ? connectorHosts.find(h => h.connectors.some(c => c.id === type)) : undefined;
+    setSourceHostId(first?.host_id || '');
+    setSourceValues(defaultsOf(first?.connectors.find(c => c.id === type)));
+  };
+
+  const chooseSourceHost = (hostId: string) => {
+    setSourceHostId(hostId);
+    // Another computer may describe the type with other fields: keep what
+    // was typed for the fields both have.
+    const next = defaultsOf(connectorHosts.find(h => h.host_id === hostId)?.connectors.find(c => c.id === addType));
+    Object.keys(next).forEach(k => { if (sourceValues[k] !== undefined && sourceValues[k] !== '') next[k] = sourceValues[k]; });
+    setSourceValues(next);
+  };
+
+  const openEditSource = (source: Source) => {
+    setAddHostError('');
+    setEditSource(source);
+    setSourceName(source.name);
+    // The server never sends the fields back: they start empty, and an
+    // empty field keeps what is stored.
+    setSourceValues({});
+    setAddHostOpen(true);
+    fetchConnectors();
+  };
+
+  // What the server said about a refused write: JSON {"error"} or, for a
+  // non-admin, a plain line of text.
+  const writeErrorText = async (response: Response, fallback: string): Promise<string> => {
+    const text = (await response.text().catch(() => '')).trim();
+    try {
+      const body = JSON.parse(text);
+      if (body && typeof body.error === 'string' && body.error) return t(body.error);
+    } catch { /* not JSON */ }
+    if (text && text.length <= 200 && !text.startsWith('<')) return t(text);
+    return fallback;
+  };
+
+  const submitSource = async () => {
+    if (!token || addHostBusy) return;
+    const name = sourceName.trim();
+    if (!name) { setAddHostError(t('Enter a name for the computer')); return; }
+    if (!editSource && !dialogHosts.some(h => h.host_id === sourceHostId)) { setAddHostError(t('Choose the Lunaris computer to go through')); return; }
+    const values: Record<string, string> = {};
+    for (const field of dialogConnector?.fields || []) {
+      const raw = sourceValues[field.key] ?? '';
+      const value = field.kind === 'secret' ? raw : raw.trim();
+      if (!value) {
+        // An empty field of an edit keeps what is stored.
+        if (field.required && !editSource) { setAddHostError(t('%1 is required', t(field.label))); return; }
+        continue;
+      }
+      if (field.kind === 'port') {
+        const port = Number(value);
+        if (!/^\d+$/.test(value) || port < 1 || port > 65535) {
+          setAddHostError(t('%1 must be a number from 1 to 65535', t(field.label)));
+          return;
+        }
+      }
+      values[field.key] = value;
+    }
+    setAddHostBusy(true);
+    setAddHostError('');
+    try {
+      const base = `${getBackendProtocol().http}//${getBackendHost()}/api/hosts/${encodeURIComponent(editSource ? editSource.host_id : sourceHostId)}/sources`;
+      const response = await fetch(editSource ? `${base}/${encodeURIComponent(editSource.id)}` : base, {
+        method: editSource ? 'PUT' : 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(editSource ? { name, values } : { name, connector: addType, values }),
+      });
+      if (response.ok) {
+        setAddHostOpen(false);
+        setEditSource(null);
+        fetchSources();
+      } else if (response.status === 401) {
+        handleLogout();
+      } else {
+        setAddHostError(await writeErrorText(response, editSource ? t('Could not save the computer') : t('Could not add the computer')));
+      }
+    } catch {
+      setAddHostError(t('Cannot reach the server'));
+    } finally {
+      setAddHostBusy(false);
+    }
+  };
+
+  const handleDeleteSource = async (source: Source) => {
+    if (!token || deleteSourceBusy) return;
+    setDeleteSourceBusy(true);
+    setDeleteSourceError('');
+    try {
+      const response = await fetch(`${getBackendProtocol().http}//${getBackendHost()}/api/hosts/${encodeURIComponent(source.host_id)}/sources/${encodeURIComponent(source.id)}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (response.ok) {
+        setPendingDeleteSource(null);
+        setSources((current) => current.filter((x) => !(x.id === source.id && x.host_id === source.host_id)));
+      } else if (response.status === 401) {
+        handleLogout();
+      } else {
+        setDeleteSourceError(await writeErrorText(response, t('Could not delete the computer')));
+      }
+    } catch {
+      setDeleteSourceError(t('Cannot reach the server'));
+    } finally {
+      setDeleteSourceBusy(false);
+    }
   };
 
   const submitAddHost = async () => {
@@ -812,7 +1062,32 @@ function App() {
     setSelectedHost(host);
   };
 
+  // The Lunaris hosts first, then the computers of other types by name.
+  const sortedSources = [...sources].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  const closeAddHost = () => { setAddHostOpen(false); setEditSource(null); };
+  const sourceDialog = !!editSource || !!addType;
+
   const currentViewingHost = viewingHost ? (hosts.find(h => h.id === viewingHost.id) || viewingHost) : null;
+
+  // A computer of another type: a session to the Lunaris computer it is
+  // reached through, asking for that source.
+  if (token && selectedSource) {
+    return (
+      <StreamPlayer
+        key={`source:${selectedSource.host_id}:${selectedSource.id}`}
+        hostId={selectedSource.host_id}
+        hostName={selectedSource.name}
+        sourceId={selectedSource.id}
+        token={token}
+        serverCodecModeSupport={hosts.find(h => h.id === selectedSource.host_id)?.server_codec_mode_support}
+        appId={0}
+        onBack={() => {
+          setSelectedSource(null);
+          fetchHosts();
+        }}
+      />
+    );
+  }
 
   // If inside streaming session, render full screen stream viewer
   if (token && selectedHost) {
@@ -1319,12 +1594,12 @@ function App() {
                         </div>
                       )}
 
-                      {hostsLoading && hosts.length === 0 ? (
+                      {hostsLoading && hosts.length === 0 && sources.length === 0 ? (
                         <div className="loading-card">
                           <div className="tech-loader"></div>
                           <div>Syncing active host agent list...</div>
                         </div>
-                      ) : hosts.length === 0 ? (
+                      ) : hosts.length === 0 && sources.length === 0 ? (
                         <div className="empty-card">
                           <div className="empty-icon">🖥️</div>
                           <h3>{t('No agents connected')}</h3>
@@ -1447,6 +1722,79 @@ function App() {
                               </div>
                             );
                           })}
+                          {sortedSources.map((source) => {
+                            const isOnline = !!source.online;
+                            return (
+                              <div
+                                key={`source:${source.host_id}:${source.id}`}
+                                className={`host-card source-card ${isOnline ? 'online clickable-host-card' : 'offline'}`}
+                                onClick={() => { if (isOnline) setSelectedSource(source); }}
+                              >
+                                <div className="host-card-header">
+                                  <div className="source-card-title">
+                                    <h3 className="host-name">{source.name}</h3>
+                                    <div className="source-card-sub">
+                                      <span className="source-type-badge">{t(source.connector_name || source.connector)}</span>
+                                      <span className="source-via">{t('via %1', source.host_name)}</span>
+                                    </div>
+                                  </div>
+                                </div>
+
+                                <div className="host-card-body">
+                                  <div className="host-meta-item">
+                                    <span className="meta-label">{t('Status')}</span>
+                                    <div className="host-status-badge">
+                                      <span className={`status-indicator ${isOnline ? 'online' : 'offline'}`}></span>
+                                      <span className="status-label">{t(isOnline ? 'Online' : 'Offline')}</span>
+                                    </div>
+                                  </div>
+                                </div>
+
+                                <div className="host-card-actions" onClick={(e) => e.stopPropagation()}>
+                                  {isOnline && (
+                                    <button
+                                      type="button"
+                                      className="btn-primary host-card-connect"
+                                      onClick={() => setSelectedSource(source)}
+                                    >
+                                      {t('Connect')}
+                                    </button>
+                                  )}
+                                  {userRole === 'admin' && (
+                                    <button
+                                      type="button"
+                                      className="host-action-btn"
+                                      title={t('Edit')}
+                                      aria-label={t('Edit')}
+                                      onClick={() => openEditSource(source)}
+                                    >
+                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M12 20h9" />
+                                        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" />
+                                      </svg>
+                                    </button>
+                                  )}
+                                  {userRole === 'admin' && (
+                                    <button
+                                      type="button"
+                                      className="host-action-btn danger"
+                                      title={t('Delete')}
+                                      aria-label={t('Delete')}
+                                      onClick={() => { setDeleteSourceError(''); setPendingDeleteSource(source); }}
+                                    >
+                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                        <polyline points="3 6 5 6 21 6" />
+                                        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                                        <path d="M10 11v6" />
+                                        <path d="M14 11v6" />
+                                        <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                                      </svg>
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       )}
                     </>
@@ -1526,45 +1874,140 @@ function App() {
         </div>
       )}
 
+      {pendingDeleteSource && (
+        <div className="host-confirm-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget && !deleteSourceBusy) setPendingDeleteSource(null); }}>
+          <div className="host-confirm-card" role="dialog" aria-modal="true" aria-labelledby="deleteSourceTitle">
+            <div className="host-confirm-icon danger">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="3 6 5 6 21 6" />
+                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                <path d="M10 11v6" />
+                <path d="M14 11v6" />
+                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+              </svg>
+            </div>
+            <div className="host-confirm-content">
+              <h2 id="deleteSourceTitle">{t('Delete computer')}</h2>
+              <p>{t('Delete %1 from the list? It is reached through %2, which stays.', pendingDeleteSource.name, pendingDeleteSource.host_name)}</p>
+              {deleteSourceError && <p className="add-host-error" role="alert">{deleteSourceError}</p>}
+            </div>
+            <div className="host-confirm-actions">
+              <button className="btn-secondary" disabled={deleteSourceBusy} onClick={() => setPendingDeleteSource(null)}>{t('Cancel')}</button>
+              <button className="btn-danger" disabled={deleteSourceBusy} onClick={() => handleDeleteSource(pendingDeleteSource)}>
+                {deleteSourceBusy ? t('Deleting…') : t('Delete')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {addHostOpen && (
-        <div className="host-confirm-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget && !addHostBusy) setAddHostOpen(false); }}>
+        <div className="host-confirm-overlay add-host-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget && !addHostBusy) closeAddHost(); }}>
           <form
             className="host-confirm-card add-host-card"
             role="dialog"
             aria-modal="true"
             aria-labelledby="addHostTitle"
-            onSubmit={(e) => { e.preventDefault(); submitAddHost(); }}
+            noValidate
+            onSubmit={(e) => { e.preventDefault(); if (sourceDialog) submitSource(); else submitAddHost(); }}
           >
             <div className="host-confirm-content">
-              <h2 id="addHostTitle">{t('Add computer')}</h2>
-              <p>{t('The server connects to the Lunaris app on that computer (remote control turned on). Its address and password are shown under "This computer" there.')}</p>
+              <h2 id="addHostTitle">{editSource ? t('Edit computer') : t('Add computer')}</h2>
+              {editSource ? (
+                <p>{t('%1, reached through %2.', t(editSource.connector_name || editSource.connector), editSource.host_name)}</p>
+              ) : !addType ? (
+                <p>{t('The server connects to the Lunaris app on that computer (remote control turned on). Its address and password are shown under "This computer" there.')}</p>
+              ) : null}
             </div>
-            <div className="form-group">
-              <label htmlFor="addHostAddress">{t('Address')}</label>
-              <input
-                id="addHostAddress"
-                autoFocus
-                placeholder={t('e.g. 192.168.1.20')}
-                value={addHostAddress}
-                onChange={(e) => setAddHostAddress(e.target.value)}
-                autoComplete="off"
-              />
-            </div>
-            <div className="form-group">
-              <label htmlFor="addHostPassword">{t('Password (optional)')}</label>
-              <input
-                id="addHostPassword"
-                type="password"
-                value={addHostPassword}
-                onChange={(e) => setAddHostPassword(e.target.value)}
-                autoComplete="new-password"
-              />
-              <span className="form-hint">{t('Without the password, the person at that computer is asked to accept each connection.')}</span>
-            </div>
-            {addHostError && <div className="add-host-error">{addHostError}</div>}
+            {!editSource && connectorTypes.length > 0 && (
+              <div className="form-group">
+                <label htmlFor="addHostType">{t('Type')}</label>
+                <select id="addHostType" value={addType} onChange={(e) => chooseAddType(e.target.value)}>
+                  <option value="">Lunaris</option>
+                  {connectorTypes.map(c => <option key={c.id} value={c.id}>{t(c.name)}</option>)}
+                </select>
+              </div>
+            )}
+            {!sourceDialog && (
+              <>
+                <div className="form-group">
+                  <label htmlFor="addHostAddress">{t('Address')}</label>
+                  <input
+                    id="addHostAddress"
+                    autoFocus
+                    placeholder={t('e.g. 192.168.1.20')}
+                    value={addHostAddress}
+                    onChange={(e) => setAddHostAddress(e.target.value)}
+                    autoComplete="off"
+                  />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="addHostPassword">{t('Password (optional)')}</label>
+                  <input
+                    id="addHostPassword"
+                    type="password"
+                    value={addHostPassword}
+                    onChange={(e) => setAddHostPassword(e.target.value)}
+                    autoComplete="new-password"
+                  />
+                  <span className="form-hint">{t('Without the password, the person at that computer is asked to accept each connection.')}</span>
+                </div>
+              </>
+            )}
+            {sourceDialog && (
+              <>
+                <div className="form-group">
+                  <label htmlFor="sourceName">{t('Name')}</label>
+                  <input
+                    id="sourceName"
+                    value={sourceName}
+                    onChange={(e) => setSourceName(e.target.value)}
+                    autoComplete="off"
+                    maxLength={100}
+                  />
+                </div>
+                {!editSource && (
+                  <div className="form-group">
+                    <label htmlFor="sourceHost">{t('Through which Lunaris computer')}</label>
+                    <select id="sourceHost" value={sourceHostId} onChange={(e) => chooseSourceHost(e.target.value)}>
+                      {dialogHosts.map(h => <option key={h.host_id} value={h.host_id}>{h.host_name}</option>)}
+                    </select>
+                    <span className="form-hint">{t('That computer must be on the same network as the computer being added.')}</span>
+                  </div>
+                )}
+                {editSource && (
+                  <span className="form-hint">
+                    {dialogConnector
+                      ? t('Leave a field empty to keep it.')
+                      : t('Only the name can be changed while %1 is offline.', editSource.host_name)}
+                  </span>
+                )}
+                {(dialogConnector?.fields || []).map(field => (
+                  <div className="form-group" key={field.key}>
+                    <label htmlFor={`sourceField-${field.key}`}>
+                      {t(field.label || field.key)}
+                      {!editSource && !field.required && !field.default ? ` ${t('(optional)')}` : ''}
+                    </label>
+                    <input
+                      id={`sourceField-${field.key}`}
+                      type={field.kind === 'secret' ? 'password' : field.kind === 'port' ? 'number' : 'text'}
+                      inputMode={field.kind === 'port' ? 'numeric' : undefined}
+                      min={field.kind === 'port' ? 1 : undefined}
+                      max={field.kind === 'port' ? 65535 : undefined}
+                      value={sourceValues[field.key] ?? ''}
+                      onChange={(e) => setSourceValues((current) => ({ ...current, [field.key]: e.target.value }))}
+                      autoComplete={field.kind === 'secret' ? 'new-password' : 'off'}
+                    />
+                  </div>
+                ))}
+              </>
+            )}
+            {addHostError && <div className="add-host-error" role="alert" ref={addHostErrorRef}>{addHostError}</div>}
             <div className="host-confirm-actions">
-              <button type="button" className="btn-secondary" disabled={addHostBusy} onClick={() => setAddHostOpen(false)}>{t('Cancel')}</button>
-              <button type="submit" className="btn-primary" disabled={addHostBusy}>{addHostBusy ? t('Adding…') : t('Add')}</button>
+              <button type="button" className="btn-secondary" disabled={addHostBusy} onClick={closeAddHost}>{t('Cancel')}</button>
+              <button type="submit" className="btn-primary" disabled={addHostBusy}>
+                {editSource ? (addHostBusy ? t('Saving…') : t('Save')) : (addHostBusy ? t('Adding…') : t('Add'))}
+              </button>
             </div>
           </form>
         </div>

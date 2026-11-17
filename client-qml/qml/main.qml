@@ -511,7 +511,7 @@ ApplicationWindow {
                 return;
             }
             window.isStreamMode = false;
-            homeView.showError(message);
+            homeView.showError(I18n.tError(message));
             homeView.forceActiveFocus();
         }
 
@@ -521,7 +521,7 @@ ApplicationWindow {
             console.log("Source " + status + ": " + reason);
             var failed = status === "failed";
             var message = reason !== ""
-                ? I18n.t(failed ? "Could not connect to the other computer: %1" : "The other computer closed the session: %1").arg(I18n.t(reason))
+                ? I18n.t(failed ? "Could not connect to the other computer: %1" : "The other computer closed the session: %1").arg(I18n.tError(reason))
                 : I18n.t(failed ? "Could not connect to the other computer." : "The other computer closed the session.");
             bridge.stopStream();
             if (bridge.hasConnectionArgs()) {
@@ -533,6 +533,12 @@ ApplicationWindow {
             window.isStreamMode = false;
             homeView.showError(message);
             homeView.forceActiveFocus();
+        }
+
+        // The source being shown listed its displays: kept with its card, for
+        // the display choice in its stream settings.
+        onSourceDisplaysUpdated: (displaysJson, current) => {
+            homeView.sourceDisplaysSeen(displaysJson, current);
         }
 
         onCapabilitiesUpdated: (displaysJson, encodersJson, gpuInfo, hostOs, sourcesJson) => {

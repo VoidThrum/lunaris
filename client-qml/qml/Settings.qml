@@ -36,6 +36,41 @@ Rectangle {
     property string renderBackend: "auto_gpu"
     // The source to show; "" = the host's own screen.
     property string sourceId: ""
+    // The computer being configured is itself a source (a card of another
+    // type): there is no other computer to choose and nothing is encoded
+    // for it here. `sourceId` is then that source.
+    property bool sourceOnly: false
+    // The displays the sources listed in their sessions:
+    // { "<source id>": [{ id, name, width, height }] }. A source has its
+    // own displays, not the host's.
+    property var sourceDisplays: ({})
+
+    // The displays to choose from: the shown source's own when a source is
+    // shown, else the host's.
+    readonly property var displayOptions: {
+        var options = [{ value: "default", label: I18n.t("Default") }];
+        if (settingsRoot.sourceId !== "") {
+            var seen = settingsRoot.sourceDisplays[settingsRoot.sourceId] || [];
+            var listed = settingsRoot.displayId === "default";
+            for (var i = 0; i < seen.length; i++) {
+                var d = seen[i];
+                options.push({ value: String(d.id), label: (d.name || I18n.t("Display %1").arg(i + 1))
+                    + (d.width > 0 && d.height > 0 ? " (" + d.width + "x" + d.height + ")" : "") });
+                if (String(d.id) === settingsRoot.displayId) listed = true;
+            }
+            // The chosen one stays choosable when the list is not known (yet).
+            if (!listed) {
+                var n = parseInt(settingsRoot.displayId);
+                options.push({ value: settingsRoot.displayId, label: isNaN(n) ? settingsRoot.displayId : I18n.t("Display %1").arg(n + 1) });
+            }
+            return options;
+        }
+        for (var j = 1; j < settingsRoot.availableDisplayIds.length; j++)
+            options.push({ value: settingsRoot.availableDisplayIds[j], label: settingsRoot.availableDisplayLabels[j] });
+        return options;
+    }
+    readonly property bool sourceDisplaysKnown: settingsRoot.sourceId !== ""
+        && (settingsRoot.sourceDisplays[settingsRoot.sourceId] || []).length > 0
 
     signal applySettings(string res, int fps, string codec, int bitrate, int queueLimit, bool disableCuda, string renderBackend, string inputProtocol, string encoder, string displayId, string sourceId)
 
@@ -510,7 +545,7 @@ Rectangle {
             SectionTitle { visible: sourceCard.visible; text: I18n.t("Computer") }
             Card {
                 id: sourceCard
-                visible: settingsRoot.category === "host" && settingsRoot.sourceOptions.length > 1
+                visible: settingsRoot.category === "host" && !settingsRoot.sourceOnly && settingsRoot.sourceOptions.length > 1
                 SettingRow {
                     divider: false
                     title: I18n.t("Computer to show")
@@ -519,14 +554,16 @@ Rectangle {
                         width: parent.width
                         options: settingsRoot.sourceOptions
                         value: settingsRoot.sourceId
-                        onPicked: (v) => settingsRoot.sourceId = v
+                        // Another computer has other displays.
+                        onPicked: (v) => { if (v !== settingsRoot.sourceId) settingsRoot.displayId = "default"; settingsRoot.sourceId = v; }
                     }
                 }
             }
 
-            SectionTitle { visible: settingsRoot.category === "host"; text: I18n.t("Encoding") }
+            // A source arrives as that computer encoded it: no encoder to choose.
+            SectionTitle { visible: settingsRoot.category === "host" && !settingsRoot.sourceOnly; text: I18n.t("Encoding") }
             Card {
-                visible: settingsRoot.category === "host"
+                visible: settingsRoot.category === "host" && !settingsRoot.sourceOnly
                 SettingRow {
                     divider: false
                     title: I18n.t("Encoder")
@@ -546,12 +583,13 @@ Rectangle {
                 SettingRow {
                     divider: false
                     title: I18n.t("Display")
-                    hint: I18n.t("Which screen of the remote computer to show.")
+                    hint: settingsRoot.sourceId !== "" && !settingsRoot.sourceDisplaysKnown
+                        ? I18n.t("Which screen of the remote computer to show. Its screens are listed here after you have connected to it once.")
+                        : I18n.t("Which screen of the remote computer to show.")
                     ThemedCombo {
+                        objectName: "displayCombo"
                         width: parent.width
-                        options: settingsRoot.availableDisplayIds.length > 0
-                            ? settingsRoot.availableDisplayIds.map(function (id, i) { return { value: id, label: settingsRoot.availableDisplayLabels[i] }; })
-                            : [{ value: "default", label: I18n.t("Default") }]
+                        options: settingsRoot.displayOptions
                         value: settingsRoot.displayId
                         onPicked: (v) => settingsRoot.displayId = v
                     }

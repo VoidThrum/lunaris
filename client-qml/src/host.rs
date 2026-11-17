@@ -604,31 +604,6 @@ pub fn set_rustdesk(enabled: bool, port: u16) -> Result<(), String> {
     restart_if_ours()
 }
 
-/// The sources of this computer (other computers it shows) and the
-/// connectors to add one with, as JSON for the settings (`sources.rs`).
-pub fn sources_json() -> String {
-    let sources = load_or_create_config().map(|config| config.sources).unwrap_or_default();
-    let connectors = agent::connector::available(&agent::connector::connectors_dir());
-    agent::connector::sources::listing_json(&sources, &connectors)
-}
-
-/// Adds a source. No restart: the agent reads its sources at each session.
-pub fn add_source(name: &str, connector: &str, values_json: &str) -> Result<(), String> {
-    let mut config = load_or_create_config()?;
-    let connectors = agent::connector::available(&agent::connector::connectors_dir());
-    agent::connector::sources::add(&mut config, &connectors, name, connector, values_json)?;
-    save(&config)
-}
-
-/// Removes the source `id`.
-pub fn remove_source(id: &str) -> Result<(), String> {
-    let mut config = load_or_create_config()?;
-    if agent::connector::sources::remove(&mut config, id) {
-        save(&config)?;
-    }
-    Ok(())
-}
-
 fn restart_if_ours() -> Result<(), String> {
     if child_alive() {
         kill_child();

@@ -117,7 +117,9 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
     let addr = &args[1];
-    let password = &args[2];
+    // "-" as the password: it is in PROBE_PASSWORD (not on the command line).
+    let from_env = std::env::var("PROBE_PASSWORD").unwrap_or_default();
+    let password = if args[2] == "-" { &from_env } else { &args[2] };
     let seconds: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
     let codec = args.get(4).cloned().unwrap_or_else(|| "h264".into());
     let chroma = args.get(5).cloned();
@@ -168,10 +170,19 @@ async fn main() -> Result<()> {
     out_tx.send(SignalingMessage::GetCapabilities { target_id: host.clone() })?;
     let caps = recv_until(&mut in_rx, Duration::from_secs(10), |m| matches!(m, SignalingMessage::CapabilitiesResponse { .. })).await;
     match &caps {
-        Some(SignalingMessage::CapabilitiesResponse { target_id, displays, encoders, host_os, .. }) => step(
+        // PROBE_NO_DISPLAYS=1: an agent that shows other computers only (the
+        // app's bridge-only agent) must tell nothing of this computer's displays.
+        Some(SignalingMessage::CapabilitiesResponse { target_id, displays, encoders, host_os, sources, .. }) => step(
             "capabilities",
-            !displays.is_empty(),
-            format!("from agent {}: {} display(s), encoders {:?}, os {:?}", target_id, displays.len(), encoders, host_os),
+            if std::env::var("PROBE_NO_DISPLAYS").is_ok() { displays.is_empty() } else { !displays.is_empty() },
+            format!(
+                "from agent {}: {} display(s), encoders {:?}, os {:?}, sources {:?}",
+                target_id,
+                displays.len(),
+                encoders,
+                host_os,
+                sources.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+            ),
         )?,
         _ => step("capabilities", false, "no CapabilitiesResponse within 10 s")?,
     }
@@ -263,15 +274,21 @@ async fn main() -> Result<()> {
         chroma: chroma.clone(),
         encoder_csc_mode: None,
         microphone: None,
-        source_id: None,
+        // PROBE_SOURCE=<id>: a computer the agent shows through a connector.
+        source_id: std::env::var("PROBE_SOURCE").ok().filter(|s| !s.is_empty()),
         decode_codecs: None,
     })?;
     let offer = recv_until(&mut in_rx, Duration::from_secs(15), |m| {
-        matches!(m, SignalingMessage::Sdp { sdp, .. } if matches!(sdp.ty, RtcSdpType::Offer)) || matches!(m, SignalingMessage::Error { .. })
+        matches!(m, SignalingMessage::Sdp { sdp, .. } if matches!(sdp.ty, RtcSdpType::Offer))
+            || matches!(m, SignalingMessage::Error { .. })
+            || matches!(m, SignalingMessage::SourceStatus { .. })
     })
     .await;
     let offer_sdp = match offer {
         Some(SignalingMessage::Sdp { sdp, .. }) => sdp.sdp,
+        Some(SignalingMessage::SourceStatus { status, reason, .. }) => {
+            return step("offer", false, format!("source {}: {}", status, reason.unwrap_or_default())).map(|_| ())
+        }
         Some(SignalingMessage::Error { message }) => return step("offer", false, message).map(|_| ()),
         _ => return step("offer", false, "no SDP offer within 15 s").map(|_| ()),
     };
