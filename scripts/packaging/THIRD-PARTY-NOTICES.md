@@ -46,6 +46,37 @@ The remote-cursor images of the web and desktop clients are the Bibata
 Modern Classic cursors (GPL-3.0, https://github.com/ful1e5/Bibata_Cursor);
 see `assets/cursors/README.md`.
 
+## RustDesk protocol definitions and ported code
+
+The agent's RustDesk-compatible listener (`agent/src/rustdesk.rs` and
+`agent/src/rustdesk/`, off unless `rustdesk_port` is set) contains material
+from RustDesk (https://github.com/rustdesk/rustdesk, commit
+3e953e886a874956d8351d6c25e340ea82dd2343, version 1.5.3), which is licensed
+under the GNU Affero General Public License v3.0 (AGPL-3.0):
+
+- `agent/proto/rustdesk/message.proto`, copied from
+  `libs/base/protos/message.proto`; the Rust types generated from it are
+  compiled into the agent.
+- `agent/src/rustdesk/qos.rs` and `agent/src/rustdesk/qos/tests/`, copied from
+  `src/server/video_qos.rs` and `src/server/video_qos/tests/` (with
+  `base_bitrate`, `Quality` and `calc_bitrate` from `libs/scrap`).
+- The other files of the listener follow RustDesk's sources function by
+  function (each step names the function it was ported from): the wire
+  protocol, login, input handling, cursor, clipboard, file transfer and
+  codec negotiation.
+
+GPL-3.0 section 13 permits combining the two; the AGPL-3.0 continues to apply
+to that part.
+
+Libraries the listener links into the agent (all packages):
+
+| Component | Licence | Source |
+|-----------|---------|--------|
+| Zstandard (libzstd, built from the `zstd-sys` crate, statically linked) with the `zstd` and `zstd-safe` crates | BSD-3-Clause (libzstd is dual BSD-3-Clause / GPL-2.0; used under BSD) and MIT (crates) | https://github.com/facebook/zstd, https://github.com/gyscos/zstd-rs |
+| xxhash-rust | BSL-1.0 | https://github.com/DoumanAsh/xxhash-rust |
+| prost | Apache-2.0 | https://github.com/tokio-rs/prost |
+| regex, socket2 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex, https://github.com/rust-lang/socket2 |
+
 ## Hardware encoders and drivers
 
 Hardware encoders (VAAPI, NVENC, AMF, Quick Sync) and NvFBC run in the GPU

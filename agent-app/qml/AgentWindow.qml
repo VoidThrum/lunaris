@@ -15,7 +15,7 @@ ApplicationWindow {
     color: Theme.bg
     flags: Qt.Window
 
-    readonly property int baseHeight: directEnabled ? 760 : 640
+    readonly property int baseHeight: directEnabled ? 880 : 760
 
     // Grow the window while the activity log is open.
     onShowLogChanged: {
@@ -43,6 +43,8 @@ ApplicationWindow {
     // Direct connections (clients connect to this computer, no server)
     property bool directEnabled: false
     property int directPort: 8091
+    property bool rustdeskEnabled: false
+    property int rustdeskPort: 21118
     property string directPassword: ""
     property var directAddresses: []
 
@@ -339,6 +341,31 @@ ApplicationWindow {
             }
         }
 
+        // RustDesk clients
+        Card {
+            Layout.fillWidth: true
+            implicitHeight: rustdeskCol.implicitHeight + 28
+            ColumnLayout {
+                id: rustdeskCol
+                anchors.fill: parent; anchors.margins: 14
+                spacing: 8
+                SectionLabel { text: "RUSTDESK CLIENTS" }
+                Toggle {
+                    text: "Allow RustDesk clients (LAN, direct IP)"
+                    checked: window.rustdeskEnabled
+                    onToggled: { bridge.setRustdesk(checked, window.rustdeskPort); restartIfSharing() }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: window.rustdeskEnabled
+                        ? "In RustDesk, connect to this computer's address and port " + window.rustdeskPort + " with the access password. Not encrypted: for your own network or a VPN only."
+                        : "Lets the RustDesk app connect by this computer's address with the access password. Not encrypted: for your own network or a VPN only."
+                    color: Theme.textMuted; font.pixelSize: 12
+                }
+            }
+        }
+
         // Options
         ColumnLayout {
             Layout.fillWidth: true
@@ -451,6 +478,9 @@ ApplicationWindow {
             if (success) flash("Configuration imported", false); else if (error !== "") flash("Import failed: " + error, true)
         }
         function onUpdateAvailable(version, url) { window.updateVersion = version; window.updateUrl = url }
+        function onRustdeskConfigLoaded(enabled, port) {
+            window.rustdeskEnabled = enabled; window.rustdeskPort = port
+        }
         function onDirectConfigLoaded(enabled, port, password, addresses) {
             window.directEnabled = enabled; window.directPort = port; window.directPassword = password
             var a = addresses.toString(); window.directAddresses = a === "" ? [] : a.split("\n")

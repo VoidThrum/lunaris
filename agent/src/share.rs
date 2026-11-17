@@ -19,7 +19,7 @@ use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit, RT
 use webrtc::peer_connection::PeerConnection;
 
 /// Clipboard text larger than this isn't sent (it would hold up the channel).
-const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Deserialize)]
@@ -97,7 +97,7 @@ fn setup_clipboard(channel: Arc<dyn DataChannel>, allowed: bool) -> Vec<tokio::t
 
 /// Owns this computer's clipboard for the session: sets the client's text,
 /// reports local changes. Ends when the session's sender is dropped.
-fn clipboard_thread(set_rx: std_mpsc::Receiver<String>, changed_tx: tokio::sync::mpsc::UnboundedSender<String>) {
+pub(crate) fn clipboard_thread(set_rx: std_mpsc::Receiver<String>, changed_tx: tokio::sync::mpsc::UnboundedSender<String>) {
     let mut clipboard = match arboard::Clipboard::new() {
         Ok(c) => c,
         Err(e) => {
@@ -179,7 +179,7 @@ fn type_run(injector: &lunaris_media::input::InputInjector, run: &str, ascii: bo
 static OWN_CLIPBOARD: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 const OWN_CLIPBOARD_FOR: Duration = Duration::from_secs(5);
 
-fn note_own_clipboard(text: &str) {
+pub(crate) fn note_own_clipboard(text: &str) {
     if let Ok(mut own) = OWN_CLIPBOARD.lock() {
         own.retain(|(_, at)| at.elapsed() < OWN_CLIPBOARD_FOR);
         own.push((text.to_string(), Instant::now()));

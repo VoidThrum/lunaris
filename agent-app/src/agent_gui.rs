@@ -111,6 +111,10 @@ pub mod qobject {
         #[qsignal]
         fn config_saved(self: Pin<&mut AgentBridge>, success: bool, error_msg: QString);
 
+        /// RustDesk clients by IP address: on/off and the port.
+        #[qsignal]
+        fn rustdesk_config_loaded(self: Pin<&mut AgentBridge>, enabled: bool, port: i32);
+
         /// Direct connections: on/off, port, access password and this
         /// computer's addresses (one per line).
         #[qsignal]
@@ -149,6 +153,11 @@ pub mod qobject {
 
         #[qinvokable]
         fn regenerate_direct_password(self: Pin<&mut AgentBridge>);
+
+        /// Lets RustDesk clients connect by IP address on `port`, or not
+        /// (`rustdesk_port` of the config).
+        #[qinvokable]
+        fn set_rustdesk(self: Pin<&mut AgentBridge>, enabled: bool, port: i32);
 
         #[qinvokable]
         fn start_agent(self: Pin<&mut AgentBridge>);
@@ -301,6 +310,20 @@ impl qobject::AgentBridge {
         self.as_mut().save_direct_config(config);
     }
 
+    pub fn set_rustdesk(mut self: Pin<&mut Self>, enabled: bool, port: i32) {
+        let Some(port) = u16::try_from(port).ok().filter(|port| *port >= 1024) else {
+            self.as_mut().config_saved(false, QString::from("Use a port from 1024 to 65535"));
+            return;
+        };
+        let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
+        config.rustdesk_port = enabled.then_some(port);
+        if enabled {
+            // RustDesk clients log in with the access password.
+            agent::pairing::ensure_direct_password(&mut config);
+        }
+        self.as_mut().save_direct_config(config);
+    }
+
     pub fn regenerate_direct_password(mut self: Pin<&mut Self>) {
         let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
         config.direct_password = agent::pairing::generate_direct_password();
@@ -329,6 +352,10 @@ impl qobject::AgentBridge {
         })
         .join()
         .unwrap_or_default();
+        self.as_mut().rustdesk_config_loaded(
+            config.rustdesk_port.is_some(),
+            config.rustdesk_port.unwrap_or(agent::rustdesk::DEFAULT_PORT) as i32,
+        );
         self.as_mut().direct_config_loaded(
             config.direct_enabled,
             config.direct_port as i32,

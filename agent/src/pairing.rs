@@ -75,6 +75,14 @@ pub struct AgentConfig {
     /// when missing), sent as `key` on `/ws/agent`.
     #[serde(default)]
     pub agent_key: String,
+    /// RustDesk compatibility (rustdesk.rs): when set, RustDesk clients can
+    /// connect to this port by IP address and see and control this computer
+    /// (unencrypted, as RustDesk's direct IP access is: for a LAN or a VPN),
+    /// logging in with `direct_password` or accepted here, as `approve_mode`
+    /// says. Absent (the default): off. RustDesk's own port for this is
+    /// 21118.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustdesk_port: Option<u16>,
 }
 
 impl Default for AgentConfig {

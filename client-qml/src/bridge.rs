@@ -1135,6 +1135,11 @@ pub mod qobject {
         #[qinvokable]
         fn host_set_port(self: Pin<&mut StreamBridge>, port: i32) -> QString;
 
+        /// Lets RustDesk clients connect by IP address on `port`, or not;
+        /// returns an error message or "".
+        #[qinvokable]
+        fn host_set_rustdesk(self: Pin<&mut StreamBridge>, enabled: bool, port: i32) -> QString;
+
         /// The app's own Lunaris server, as JSON: enabled, running, ours,
         /// port, local_url, lan_url, admin_password, data_dir, error.
         #[qinvokable]
@@ -2779,6 +2784,13 @@ impl qobject::StreamBridge {
 
     pub fn host_answer_approval(self: Pin<&mut Self>, id: i32, accept: bool) {
         crate::host::answer_approval(id.max(0) as u64, accept);
+    }
+
+    pub fn host_set_rustdesk(self: Pin<&mut Self>, enabled: bool, port: i32) -> QString {
+        let result = u16::try_from(port)
+            .map_err(|_| "Use a port from 1024 to 65535".to_string())
+            .and_then(|port| crate::host::set_rustdesk(enabled, port));
+        QString::from(&result.err().unwrap_or_default())
     }
 
     pub fn host_set_port(self: Pin<&mut Self>, port: i32) -> QString {

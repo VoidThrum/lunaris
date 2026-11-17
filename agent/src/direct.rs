@@ -84,12 +84,12 @@ fn addr_key(ip: IpAddr) -> IpAddr {
 
 /// Wrong-password attempts per client address: (count, time of the last one).
 #[derive(Default)]
-struct LoginGuard {
+pub(crate) struct LoginGuard {
     failures: HashMap<IpAddr, (u32, Instant)>,
 }
 
 impl LoginGuard {
-    fn locked_out(&mut self, ip: IpAddr) -> bool {
+    pub(crate) fn locked_out(&mut self, ip: IpAddr) -> bool {
         let key = addr_key(ip);
         match self.failures.get(&key) {
             Some((count, last)) if last.elapsed() < LOCKOUT => *count >= MAX_FAILED_LOGINS,
@@ -101,7 +101,7 @@ impl LoginGuard {
         }
     }
 
-    fn failed(&mut self, ip: IpAddr) {
+    pub(crate) fn failed(&mut self, ip: IpAddr) {
         let key = addr_key(ip);
         if !self.failures.contains_key(&key) && self.failures.len() >= MAX_TRACKED_ADDRS {
             self.failures.retain(|_, (_, last)| last.elapsed() < LOCKOUT);
@@ -120,15 +120,15 @@ impl LoginGuard {
         entry.1 = Instant::now();
     }
 
-    fn succeeded(&mut self, ip: IpAddr) {
+    pub(crate) fn succeeded(&mut self, ip: IpAddr) {
         self.failures.remove(&addr_key(ip));
     }
 }
 
 /// Everything the listener limits across connections.
 #[derive(Default)]
-struct Limits {
-    logins: LoginGuard,
+pub(crate) struct Limits {
+    pub(crate) logins: LoginGuard,
     /// Connections not let in yet, per address.
     unauth: HashMap<IpAddr, usize>,
     unauth_total: usize,
@@ -192,13 +192,13 @@ fn allow_at<K: Hash + Eq>(map: &mut HashMap<K, Instant>, key: K, now: Instant) -
 }
 
 /// Counts a connection as not let in until dropped or `authenticated`.
-struct UnauthSlot {
+pub(crate) struct UnauthSlot {
     limits: Arc<Mutex<Limits>>,
     ip: IpAddr,
 }
 
 impl UnauthSlot {
-    fn take(limits: &Arc<Mutex<Limits>>, ip: IpAddr) -> Option<Self> {
+    pub(crate) fn take(limits: &Arc<Mutex<Limits>>, ip: IpAddr) -> Option<Self> {
         limits.lock().unwrap().open_unauth(ip).then(|| UnauthSlot { limits: limits.clone(), ip })
     }
 }
@@ -210,13 +210,13 @@ impl Drop for UnauthSlot {
 }
 
 /// A question on screen, for the limits.
-struct PromptSlot {
+pub(crate) struct PromptSlot {
     limits: Arc<Mutex<Limits>>,
     ip: IpAddr,
 }
 
 impl PromptSlot {
-    fn take(limits: &Arc<Mutex<Limits>>, ip: IpAddr) -> Option<Self> {
+    pub(crate) fn take(limits: &Arc<Mutex<Limits>>, ip: IpAddr) -> Option<Self> {
         limits.lock().unwrap().start_prompt(ip).then(|| PromptSlot { limits: limits.clone(), ip })
     }
 }
@@ -254,7 +254,7 @@ fn clean_name(name: &str) -> String {
 
 /// Who is asking, as shown to the person here: the address it really comes
 /// from, and the name it gave only marked as its claim.
-fn requester_label(claimed: &str, ip: IpAddr, via_server: bool) -> String {
+pub(crate) fn requester_label(claimed: &str, ip: IpAddr, via_server: bool) -> String {
     let name = clean_name(claimed);
     match (name.is_empty(), via_server) {
         (true, false) => ip.to_string(),

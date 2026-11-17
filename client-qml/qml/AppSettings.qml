@@ -424,6 +424,49 @@ Rectangle {
                 Text { visible: settings.portError !== ""; text: settings.portError; color: Theme.danger; font.pixelSize: 12 }
             }
 
+            Card {
+                id: rustdeskCard
+                visible: settings.section === "network"
+                title: I18n.t("RustDesk clients")
+                subtitle: I18n.t("Lets the RustDesk app connect to this computer by its address, with the same password and permissions. Not encrypted: for your own network or a VPN only. Restarts remote control.")
+                property string error: ""
+                function apply(enabled, port) {
+                    rustdeskCard.error = typeof bridge.hostSetRustdesk === "function"
+                        ? bridge.hostSetRustdesk(enabled, port)
+                        : "This version of the app cannot change it";
+                    homeView.refreshHost();
+                }
+                CheckRow {
+                    text: I18n.t("Allow RustDesk clients (LAN, direct IP)")
+                    checked: !!homeView && homeView.hostStatus.rustdesk_enabled === true
+                    onToggled: rustdeskCard.apply(checked, parseInt(rustdeskPortField.text) || 21118)
+                }
+                SettingRow {
+                    label: I18n.t("Port")
+                    hint: I18n.t("Default 21118, the port RustDesk uses for direct IP access. In RustDesk, connect to address:port.")
+                    RowLayout {
+                        spacing: 8
+                        InputField {
+                            id: rustdeskPortField
+                            Layout.fillWidth: false
+                            implicitWidth: 90
+                            implicitHeight: 34
+                            fontSize: 13
+                            text: homeView && homeView.hostStatus.rustdesk_port ? String(homeView.hostStatus.rustdesk_port) : "21118"
+                            input.validator: IntValidator { bottom: 1; top: 65535 }
+                            onAccepted: saveRustdeskPortBtn.clicked()
+                        }
+                        SecondaryButton {
+                            id: saveRustdeskPortBtn
+                            text: I18n.t("Save")
+                            enabled: !!homeView && rustdeskPortField.text !== String(homeView.hostStatus.rustdesk_port)
+                            onClicked: rustdeskCard.apply(homeView.hostStatus.rustdesk_enabled === true, parseInt(rustdeskPortField.text))
+                        }
+                    }
+                }
+                Text { visible: rustdeskCard.error !== ""; text: rustdeskCard.error; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            }
+
             LocalServerCard {
                 visible: settings.section === "network"
                 Layout.fillWidth: true

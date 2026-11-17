@@ -22,6 +22,7 @@ mod hub;
 mod input;
 pub mod pairing;
 mod rtcp_forward;
+pub mod rustdesk;
 mod share;
 mod video;
 #[cfg(target_os = "windows")]
@@ -372,6 +373,28 @@ pub async fn run_agent(
                 if let Ok(mut last) = LAST_ERROR.lock() {
                     *last = Some(msg);
                 }
+            }
+        }));
+    }
+
+    if let Some(port) = config.rustdesk_port {
+        // The RustDesk client logs in with the access password.
+        if crate::pairing::ensure_direct_password(&mut config) {
+            if let Err(e) = crate::pairing::save_config(&config, crate::pairing::config_path()) {
+                warn!("Could not save the new access password: {}", e);
+            }
+        }
+        let rustdesk_config = rustdesk::RustdeskConfig {
+            port,
+            password: config.direct_password.clone(),
+            approve_mode: approval::ApproveMode::parse(&config.approve_mode),
+            allow_clipboard: config.allow_clipboard,
+            agent_id: config.client_unique_id.clone(),
+            name: name.clone(),
+        };
+        tasks.0.push(tokio::spawn(async move {
+            if let Err(e) = rustdesk::run_listener(rustdesk_config).await {
+                error!("RustDesk compatibility unavailable: cannot listen on port {}: {}", port, e);
             }
         }));
     }

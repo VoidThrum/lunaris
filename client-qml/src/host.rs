@@ -36,6 +36,10 @@ struct HostStatus {
     full_disk_access: bool,
     /// "password", "click" or "password-click" (agent/src/approval.rs).
     approve_mode: String,
+    /// RustDesk clients may connect by IP address (agent/src/rustdesk.rs),
+    /// and the port they use (21118, RustDesk's own, when it is off).
+    rustdesk_enabled: bool,
+    rustdesk_port: u16,
     error: String,
 }
 
@@ -197,6 +201,8 @@ pub fn status_json() -> String {
             allow_file_transfer: config.allow_file_transfer,
             full_disk_access: config.file_access.trim() == "full",
             approve_mode: config.approve_mode.clone(),
+            rustdesk_enabled: config.rustdesk_port.is_some(),
+            rustdesk_port: config.rustdesk_port.unwrap_or(agent::rustdesk::DEFAULT_PORT),
             error: String::new(),
         },
         Err(error) => HostStatus {
@@ -211,6 +217,8 @@ pub fn status_json() -> String {
             allow_file_transfer: true,
             full_disk_access: false,
             approve_mode: "password-click".into(),
+            rustdesk_enabled: false,
+            rustdesk_port: agent::rustdesk::DEFAULT_PORT,
             error,
         },
     };
@@ -576,6 +584,22 @@ pub fn set_port(port: u16) -> Result<(), String> {
     }
     let mut config = load_or_create_config()?;
     config.direct_port = port;
+    save(&config)?;
+    restart_if_ours()
+}
+
+/// Whether RustDesk clients may connect by IP address, and on which port
+/// (`rustdesk_port` of the agent's config; absent = off). Restarts the
+/// app's agent.
+pub fn set_rustdesk(enabled: bool, port: u16) -> Result<(), String> {
+    if port < 1024 {
+        return Err("Use a port from 1024 to 65535".into());
+    }
+    let mut config = load_or_create_config()?;
+    if enabled && port == config.direct_port {
+        return Err("That port is the one for direct connections".into());
+    }
+    config.rustdesk_port = enabled.then_some(port);
     save(&config)?;
     restart_if_ours()
 }
