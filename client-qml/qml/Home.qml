@@ -9,7 +9,7 @@ Rectangle {
     id: home
     color: Theme.bg
 
-    signal startSessionRequested(string server, string token, string hostId, string hostName, int appId, string res, int fps, string codec, int bitrate, int queueLimit, bool disableCuda, string renderBackend, string inputProtocol, string encoder, string displayId)
+    signal startSessionRequested(string server, string token, string hostId, string hostName, int appId, string res, int fps, string codec, int bitrate, int queueLimit, bool disableCuda, string renderBackend, string inputProtocol, string encoder, string displayId, string sourceId)
 
     // The server sign-in and its computers (Server tab); main.qml reaches it
     // as `dashboardView`.
@@ -380,7 +380,7 @@ Rectangle {
             "ws://" + addr, password, "direct", name, 0,
             s.res, s.fps, s.codec, s.bitrate, s.queueLimit,
             s.renderBackend === "software", s.renderBackend,
-            s.inputProtocol, s.encoder, s.displayId);
+            s.inputProtocol, s.encoder, s.displayId, s.sourceId);
     }
 
     // Stream settings for a saved computer: its own (gear on the card) or
@@ -390,7 +390,7 @@ Rectangle {
         var d = {
             res: home.prefs.res, fps: home.prefs.fps, codec: home.prefs.codec,
             bitrate: home.prefs.bitrate, queueLimit: 256, renderBackend: home.prefs.renderBackend,
-            inputProtocol: "webrtc", encoder: "auto", displayId: "default"
+            inputProtocol: "webrtc", encoder: "auto", displayId: "default", sourceId: ""
         };
         return Object.assign(d, (peer && peer.settings) || {});
     }
@@ -420,16 +420,16 @@ Rectangle {
             peerSettings.hostName = (peer && peer.name) ? peer.name : displayAddress(address);
             peerSettings.setCurrentSettings(s.res, s.fps, s.codec, s.bitrate, s.queueLimit,
                 s.renderBackend === "software", s.inputProtocol, s.encoder, s.displayId,
-                s.renderBackend);
+                s.renderBackend, s.sourceId);
             bridge.fetchCapabilities("ws://" + address, password, "direct");
             peerSettings.open();
         });
     }
 
     // From main.qml: what the computer whose settings are open can do.
-    function peerCapabilities(displaysJson, encodersJson, hostOs) {
+    function peerCapabilities(displaysJson, encodersJson, hostOs, sourcesJson) {
         if (!peerSettings.visible || peerSettings.address === "") return;
-        peerSettings.updateCapabilities(displaysJson, encodersJson);
+        peerSettings.updateCapabilities(displaysJson, encodersJson, sourcesJson);
         if (hostOs) updatePeer(peerSettings.address, { os: hostOs });
     }
 
@@ -1169,9 +1169,9 @@ Rectangle {
                     anchors.bottom: parent.bottom
                     anchors.fill: undefined
                     visible: home.peerTab === "server"
-                    onStartSessionRequested: (server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId) => {
+                    onStartSessionRequested: (server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId, sourceId) => {
                         home.setStatus(I18n.t("Connecting to %1…").arg(hostName), false);
-                        home.startSessionRequested(server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId);
+                        home.startSessionRequested(server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId, sourceId);
                     }
                 }
             }
@@ -1455,11 +1455,11 @@ Rectangle {
         property string password: ""
         anchors.fill: parent
         z: 1000
-        onApplySettings: (res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId) => {
+        onApplySettings: (res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId, sourceId) => {
             home.updatePeer(peerSettings.address, { settings: {
                 res: res, fps: fps, codec: codec, bitrate: bitrate, queueLimit: queueLimit,
                 renderBackend: renderBackend, inputProtocol: inputProtocol, encoder: encoder,
-                displayId: displayId
+                displayId: displayId, sourceId: sourceId
             } });
         }
     }

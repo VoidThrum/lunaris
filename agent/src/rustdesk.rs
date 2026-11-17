@@ -30,11 +30,11 @@
 //!    computer is asked as for Lunaris's own direct connections
 //!    (approval.rs).
 
-mod clipboard;
-mod cursor;
+pub(crate) mod clipboard;
+pub(crate) mod cursor;
 pub mod frame;
 mod input;
-mod qos;
+pub(crate) mod qos;
 pub mod login;
 pub mod proto;
 mod session;

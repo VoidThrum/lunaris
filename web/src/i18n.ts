@@ -364,6 +364,19 @@ const vi: Record<string, string> = {
   'Failed to update group': 'Không cập nhật được nhóm',
   'Failed to add TURN server': 'Không thêm được server TURN',
   'Internal Database Error': 'Lỗi cơ sở dữ liệu trên server',
+  // Sources: other computers a host shows through a connector.
+  'Computer to show': 'Máy cần xem',
+  'This computer': 'Máy này',
+  'Could not connect to the other computer: %1': 'Không kết nối được tới máy kia: %1',
+  'The other computer ended the session: %1': 'Máy kia đã kết thúc phiên: %1',
+  'Wrong password for the RustDesk computer': 'Sai mật khẩu của máy RustDesk',
+  'The RustDesk computer does not accept a password (only a click at the computer)': 'Máy RustDesk không nhận mật khẩu (chỉ chấp nhận bấm đồng ý tại máy)',
+  'This computer no longer has that source': 'Máy này không còn nguồn đó nữa',
+  'The computer sent no picture': 'Máy kia không gửi hình',
+  'The RustDesk computer cannot be reached (is it on, and is direct IP access switched on there?)': 'Không kết nối được tới máy RustDesk (máy có đang bật không, và đã bật truy cập trực tiếp bằng IP ở đó chưa?)',
+  'The RustDesk computer does not answer': 'Máy RustDesk không trả lời',
+  'The RustDesk computer closed the connection': 'Máy RustDesk đã đóng kết nối',
+  'The computer closed the connection': 'Máy kia đã đóng kết nối',
 };
 
 export const t = (text: string, ...args: (string | number)[]): string => {

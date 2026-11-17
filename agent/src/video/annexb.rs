@@ -117,6 +117,42 @@ fn find_001(data: &[u8], from: usize) -> Option<usize> {
     None
 }
 
+/// An Annex-B access unit without its filler data NAL units (H.264 type 12,
+/// H.265 type 38, FD_NUT): bytes a constant-bitrate encoder adds to keep
+/// its rate, which a decoder throws away. On a still screen they are most
+/// of the stream. The frame is returned as it is when it has none.
+pub fn without_filler(frame: Vec<u8>, h265: bool) -> Vec<u8> {
+    let is_filler = |header: u8| if h265 { (header >> 1) & 0x3f == 38 } else { header & 0x1f == 12 };
+    // Where each NAL unit begins, start code included (00 00 01, with the
+    // zero byte before it when there is one).
+    let mut starts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i + 3 <= frame.len() {
+        if frame[i] == 0 && frame[i + 1] == 0 && frame[i + 2] == 1 {
+            starts.push(if i > 0 && frame[i - 1] == 0 { i - 1 } else { i });
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let header_of = |start: usize| {
+        let code = if frame[start + 2] == 1 { 3 } else { 4 };
+        frame.get(start + code).copied()
+    };
+    if !starts.iter().any(|start| header_of(*start).is_some_and(is_filler)) {
+        return frame;
+    }
+    let mut out = Vec::with_capacity(frame.len());
+    out.extend_from_slice(&frame[..starts[0]]);
+    for (n, start) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(frame.len());
+        if !header_of(*start).is_some_and(is_filler) {
+            out.extend_from_slice(&frame[*start..end]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -383,5 +419,35 @@ mod tests {
             }
             assert_same(&data);
         }
+    }
+}
+
+#[cfg(test)]
+mod filler_tests {
+    use super::without_filler;
+
+    #[test]
+    fn filler_data_is_taken_out_and_the_rest_is_untouched() {
+        // H.264: SEI (6), a slice (1), filler (12) of 0xFF bytes, with both start codes.
+        let sei = [0, 0, 0, 1, 0x06, 0x05, 0x01, 0x80];
+        let slice = [0, 0, 1, 0x41, 0x9A, 0x00, 0x00, 0x03, 0x01, 0x22];
+        let filler = [0, 0, 0, 1, 0x0C, 0xFF, 0xFF, 0xFF, 0x80];
+        let frame: Vec<u8> = [&sei[..], &slice[..], &filler[..]].concat();
+        assert_eq!(without_filler(frame.clone(), false), [&sei[..], &slice[..]].concat());
+        // Filler first or in the middle.
+        assert_eq!(without_filler([&filler[..], &sei[..], &filler[..], &slice[..]].concat(), false), [&sei[..], &slice[..]].concat());
+        // Nothing to take out: the same bytes (an emulation prevention 00 00 03 is not a start code).
+        let plain: Vec<u8> = [&sei[..], &slice[..]].concat();
+        assert_eq!(without_filler(plain.clone(), false), plain);
+        // The same bytes read as H.265 have no FD_NUT (type 38) in them.
+        assert_eq!(without_filler(frame.clone(), true), frame);
+        // H.265: a slice (type 1: header 0x02 0x01) and filler (type 38: header 0x4C 0x01).
+        let hevc_slice = [0, 0, 0, 1, 0x02, 0x01, 0xD0, 0x10];
+        let hevc_filler = [0, 0, 1, 0x4C, 0x01, 0xFF, 0xFF, 0x80];
+        assert_eq!(without_filler([&hevc_slice[..], &hevc_filler[..]].concat(), true), hevc_slice.to_vec());
+        // Odd input is left alone.
+        assert_eq!(without_filler(vec![], false), Vec::<u8>::new());
+        assert_eq!(without_filler(vec![0, 0, 1], false), vec![0, 0, 1]);
+        assert_eq!(without_filler(vec![1, 2, 3, 4], false), vec![1, 2, 3, 4]);
     }
 }

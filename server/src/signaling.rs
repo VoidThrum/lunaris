@@ -797,7 +797,7 @@ async fn handle_agent_signaling(sig: SignalingMessage, agent_id: &str, state: Ar
                 ));
             }
         }
-        SignalingMessage::CapabilitiesResponse { target_id, displays, encoders, gpu_info, host_os } => {
+        SignalingMessage::CapabilitiesResponse { target_id, displays, encoders, gpu_info, host_os, sources } => {
             info!("Server: CapabilitiesResponse from agent {} for client {} ({} displays, {} encoders)", agent_id, target_id, displays.len(), encoders.len());
             let clients = state.clients.read().unwrap();
             if let Some(client_tx) = clients.get(&target_id) {
@@ -808,10 +808,20 @@ async fn handle_agent_signaling(sig: SignalingMessage, agent_id: &str, state: Ar
                     encoders,
                     gpu_info,
                     host_os,
+                    sources,
                 });
                 let _ = client_tx.send(msg);
             } else {
                 warn!("Server: Client {} NOT found in clients map! Cannot forward CapabilitiesResponse", target_id);
+            }
+        }
+        SignalingMessage::SourceStatus { target_id, status, reason } => {
+            if let Some(client_tx) = state.clients.read().unwrap().get(&target_id) {
+                let _ = client_tx.send(ServerToClientMessage::Signaling(SignalingMessage::SourceStatus {
+                    target_id: agent_id.to_string(),
+                    status,
+                    reason,
+                }));
             }
         }
         SignalingMessage::AccessRequest { target_id, status } => {
@@ -908,6 +918,8 @@ async fn handle_client_signaling(
             chroma,
             encoder_csc_mode,
             microphone,
+            source_id,
+            decode_codecs,
         } => {
             info!("Client {} requested session for host {} with settings: w={:?}, h={:?}, fps={:?}, bitrate={:?}, codec={:?}, app_id={:?}, chroma={:?}, encoder_csc_mode={:?}", client_id, host_id, width, height, fps, bitrate, codec, app_id, chroma, encoder_csc_mode);
 
@@ -964,6 +976,8 @@ async fn handle_client_signaling(
                         chroma: chroma.clone(),
                         encoder_csc_mode,
                         microphone,
+                        source_id: source_id.clone(),
+                        decode_codecs: decode_codecs.clone(),
                         ice_servers: Some(ice_servers),
                         requester,
                     });
@@ -1413,6 +1427,8 @@ mod tests {
             chroma: None,
             encoder_csc_mode: None,
             microphone: None,
+            source_id: None,
+            decode_codecs: None,
         };
         handle_client_signaling(request(), "a", "c1", state.clone()).await;
         // A second connection takes the host over (the agent runs one session).
@@ -1433,5 +1449,98 @@ mod tests {
             Some(ServerToAgentMessage::Signaling(SignalingMessage::EndSession { .. }))
         ));
         assert_eq!(host_status(&state, "h1").await, "Online");
+    }
+
+    /// The source asked for and the codecs the client decodes reach the
+    /// agent; the agent's sources and what it says of a source reach the
+    /// client. Messages from clients and agents of before these fields
+    /// still parse, and mean "no source".
+    #[tokio::test]
+    async fn sources_pass_through_and_older_peers_still_work() {
+        let state = state().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash, role, is_active) VALUES ('a', 'a', 'x', 'admin', 1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO hosts (id, name, status) VALUES ('h1', 'H1', 'Online')").execute(&state.db).await.unwrap();
+        let (agent_tx, mut agent_rx) = crate::queue::channel::<ServerToAgentMessage>();
+        state.agents.write().unwrap().insert("h1".into(), agent_tx);
+        let (client_tx, mut client_rx) = crate::queue::channel::<ServerToClientMessage>();
+        state.clients.write().unwrap().insert("c1".into(), client_tx);
+
+        // A new client: the request as it is on the wire.
+        let new_client: SignalingMessage = serde_json::from_str(
+            r#"{"type":"RequestSession","payload":{"host_id":"h1","width":1280,"height":720,"fps":60,"bitrate":8000,"codec":"h264","app_id":null,"encoder":null,"display_id":null,"source_id":"office-pc","decode_codecs":["h264","vp8","av1"]}}"#,
+        )
+        .unwrap();
+        handle_client_signaling(new_client, "a", "c1", state.clone()).await;
+        match agent_rx.rx_try() {
+            Some(ServerToAgentMessage::Signaling(SignalingMessage::IncomingSession { source_id, decode_codecs, client_id, .. })) => {
+                assert_eq!(client_id, "c1");
+                assert_eq!(source_id.as_deref(), Some("office-pc"));
+                assert_eq!(decode_codecs, Some(vec!["h264".to_string(), "vp8".to_string(), "av1".to_string()]));
+            }
+            _ => panic!("the agent got no IncomingSession"),
+        }
+
+        // A client from before the fields: the same request without them.
+        let old_client: SignalingMessage = serde_json::from_str(
+            r#"{"type":"RequestSession","payload":{"host_id":"h1","width":1280,"height":720,"fps":60,"bitrate":8000,"codec":"h264","app_id":null,"encoder":null,"display_id":null}}"#,
+        )
+        .unwrap();
+        handle_client_signaling(old_client, "a", "c1", state.clone()).await;
+        while let Some(message) = agent_rx.rx_try() {
+            if let ServerToAgentMessage::Signaling(SignalingMessage::IncomingSession { source_id, decode_codecs, .. }) = &message {
+                assert!(source_id.is_none() && decode_codecs.is_none());
+                // What an agent from before the fields is sent has no trace of them.
+                let wire = serde_json::to_string(&message).unwrap();
+                assert!(!wire.contains("source_id") && !wire.contains("decode_codecs"), "{}", wire);
+            }
+        }
+        while client_rx.rx_try().is_some() {}
+
+        // The agent's capabilities: with sources (new agent) and without (old agent).
+        let new_agent: SignalingMessage = serde_json::from_str(
+            r#"{"type":"CapabilitiesResponse","payload":{"target_id":"c1","displays":[],"encoders":["native"],"gpu_info":null,"host_os":"linux","sources":[{"id":"office-pc","name":"Office PC","connector":"rustdesk"}]}}"#,
+        )
+        .unwrap();
+        handle_agent_signaling(new_agent, "h1", state.clone()).await;
+        match client_rx.rx_try() {
+            Some(ServerToClientMessage::Signaling(SignalingMessage::CapabilitiesResponse { target_id, sources, .. })) => {
+                assert_eq!(target_id, "h1");
+                assert_eq!(sources, vec![common::SourceInfoMsg { id: "office-pc".into(), name: "Office PC".into(), connector: "rustdesk".into() }]);
+            }
+            _ => panic!("the client got no CapabilitiesResponse"),
+        }
+        let old_agent: SignalingMessage = serde_json::from_str(
+            r#"{"type":"CapabilitiesResponse","payload":{"target_id":"c1","displays":[],"encoders":["native"],"gpu_info":null,"host_os":"linux"}}"#,
+        )
+        .unwrap();
+        handle_agent_signaling(old_agent, "h1", state.clone()).await;
+        match client_rx.rx_try() {
+            Some(message @ ServerToClientMessage::Signaling(SignalingMessage::CapabilitiesResponse { .. })) => {
+                // A client from before the field is not sent an empty list either.
+                assert!(!serde_json::to_string(&message).unwrap().contains("sources"));
+            }
+            _ => panic!("the client got no CapabilitiesResponse"),
+        }
+
+        // What the agent says of a source (it failed, it ended) reaches the client.
+        handle_agent_signaling(
+            SignalingMessage::SourceStatus { target_id: "c1".into(), status: "failed".into(), reason: Some("Wrong password".into()) },
+            "h1",
+            state.clone(),
+        )
+        .await;
+        match client_rx.rx_try() {
+            Some(ServerToClientMessage::Signaling(SignalingMessage::SourceStatus { target_id, status, reason })) => {
+                assert_eq!((target_id.as_str(), status.as_str(), reason.as_deref()), ("h1", "failed", Some("Wrong password")));
+            }
+            _ => panic!("the client got no SourceStatus"),
+        }
+
+        // A message type this build does not know (a newer peer) does not parse,
+        // which the socket loops log and skip.
+        assert!(serde_json::from_str::<SignalingMessage>(r#"{"type":"SomethingNewer","payload":{"target_id":"c1"}}"#).is_err());
     }
 }

@@ -120,6 +120,26 @@ const parseHostCursorImage = (image: any): HostCursorImagePayload | null => {
 
 
 type CodecName = 'h264' | 'h265' | 'av1';
+
+/** The video codecs this browser decodes over WebRTC, as the host is told them. */
+const decodableCodecs = (): string[] | undefined => {
+  try {
+    const caps = typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities
+      ? RTCRtpReceiver.getCapabilities('video') : null;
+    if (!caps || !caps.codecs) return undefined;
+    const names: Record<string, string> = {
+      'video/h264': 'h264', 'video/h265': 'h265', 'video/hevc': 'h265', 'video/av1': 'av1', 'video/vp8': 'vp8', 'video/vp9': 'vp9',
+    };
+    const found: string[] = [];
+    for (const codec of caps.codecs) {
+      const name = names[codec.mimeType.toLowerCase()];
+      if (name && !found.includes(name)) found.push(name);
+    }
+    return found.length > 0 ? found : undefined;
+  } catch {
+    return undefined;
+  }
+};
 type CodecChoice = CodecName | 'auto';
 
 interface StreamPlayerProps {
@@ -343,6 +363,16 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     displayId: '',
     displayName: ''
   });
+  // The other computers this host shows (through connectors), and the one
+  // chosen for this host ('' = the host's own screen).
+  const [availableSources, setAvailableSources] = useState<{ id: string; name: string; connector?: string }[]>([]);
+  const [activeSource, setActiveSource] = useState<string>(() => {
+    try { return localStorage.getItem(`lunaris_stream_source_${hostId}`) || ''; } catch { return ''; }
+  });
+  // A source that changed its video codec asks for the session to be started again.
+  const [sourceRestart, setSourceRestart] = useState(0);
+  const sourceRestartsRef = useRef(0);
+  const lastSourceRestartRef = useRef(0);
   const [availableDisplays, setAvailableDisplays] = useState<{id: string; name: string; width: number; height: number; refresh_rate: number; is_primary: boolean}[]>([]);
   const [useNativeClient, setUseNativeClient] = useState<boolean>(() => {
     if (typeof window.RTCPeerConnection === 'undefined') {
@@ -1320,6 +1350,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
               app_id: selectedAppId,
               encoder: activeEncoder !== 'auto' ? activeEncoder : undefined,
               display_id: activeDisplay !== 'default' ? activeDisplay : undefined,
+              source_id: activeSource || undefined,
+              decode_codecs: decodableCodecs(),
               chroma: activeChroma === '444' ? '444' : undefined,
               microphone: (() => { try { return localStorage.getItem('lunaris_stream_microphone') === 'true'; } catch { return false; } })() ? true : undefined
             }
@@ -1348,7 +1380,22 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
 
           case "CapabilitiesResponse":
             addLog(`Received capabilities: ${payload.displays?.length || 0} displays, ${payload.encoders?.length || 0} encoders`);
-            if (payload.displays) setAvailableDisplays(payload.displays);
+            // While a source is shown the display list is the source's own
+            // (it comes on the general channel as "source_displays").
+            if (payload.displays && !activeSource) setAvailableDisplays(payload.displays);
+            {
+              // No list: an agent or a server from before sources, which
+              // shows the host's own screen whatever was asked for.
+              const sources: any[] = Array.isArray(payload.sources) ? payload.sources : [];
+              setAvailableSources(sources);
+              // A source this host does not have (any more) is not asked for
+              // again: the choice goes back to the host's own screen.
+              if (activeSource && !sources.some((s: any) => s.id === activeSource)) {
+                addLog('The chosen source is not one of this host; showing the host itself.');
+                try { localStorage.removeItem(`lunaris_stream_source_${hostId}`); } catch { /* private mode */ }
+                setActiveSource('');
+              }
+            }
             if (payload.encoders) setAvailableEncoders(payload.encoders);
             if (payload.gpu_info) setAgentGpuInfo(payload.gpu_info);
             if (payload.host_os) setAgentHostOs(String(payload.host_os).toLowerCase());
@@ -1429,6 +1476,28 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
             setErrorMsg("The remote host ended the streaming session.");
             break;
             
+          case "SourceStatus": {
+            // About the computer the host shows through a connector.
+            const reason = String(payload?.reason || '');
+            addLog(`Source ${payload?.status}: ${reason}`);
+            // Restarts close together count; one after a while starts the count again.
+            if (Date.now() - lastSourceRestartRef.current > 30000) sourceRestartsRef.current = 0;
+            if (payload?.status === 'restart' && sourceRestartsRef.current < 3) {
+              // Its video codec changed: the same session again finds the new one.
+              sourceRestartsRef.current += 1;
+              lastSourceRestartRef.current = Date.now();
+              setStatus("Connecting...");
+              setSourceRestart(n => n + 1);
+            } else {
+              cleanup();
+              setErrorMsg(payload?.status === 'failed'
+                ? t('Could not connect to the other computer: %1', t(reason))
+                : t('The other computer ended the session: %1', t(reason)));
+              setStatus("Error");
+            }
+            break;
+          }
+
           case "AccessRequest": {
             // Added without its password: the person there accepts or not.
             const refusal = accessRefusal(String(payload?.status || ''));
@@ -1476,7 +1545,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       cleanup();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, activeResolution, activeCodec, token, hostName, selectedAppId, useNativeClient, activeInputProtocol, useCanvasRenderer, activeEncoder, activeDisplay, activeChroma]);
+  }, [hostId, activeResolution, activeCodec, token, hostName, selectedAppId, useNativeClient, activeInputProtocol, useCanvasRenderer, activeEncoder, activeDisplay, activeChroma, activeSource, sourceRestart]);
 
   // Fetch display/encoder capabilities from agent when host is selected (before stream starts)
   useEffect(() => {
@@ -2093,6 +2162,14 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
 
     try {
       const message = JSON.parse(text);
+      if (message?.type === 'source_displays' && Array.isArray(message.displays)) {
+        // The displays of the computer shown through a connector.
+        setAvailableDisplays(message.displays.map((d: any) => ({
+          id: String(d.id), name: String(d.name), width: Number(d.width) || 0, height: Number(d.height) || 0,
+          refresh_rate: 0, is_primary: String(d.id) === String(message.current),
+        })));
+        return;
+      }
       if (message?.type !== 'host_cursor') return;
 
       const x = Number(message.x);
@@ -2334,7 +2411,11 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         const caps = RTCRtpReceiver.getCapabilities('video');
         if (caps && caps.codecs) {
           // Build ordered codec preference: put selected codec first, keep RED/ULPFEC/FlexFEC
-          const mimeTarget = codecForSession === 'h265' ? ['video/h265', 'video/hevc']
+          // A computer shown through a connector sends what it encodes, which can be
+          // VP8 or VP9: the offer then names that codec and the answer must take it.
+          const offeredVpx = /^a=rtpmap:\d+ (VP8|VP9)\/90000/im.exec(offerSdp)?.[1].toLowerCase();
+          const mimeTarget = offeredVpx ? [`video/${offeredVpx}`]
+            : codecForSession === 'h265' ? ['video/h265', 'video/hevc']
             : codecForSession === 'av1' ? ['video/av1']
             : ['video/h264'];
           const preferred = caps.codecs.filter(c =>
@@ -2849,6 +2930,20 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       setActiveInputProtocol(value);
       setDraftInputProtocol(value);
       if (value !== activeInputProtocol) setStatus("Connecting...");
+    } else if (key === 'source') {
+      try {
+        if (value) localStorage.setItem(`lunaris_stream_source_${hostId}`, value);
+        else localStorage.removeItem(`lunaris_stream_source_${hostId}`);
+      } catch { /* private mode */ }
+      if (value !== activeSource) {
+        // The displays are those of the computer shown: start from its own choice.
+        localStorage.setItem('lunaris_stream_display', 'default');
+        setActiveDisplay('default');
+        setAvailableDisplays([]);
+        sourceRestartsRef.current = 0;
+        setStatus("Connecting...");
+        setActiveSource(value);
+      }
     } else if (key === 'display') {
       localStorage.setItem('lunaris_stream_display', value);
       setActiveDisplay(value);
@@ -4135,6 +4230,21 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
             WebTransport
           </option>
         </select>
+
+        {/* Source Dropdown: the host's own screen or a computer it shows */}
+        {availableSources.length > 0 && (
+          <select
+            value={activeSource}
+            onChange={(e) => updateSetting('source', e.target.value)}
+            className="stream-select"
+            title={t('Computer to show')}
+          >
+            <option value="">{t('This computer')}</option>
+            {availableSources.map(s => (
+              <option key={s.id} value={s.id}>{s.name}</option>
+            ))}
+          </select>
+        )}
 
         {/* Display Dropdown */}
         <select

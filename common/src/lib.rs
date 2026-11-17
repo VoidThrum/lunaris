@@ -210,6 +210,17 @@ pub struct DisplayInfoMsg {
     pub is_primary: bool,
 }
 
+/// A computer a host can show besides its own screen. Only the name: what
+/// it takes to connect to it (address, password) stays at the host.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SourceInfoMsg {
+    pub id: String,
+    pub name: String,
+    /// The connector's id ("rustdesk", ...), for an icon or a label.
+    #[serde(default)]
+    pub connector: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "payload")]
 pub enum SignalingMessage {
@@ -233,6 +244,14 @@ pub enum SignalingMessage {
         /// Also record the host's microphone into the stream's sound.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         microphone: Option<bool>,
+        /// The source to show: one of the host's `sources` (a computer it
+        /// shows through a connector). None = the host's own screen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<String>,
+        /// The video codecs the client can decode ("h264", "h265", "av1",
+        /// "vp8", "vp9"). None = a client from before this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decode_codecs: Option<Vec<String>>,
     },
     // Server notifying agent about session request
     IncomingSession {
@@ -255,6 +274,14 @@ pub enum SignalingMessage {
         /// Also record the host's microphone into the stream's sound.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         microphone: Option<bool>,
+        /// The source to show: one of the host's `sources` (a computer it
+        /// shows through a connector). None = the host's own screen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<String>,
+        /// The video codecs the client can decode ("h264", "h265", "av1",
+        /// "vp8", "vp9"). None = a client from before this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decode_codecs: Option<Vec<String>>,
         ice_servers: Option<Vec<RtcIceServer>>,
         /// Who asks (user name, computer name), shown to the person at the
         /// host when the connection must be accepted there.
@@ -322,6 +349,9 @@ pub enum SignalingMessage {
         encoders: Vec<String>,
         gpu_info: Option<String>,
         host_os: Option<String>,
+        /// The other computers this host can show (through connectors).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<SourceInfoMsg>,
     },
     EncoderStatus {
         target_id: String,
@@ -339,6 +369,17 @@ pub enum SignalingMessage {
     AccessRequest {
         target_id: String,
         status: String,
+    },
+    /// Agent -> client, about the source of the session (a computer shown
+    /// through a connector): `status` is "failed" (it could not be
+    /// connected to; no session follows) or "ended" (it closed; the session
+    /// is over). `reason` is a text for the person. Clients, servers and
+    /// agents from before this message drop it.
+    SourceStatus {
+        target_id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     // Errors
     Error {

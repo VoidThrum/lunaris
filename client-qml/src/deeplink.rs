@@ -196,6 +196,7 @@ pub fn parse_deeplink_url(url_str: &str) -> Option<AppArgs> {
         input_protocol,
         encoder,
         display_id,
+        source_id: None,
     })
 }
 

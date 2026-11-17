@@ -15,7 +15,7 @@ ApplicationWindow {
     color: Theme.bg
     flags: Qt.Window
 
-    readonly property int baseHeight: directEnabled ? 880 : 760
+    readonly property int baseHeight: directEnabled ? 904 : 784
 
     // Grow the window while the activity log is open.
     onShowLogChanged: {
@@ -47,6 +47,23 @@ ApplicationWindow {
     property int rustdeskPort: 21118
     property string directPassword: ""
     property var directAddresses: []
+    // Sources: other computers this one shows, each through a connector
+    // (agent/src/connector). `sources` has names only: what a source's
+    // fields hold (address, password) is never sent back to this window.
+    property bool showSources: false
+    property var sources: []
+    property var connectors: []
+    property string sourceConnectorId: ""
+    property string sourceError: ""
+    readonly property var sourceConnector: {
+        for (var i = 0; i < connectors.length; i++)
+            if (connectors[i].id === sourceConnectorId) return connectors[i]
+        return null
+    }
+    // This window is in English; the sources page is also in Vietnamese
+    // for a Vietnamese system.
+    readonly property bool vietnamese: Qt.locale().name.indexOf("vi") === 0
+    function tr(en, vi) { return vietnamese ? vi : en }
 
     readonly property string statusText: agentConnected ? "Online"
         : (agentActive ? (directEnabled ? "Ready for direct connections" : "Connecting…") : "Offline")
@@ -77,6 +94,22 @@ ApplicationWindow {
     // Direct-connection settings apply when sharing (re)starts.
     function restartIfSharing() { if (window.agentActive) { bridge.stopAgent(); restartTimer.restart() } }
     function copyText(t) { clipHelper.text = t; clipHelper.selectAll(); clipHelper.copy(); clipHelper.text = "" }
+    function addSource() {
+        var name = sourceName.text.trim()
+        if (name === "") { window.sourceError = tr("Give the computer a name", "Hãy đặt tên cho máy"); return }
+        var values = {}
+        for (var i = 0; i < sourceFields.count; i++) {
+            var item = sourceFields.itemAt(i)
+            if (!item) continue
+            if (item.field.required && item.value.trim() === "") {
+                window.sourceError = tr("%1 is required", "Cần nhập %1").arg(item.field.label)
+                return
+            }
+            values[item.field.key] = item.value
+        }
+        window.sourceError = ""
+        bridge.addSource(name, window.sourceConnectorId, JSON.stringify(values))
+    }
     function flash(msg, isError) { window.notice = msg; window.noticeError = isError; noticeTimer.restart() }
 
     // ── Timers ──
@@ -366,6 +399,21 @@ ApplicationWindow {
             }
         }
 
+        // Sources: the page is over the window (showSources).
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+            Text {
+                Layout.fillWidth: true
+                text: tr("Other computers this one shows", "Máy khác mà máy này hiển thị") + " (" + window.sources.length + ")"
+                color: Theme.text; font.pixelSize: 13; elide: Text.ElideRight
+            }
+            LinkButton {
+                text: tr("Manage", "Quản lý")
+                onClicked: { window.sourceError = ""; bridge.loadSources(); window.showSources = true }
+            }
+        }
+
         // Options
         ColumnLayout {
             Layout.fillWidth: true
@@ -451,9 +499,205 @@ ApplicationWindow {
         Item { Layout.fillHeight: !window.showLog }
     }
 
+    // ── Sources page ──
+    Rectangle {
+        anchors.fill: parent
+        z: 10
+        visible: window.showSources
+        color: Theme.bg
+        // Nothing underneath gets the clicks or the wheel.
+        MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons; onWheel: (wheel) => wheel.accepted = true }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 20
+            spacing: 12
+
+            RowLayout {
+                Layout.fillWidth: true
+                Text {
+                    Layout.fillWidth: true
+                    text: tr("Other computers", "Máy tính khác")
+                    color: Theme.textStrong; font.pixelSize: 17; font.weight: Font.DemiBold
+                }
+                LinkButton {
+                    text: tr("Back", "Quay lại")
+                    // Closing drops what was typed in the form, the password with it.
+                    onClicked: { window.showSources = false; sourceName.text = ""; window.sourceError = "" }
+                }
+            }
+
+            Flickable {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                contentWidth: width
+                contentHeight: sourcesCol.implicitHeight
+                ScrollBar.vertical: ScrollBar {}
+
+                ColumnLayout {
+                    id: sourcesCol
+                    width: parent.width
+                    spacing: 12
+
+                    Text {
+                        Layout.fillWidth: true; wrapMode: Text.Wrap
+                        text: tr("Computers this one can show to the people who connect to it, for example a RustDesk computer on your network.",
+                                 "Những máy mà máy này hiển thị được cho người kết nối tới nó, ví dụ một máy RustDesk trong mạng của bạn.")
+                        color: Theme.textMuted; font.pixelSize: 12
+                    }
+                    Text {
+                        Layout.fillWidth: true; wrapMode: Text.Wrap
+                        text: tr("Anyone who may use this computer may also use these computers.",
+                                 "Ai được dùng máy này thì cũng dùng được các máy này.")
+                        color: Theme.text; font.pixelSize: 12
+                    }
+                    Text {
+                        Layout.fillWidth: true; wrapMode: Text.Wrap
+                        text: tr("The address and password stay on this computer; the server and the viewers only see the name.",
+                                 "Địa chỉ và mật khẩu chỉ nằm trên máy này; server và người xem chỉ thấy tên.")
+                        color: Theme.textMuted; font.pixelSize: 12
+                    }
+
+                    // The sources there are: name and connector, and a way to remove each.
+                    Card {
+                        Layout.fillWidth: true
+                        implicitHeight: sourceListCol.implicitHeight + 28
+                        ColumnLayout {
+                            id: sourceListCol
+                            anchors.fill: parent; anchors.margins: 14
+                            spacing: 8
+                            SectionLabel { text: tr("COMPUTERS", "MÁY TÍNH") }
+                            Text {
+                                visible: window.sources.length === 0
+                                text: tr("No other computers yet.", "Chưa có máy nào khác.")
+                                color: Theme.textMuted; font.pixelSize: 12
+                            }
+                            Repeater {
+                                model: window.sources
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 1
+                                        Text { Layout.fillWidth: true; text: modelData.name; color: Theme.textStrong; font.pixelSize: 13; elide: Text.ElideRight }
+                                        Text { Layout.fillWidth: true; text: modelData.connector_name; color: Theme.textMuted; font.pixelSize: 11; elide: Text.ElideRight }
+                                    }
+                                    LinkButton {
+                                        text: tr("Remove", "Xoá")
+                                        Accessible.name: text + " " + modelData.name
+                                        onClicked: bridge.removeSource(modelData.id)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Add one: name, connector, then the connector's own fields.
+                    Card {
+                        Layout.fillWidth: true
+                        implicitHeight: sourceFormCol.implicitHeight + 28
+                        ColumnLayout {
+                            id: sourceFormCol
+                            anchors.fill: parent; anchors.margins: 14
+                            spacing: 8
+                            SectionLabel { text: tr("ADD A COMPUTER", "THÊM MÁY TÍNH") }
+                            Text { text: tr("Name (what viewers see)", "Tên (người xem sẽ thấy)"); color: Theme.text; font.pixelSize: 12 }
+                            Field { id: sourceName; maximumLength: 64; Accessible.name: tr("Name", "Tên") }
+
+                            Text { visible: window.connectors.length > 1; text: tr("Connect with", "Kết nối bằng"); color: Theme.text; font.pixelSize: 12 }
+                            Flow {
+                                visible: window.connectors.length > 1
+                                Layout.fillWidth: true
+                                spacing: 6
+                                Repeater {
+                                    model: window.connectors
+                                    Rectangle {
+                                        readonly property bool chosen: modelData.id === window.sourceConnectorId
+                                        implicitHeight: 28
+                                        implicitWidth: connectorLabel.implicitWidth + 20
+                                        radius: Theme.radiusSm
+                                        color: chosen ? Theme.accentA(0.18) : Theme.surface2
+                                        border.width: 1
+                                        border.color: chosen ? Theme.accent : Theme.borderStrong
+                                        Accessible.role: Accessible.RadioButton
+                                        Accessible.name: modelData.name
+                                        Text { id: connectorLabel; anchors.centerIn: parent; text: modelData.name; color: Theme.textStrong; font.pixelSize: 12 }
+                                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: window.sourceConnectorId = modelData.id }
+                                    }
+                                }
+                            }
+                            Text {
+                                visible: window.connectors.length === 1
+                                text: window.sourceConnector ? window.sourceConnector.name : ""
+                                color: Theme.textMuted; font.pixelSize: 12
+                            }
+
+                            Repeater {
+                                id: sourceFields
+                                // Only while the page is open, so that nothing typed outlives it.
+                                model: window.showSources && window.sourceConnector ? window.sourceConnector.fields : []
+                                ColumnLayout {
+                                    readonly property var field: modelData
+                                    property alias value: sourceFieldInput.text
+                                    Layout.fillWidth: true
+                                    spacing: 4
+                                    Text { text: modelData.label + (modelData.required ? " *" : ""); color: Theme.text; font.pixelSize: 12 }
+                                    Field {
+                                        id: sourceFieldInput
+                                        text: modelData["default"] || ""
+                                        echoMode: modelData.kind === "secret" ? TextInput.Password : TextInput.Normal
+                                        validator: modelData.kind === "port" ? sourcePortValidator : null
+                                        Accessible.name: modelData.label
+                                        onAccepted: window.addSource()
+                                    }
+                                }
+                            }
+                            IntValidator { id: sourcePortValidator; bottom: 1; top: 65535 }
+
+                            Text {
+                                Layout.fillWidth: true; wrapMode: Text.Wrap
+                                visible: window.sourceError !== ""
+                                text: window.sourceError
+                                color: Theme.danger; font.pixelSize: 12
+                            }
+                            GhostButton {
+                                label: tr("Add", "Thêm")
+                                visible: window.connectors.length > 0
+                                onClicked: window.addSource()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── Signals ──
     Connections {
         target: bridge
+        function onSourcesLoaded(json) {
+            try {
+                var listing = JSON.parse(json.toString())
+                window.sources = listing.sources || []
+                window.connectors = listing.connectors || []
+            } catch (e) {
+                console.log("sources: " + e)
+            }
+            if (!window.sourceConnector)
+                window.sourceConnectorId = window.connectors.length > 0 ? window.connectors[0].id : ""
+        }
+        function onSourceSaved(error) {
+            window.sourceError = error.toString()
+            if (window.sourceError !== "") return
+            // A new form: the name gone, the fields back to their defaults
+            // (the password with them).
+            sourceName.text = ""
+            var id = window.sourceConnectorId
+            window.sourceConnectorId = ""
+            window.sourceConnectorId = id
+        }
         function onStatusChanged(active, connected) { window.agentActive = active; window.agentConnected = connected }
         function onLogMessage(msg) {
             var m = msg.toString ? msg.toString() : String(msg)
@@ -488,5 +732,5 @@ ApplicationWindow {
     }
 
     onClosing: (close) => { if (window.closeToTray) { close.accepted = false; window.hide() } }
-    Component.onCompleted: { bridge.loadConfig(); bridge.loadDirectConfig(); window.show() }
+    Component.onCompleted: { bridge.loadConfig(); bridge.loadDirectConfig(); bridge.loadSources(); window.show() }
 }

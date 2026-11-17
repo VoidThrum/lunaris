@@ -13,7 +13,7 @@ Rectangle {
     property string username: ""
     property string serverUrl: ""
 
-    signal startSessionRequested(string server, string token, string hostId, string hostName, int appId, string res, int fps, string codec, int bitrate, int queueLimit, bool disableCuda, string renderBackend, string inputProtocol, string encoder, string displayId)
+    signal startSessionRequested(string server, string token, string hostId, string hostName, int appId, string res, int fps, string codec, int bitrate, int queueLimit, bool disableCuda, string renderBackend, string inputProtocol, string encoder, string displayId, string sourceId)
 
     // Internal UI state properties
     property bool isLoggedIn: false
@@ -46,7 +46,7 @@ Rectangle {
             dashboardRoot.configRes, dashboardRoot.configFps, dashboardRoot.configCodec,
             dashboardRoot.configBitrate, dashboardRoot.configQueueLimit, dashboardRoot.configDisableCuda,
             dashboardRoot.configRenderBackend, dashboardRoot.configInputProtocol,
-            dashboardRoot.configEncoder, dashboardRoot.configDisplay);
+            dashboardRoot.configEncoder, dashboardRoot.configDisplay, "");
     }
 
 
@@ -69,7 +69,14 @@ Rectangle {
             dashboardRoot.configRes, dashboardRoot.configFps, dashboardRoot.configCodec,
             dashboardRoot.configBitrate, dashboardRoot.configQueueLimit, dashboardRoot.configDisableCuda,
             dashboardRoot.configRenderBackend, dashboardRoot.configInputProtocol,
-            dashboardRoot.configEncoder, dashboardRoot.configDisplay);
+            dashboardRoot.configEncoder, dashboardRoot.configDisplay, dashboardRoot.sourceFor(host));
+    }
+
+    // The source chosen in the stream settings belongs to the computer they
+    // were opened for: another computer shows its own screen.
+    function sourceFor(host) {
+        return (host && dashboardRoot.activeConfigHost && dashboardRoot.activeConfigHost.id === host.id)
+            ? dashboardRoot.configSource : "";
     }
 
     property var hostsList: []
@@ -94,6 +101,8 @@ Rectangle {
     property string configInputProtocol: "webrtc"
     property string configEncoder: "auto"
     property string configDisplay: "default"
+    // The source of `activeConfigHost` to show; "" = its own screen.
+    property string configSource: ""
     property var pendingDeleteHost: null
 
 
@@ -1016,10 +1025,11 @@ Rectangle {
                                                 dashboardRoot.configInputProtocol = "webrtc";
                                                 dashboardRoot.configEncoder = "auto";
                                                 dashboardRoot.configDisplay = "default";
+                                                dashboardRoot.configSource = "";
                                             }
                                             dashboardRoot.activeConfigHost = modelData;
                                             settingsModal.hostName = modelData.name;
-                                            settingsModal.setCurrentSettings(dashboardRoot.configRes, dashboardRoot.configFps, dashboardRoot.configCodec, dashboardRoot.configBitrate, dashboardRoot.configQueueLimit, dashboardRoot.configDisableCuda, dashboardRoot.configInputProtocol, dashboardRoot.configEncoder, dashboardRoot.configDisplay, dashboardRoot.configRenderBackend);
+                                            settingsModal.setCurrentSettings(dashboardRoot.configRes, dashboardRoot.configFps, dashboardRoot.configCodec, dashboardRoot.configBitrate, dashboardRoot.configQueueLimit, dashboardRoot.configDisableCuda, dashboardRoot.configInputProtocol, dashboardRoot.configEncoder, dashboardRoot.configDisplay, dashboardRoot.configRenderBackend, dashboardRoot.configSource);
                                             // Fetch encoder/display capabilities from agent
                                             if (dashboardRoot.serverUrl && dashboardRoot.token && modelData.id) {
                                                 bridge.fetchCapabilities(dashboardRoot.serverUrl, dashboardRoot.token, modelData.id);
@@ -1208,7 +1218,8 @@ Rectangle {
                                     dashboardRoot.configRenderBackend,
                                     dashboardRoot.configInputProtocol,
                                     dashboardRoot.configEncoder,
-                                    dashboardRoot.configDisplay
+                                    dashboardRoot.configDisplay,
+                                    dashboardRoot.sourceFor(dashboardRoot.selectedHost)
                                 );
                             }
                         }
@@ -1359,7 +1370,8 @@ Rectangle {
                                             dashboardRoot.configRenderBackend,
                                             dashboardRoot.configInputProtocol,
                                             dashboardRoot.configEncoder,
-                                            dashboardRoot.configDisplay
+                                            dashboardRoot.configDisplay,
+                                            dashboardRoot.sourceFor(dashboardRoot.selectedHost)
                                         );
                                     }
                                 }
@@ -1500,7 +1512,7 @@ Rectangle {
         anchors.fill: parent
         z: 1000
 
-        onApplySettings: (res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId) => {
+        onApplySettings: (res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId, sourceId) => {
             dashboardRoot.configRes = res;
             dashboardRoot.configFps = fps;
             dashboardRoot.configCodec = codec;
@@ -1511,6 +1523,7 @@ Rectangle {
             dashboardRoot.configInputProtocol = inputProtocol;
             dashboardRoot.configEncoder = encoder;
             dashboardRoot.configDisplay = displayId;
+            dashboardRoot.configSource = sourceId;
         }
     }
 

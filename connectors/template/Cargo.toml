@@ -1,0 +1,15 @@
+[package]
+name = "connector-template"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "A minimal external Lunaris connector: plays a recorded test pattern and exercises every message of the protocol"
+publish = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Nothing of Lunaris is needed to build this: the folder can be copied out
+# and built by itself. (The test that runs it through the agent's adapter is
+# in the agent: agent/tests/connector_template.rs.)

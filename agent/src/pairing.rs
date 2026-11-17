@@ -83,6 +83,13 @@ pub struct AgentConfig {
     /// 21118.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rustdesk_port: Option<u16>,
+    /// Other computers this one shows to its viewers, through connectors
+    /// (connector/mod.rs): `[{"id", "name", "connector", and the connector's
+    /// fields (address, password, ...)}]`. Whoever may use this computer may
+    /// use them. The fields stay in this file; viewers and the server see
+    /// the id and the name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<crate::connector::SourceConfig>,
 }
 
 impl Default for AgentConfig {

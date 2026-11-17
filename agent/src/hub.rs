@@ -153,6 +153,7 @@ pub fn target_of(sig: &SignalingMessage) -> Option<&str> {
         | GetCapabilities { target_id }
         | CapabilitiesResponse { target_id, .. }
         | EncoderStatus { target_id, .. }
+        | SourceStatus { target_id, .. }
         | AccessRequest { target_id, .. } => Some(target_id),
         Error { .. } => None,
     }
@@ -174,6 +175,7 @@ pub fn with_target(mut sig: SignalingMessage, target: &str) -> SignalingMessage 
         | GetCapabilities { target_id }
         | CapabilitiesResponse { target_id, .. }
         | EncoderStatus { target_id, .. }
+        | SourceStatus { target_id, .. }
         | AccessRequest { target_id, .. } => *target_id = target.to_string(),
         Error { .. } => {}
     }
@@ -200,6 +202,8 @@ pub fn from_direct_client(sig: SignalingMessage, conn_id: &str) -> Option<Signal
             chroma,
             encoder_csc_mode,
             microphone,
+            source_id,
+            decode_codecs,
         } => Some(IncomingSession {
             client_id: conn_id.to_string(),
             width,
@@ -213,6 +217,8 @@ pub fn from_direct_client(sig: SignalingMessage, conn_id: &str) -> Option<Signal
             chroma,
             encoder_csc_mode,
             microphone,
+            source_id,
+            decode_codecs,
             ice_servers: None,
             requester: None,
         }),
@@ -275,9 +281,13 @@ mod tests {
             chroma: Some("444".into()),
             encoder_csc_mode: Some(5),
             microphone: Some(true),
+            source_id: Some("office-pc".into()),
+            decode_codecs: Some(vec!["h264".into(), "vp8".into()]),
         };
         match from_direct_client(req, "direct-1") {
-            Some(SignalingMessage::IncomingSession { client_id, width, chroma, encoder_csc_mode, microphone, ice_servers, .. }) => {
+            Some(SignalingMessage::IncomingSession { client_id, width, chroma, encoder_csc_mode, microphone, ice_servers, source_id, decode_codecs, .. }) => {
+                assert_eq!(source_id.as_deref(), Some("office-pc"));
+                assert_eq!(decode_codecs, Some(vec!["h264".to_string(), "vp8".to_string()]));
                 assert_eq!(microphone, Some(true));
                 assert_eq!(client_id, "direct-1");
                 assert_eq!(width, Some(1920));

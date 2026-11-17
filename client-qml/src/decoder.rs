@@ -51,6 +51,22 @@ pub enum CodecType {
     AV1,
 }
 
+/// The video codecs this client can take, as the names of the session
+/// request ("h264", "h265", "av1"): those the receiver can unpack from RTP
+/// (the three of `CodecType`; there is no VP8 or VP9 depacketizer here) and
+/// that this FFmpeg has a decoder for.
+pub fn decodable_codecs() -> Vec<String> {
+    [
+        ("h264", ffi::AVCodecID::AV_CODEC_ID_H264),
+        ("h265", ffi::AVCodecID::AV_CODEC_ID_HEVC),
+        ("av1", ffi::AVCodecID::AV_CODEC_ID_AV1),
+    ]
+    .into_iter()
+    .filter(|(_, id)| !unsafe { ffi::avcodec_find_decoder(*id) }.is_null())
+    .map(|(name, _)| name.to_string())
+    .collect()
+}
+
 pub struct YUVFrame {
     pub width: i32,
     pub height: i32,

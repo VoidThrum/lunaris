@@ -14,7 +14,9 @@ use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::media_engine::{
     MIME_TYPE_AV1, MIME_TYPE_FLEX_FEC03, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS,
+    MIME_TYPE_VP8, MIME_TYPE_VP9,
 };
+use rtc::rtp::codec::vp8::Vp8Payloader;
 use rtc::rtp::{
     extension::{
         abs_send_time_extension::AbsSendTimeExtension,
@@ -50,6 +52,7 @@ use crate::video::h264::payloader::H264Payloader;
 use crate::video::h264::reader::H264Reader;
 use crate::video::h265::payloader::H265Payloader;
 use crate::video::h265::reader::H265Reader;
+use crate::video::vp9::LunarisVp9Payloader;
 use crate::video::{frame_buffer, trim_bytes_to_range};
 
 // We reuse the same channel IDs
@@ -251,6 +254,9 @@ pub enum VideoPayloader {
     H264(H264Payloader),
     H265(H265Payloader),
     Av1(LunarisAv1Payloader),
+    /// Only for a picture a connector brings (the host itself does not encode VP8 or VP9).
+    Vp8(Vp8Payloader),
+    Vp9(LunarisVp9Payloader),
 }
 
 fn encoder_supports_codec(
@@ -339,6 +345,11 @@ pub async fn setup_bridge_session(
     encoder_csc_mode: Option<i32>,
     microphone: bool,
     ice_servers: Option<Vec<common::RtcIceServer>>,
+    // The computer to show instead of this one's screen (a source of the
+    // agent's config, through its connector).
+    source: Option<crate::connector::Target>,
+    // The codecs the client says it decodes; None from older clients.
+    decode_codecs: Option<Vec<String>>,
 ) -> Result<Arc<BridgeSession>> {
     info!("Media library active: host cursor visible by default (toggle with Ctrl+Alt+Shift+N)");
     // Do NOT hide host cursor by default — keeping cursor visible ensures:
@@ -386,18 +397,30 @@ pub async fn setup_bridge_session(
     // Resolve codec settings before registering WebRTC codecs. The SDP offer
     // must only advertise the codec the host can actually encode; otherwise
     // the answer can select H.265 while the RTP track is configured for H.264.
-    let encoders = lunaris_media::encode::list_available_encoders();
+    // A source: the picture and the sound come from another computer,
+    // through a connector, as it encodes them. Nothing is encoded here
+    // then, and no encoder is tried. (LUNARIS_CONNECTOR_TEST_TARGET names
+    // one for tests; see connector/media.rs.) A source that cannot be shown
+    // is an error of the session: this computer's own screen is never shown
+    // in its place.
+    let connector_target = match crate::connector::media::test_target().map_err(|e| crate::connector::SourceError(e.to_string()))? {
+        Some(target) => Some(target),
+        None => source,
+    };
+    let encoders = if connector_target.is_some() { Vec::new() } else { lunaris_media::encode::list_available_encoders() };
     // Listed encoders are only candidates: H.265 and AV1 are supported when
     // a hardware encoder for them really opens (cached per codec and size).
     let hevc_supported = codec_supported_for_realtime(
         &encoders,
         lunaris_media::VideoCodec::H265,
-        hardware_encoder_opens(lunaris_media::VideoCodec::H265, resolution_width, resolution_height, stream_fps).await,
+        connector_target.is_none()
+            && hardware_encoder_opens(lunaris_media::VideoCodec::H265, resolution_width, resolution_height, stream_fps).await,
     );
     let av1_supported = codec_supported_for_realtime(
         &encoders,
         lunaris_media::VideoCodec::AV1,
-        hardware_encoder_opens(lunaris_media::VideoCodec::AV1, resolution_width, resolution_height, stream_fps).await,
+        connector_target.is_none()
+            && hardware_encoder_opens(lunaris_media::VideoCodec::AV1, resolution_width, resolution_height, stream_fps).await,
     );
     if codec_str == "av1" && !av1_supported {
         info!("AV1 requested but host doesn't support it, falling back to H.264");
@@ -413,6 +436,17 @@ pub async fn setup_bridge_session(
         info!("YUV 4:4:4 requested with {} — switching to H.264 High 4:4:4", codec_str);
         codec_str = "h264".to_string();
     }
+    // The other computer is logged in to first: the codec offered to the
+    // viewer is the one it sends.
+    let connector_source = match connector_target {
+        Some(target) => {
+            let source = crate::connector::media::open(&target, &requested_codec, decode_codecs.as_deref(), stream_fps).await?;
+            codec_str = crate::connector::media::codec_name(source.codec).to_string();
+            Some(source)
+        }
+        None => None,
+    };
+    let from_connector = connector_source.is_some();
     // Level 4.2 (0x2a) covers 1080p60; 0xf4 = High 4:4:4 Predictive.
     let h264_fmtp = if yuv444 {
         "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=f4002a"
@@ -460,6 +494,18 @@ pub async fn setup_bridge_session(
             "profile=0".to_string(),
             102,
             VideoPayloader::Av1(LunarisAv1Payloader::new()),
+        ),
+        "vp9" => (
+            MIME_TYPE_VP9.to_string(),
+            "profile-id=0".to_string(),
+            100,
+            VideoPayloader::Vp9(LunarisVp9Payloader::new()),
+        ),
+        "vp8" => (
+            MIME_TYPE_VP8.to_string(),
+            String::new(),
+            104,
+            VideoPayloader::Vp8(Vp8Payloader::default()),
         ),
         _ => (
             MIME_TYPE_H264.to_string(),
@@ -884,13 +930,39 @@ pub async fn setup_bridge_session(
         .await?;
 
     // Clipboard sharing (share.rs); files have their own connection (files.rs).
-    match crate::share::attach(&peer_connection, agent_config.allow_clipboard).await {
-        Ok(tasks) => spawned_tasks.extend(tasks),
-        Err(e) => warn!("Clipboard channel unavailable: {}", e),
-    }
-    // Game controllers (gamepad.rs).
-    if let Err(e) = crate::gamepad::attach(&peer_connection).await {
-        warn!("Controller channel unavailable: {}", e);
+    // With a source, the viewer's clipboard text and input are for the
+    // computer shown: they go to the connector (connector/media.rs), and
+    // this computer's clipboard, pointer, keyboard and controllers are left
+    // alone.
+    let (viewer_input_tx, viewer_input_rx) = tokio::sync::mpsc::unbounded_channel::<crate::connector::media::ViewerInput>();
+    let (source_clipboard_tx, source_clipboard_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    if from_connector {
+        let (set_tx, set_rx) = std::sync::mpsc::channel::<String>();
+        let to_source = viewer_input_tx.clone();
+        std::thread::Builder::new()
+            .name("lunaris-source-clipboard".into())
+            .spawn(move || {
+                while let Ok(text) = set_rx.recv() {
+                    if to_source.send(crate::connector::media::ViewerInput::Clipboard(text)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn the clipboard forwarder");
+        match crate::share::attach_link(&peer_connection, set_tx, source_clipboard_rx).await {
+            Ok(tasks) => spawned_tasks.extend(tasks),
+            Err(e) => warn!("Clipboard channel unavailable: {}", e),
+        }
+    } else {
+        drop(source_clipboard_rx);
+        match crate::share::attach(&peer_connection, agent_config.allow_clipboard).await {
+            Ok(tasks) => spawned_tasks.extend(tasks),
+            Err(e) => warn!("Clipboard channel unavailable: {}", e),
+        }
+        // Game controllers (gamepad.rs).
+        if let Err(e) = crate::gamepad::attach(&peer_connection).await {
+            warn!("Controller channel unavailable: {}", e);
+        }
     }
 
     // Handle messages on Data Channels
@@ -981,6 +1053,7 @@ pub async fn setup_bridge_session(
         microphone,
     };
 
+    #[allow(unused_mut)]
     let (pipeline, mut media_event_rx, pipeline_cmd_tx) =
         lunaris_media::pipeline::MediaPipeline::new(media_config);
 
@@ -990,7 +1063,55 @@ pub async fn setup_bridge_session(
     let audio_tx_clone = audio_tx.clone();
     let display_id_for_pipeline = display_id.clone();
 
+    // With a connector as the source the pipeline is never run (nothing is
+    // captured or encoded here) and what the session asks of it (key frame,
+    // frame rate, stop) goes to the connector.
+    if let Some(source) = connector_source {
+        let (connector_cmd_tx, connector_cmd_rx) = tokio::sync::mpsc::channel(16);
+        *pipeline_cmd_tx_shared.lock().unwrap() = Some(connector_cmd_tx);
+        // The source's cursor goes the way the pipeline's does.
+        let (source_events_tx, source_events_rx) = tokio::sync::mpsc::channel(64);
+        media_event_rx = source_events_rx;
+        // The viewer's pointer and keys: to the connector, in the order
+        // they came (the two channels are read by one task each).
+        for mut packets in [std::mem::replace(&mut input_rx, tokio::sync::mpsc::unbounded_channel().1), std::mem::replace(&mut key_input_rx, tokio::sync::mpsc::unbounded_channel().1)] {
+            let to_source = viewer_input_tx.clone();
+            spawned_tasks.push(tokio::spawn(async move {
+                while let Some((packet, _)) = packets.recv().await {
+                    if to_source.send(crate::connector::media::ViewerInput::Packet(packet)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        spawned_tasks.push(tokio::spawn(crate::connector::media::run(
+            source,
+            crate::connector::media::ViewerLink {
+                video: video_frame_tx.clone(),
+                audio: audio_tx.clone(),
+                media_events: source_events_tx,
+                pipeline_commands: connector_cmd_rx,
+                input: viewer_input_rx,
+                clipboard: source_clipboard_tx,
+                general: general_channel_for_cursor.clone(),
+                signaling: ws_tx.clone(),
+                client_id: client_id.clone(),
+                peer_connection: peer_connection.clone(),
+                connected: webrtc_connected.clone(),
+                fps: stream_fps,
+                bitrate_kbps: stream_bitrate,
+                display: display_id.as_deref().and_then(|id| id.parse::<usize>().ok()),
+            },
+        )));
+    } else {
+        drop((viewer_input_rx, source_clipboard_tx));
+    }
+    drop(viewer_input_tx);
+
     let pipeline_task = tokio::spawn(async move {
+        if from_connector {
+            return;
+        }
         info!("Running lunaris-media pipeline...");
         let display = display_id_for_pipeline.unwrap_or_else(|| "default".to_string());
         if let Err(e) = pipeline.run(&display).await {
@@ -999,7 +1120,12 @@ pub async fn setup_bridge_session(
     });
     spawned_tasks.push(pipeline_task);
 
-    if let Some(injector) = lunaris_media::input::InputInjector::new() {
+    // The viewer's input is for the computer shown: with a connector as the
+    // source it must never reach this one (the connectors do not take input
+    // yet, so it is dropped).
+    let no_local_input = from_connector || std::env::var_os(crate::connector::media::TEST_NO_LOCAL_INPUT_ENV).is_some();
+    let local_injector = if no_local_input { None } else { lunaris_media::input::InputInjector::new() };
+    if let Some(injector) = local_injector {
         let injector = std::sync::Arc::new(injector);
         let injector_clone = injector.clone();
 
@@ -1035,6 +1161,8 @@ pub async fn setup_bridge_session(
                 info!("InputInjector: stopped keyboard input processing thread");
             })
             .expect("Failed to spawn keyboard input thread");
+    } else if from_connector {
+        info!("Showing another computer through a connector: the viewer's input is not injected here");
     } else {
         error!(
             "InputInjector: no input backend available — remote mouse/keyboard disabled. \
@@ -1248,8 +1376,13 @@ pub async fn setup_bridge_session(
         // WireGuard tunnel at 15 Mbit/s: about 9 retransmission requests per
         // second from Chrome, late frames every few seconds.
         const RTP_PACKET_BYTES: u64 = 1200;
-        let pacing_packets_in_1ms: u64 =
-            ((stream_bitrate as u64 * 1000 * 25 / 10) / 8 / RTP_PACKET_BYTES / 1000).max(1);
+        // A source's bitrate is its own, not the one asked for here: its
+        // frames are only spread over their share of the frame interval.
+        let pacing_packets_in_1ms: u64 = if from_connector {
+            1
+        } else {
+            ((stream_bitrate as u64 * 1000 * 25 / 10) / 8 / RTP_PACKET_BYTES / 1000).max(1)
+        };
         let pacing_frame_interval_ms: u64 = (1000 / stream_fps.max(1) as u64).max(1);
         // A frame leaves within a quarter of the frame interval. The desktop
         // client shows a frame when it arrives (no jitter buffer, like
@@ -1307,6 +1440,7 @@ pub async fn setup_bridge_session(
                 let mut writer_sleeps = 0u32;
                 let mut writer_write_max = Duration::ZERO;
                 let packet_count = packets.len() as u64;
+                let frame_rtp_time = packets.first().map(|packet| packet.header.timestamp);
                 trace!(
                     "Writer task sending {} RTP packets (first seq={})",
                     packets.len(),
@@ -1371,6 +1505,9 @@ pub async fn setup_bridge_session(
                     writer_write_max = writer_write_max.max(write_started.elapsed());
                     ratecontrol_group_packets_sent += 1;
                     ratecontrol_frame_packets_sent += 1;
+                }
+                if let Some(rtp_time) = frame_rtp_time {
+                    crate::connector::media::frame_sent(rtp_time);
                 }
                 if writer_frame_started.elapsed() > Duration::from_millis(9) {
                     debug!(
@@ -1456,6 +1593,12 @@ pub async fn setup_bridge_session(
                         samples.push(frame_buffer(full_frame));
                     }
                 }
+                VideoPayloader::Vp8(_) | VideoPayloader::Vp9(_) => {
+                    // One VP8 or VP9 frame is one sample.
+                    if !full_frame.is_empty() {
+                        samples.push(frame_buffer(full_frame));
+                    }
+                }
             }
 
             if frame_count % 120 == 0 {
@@ -1475,6 +1618,8 @@ pub async fn setup_bridge_session(
                     VideoPayloader::H264(p) => p.payload(1200 - 12, &sample.freeze()),
                     VideoPayloader::H265(p) => p.payload(1200 - 12, &sample.freeze()),
                     VideoPayloader::Av1(p) => p.payload(1200 - 12, &sample.freeze()),
+                    VideoPayloader::Vp8(p) => p.payload(1200 - 12, &sample.freeze()),
+                    VideoPayloader::Vp9(p) => p.payload(1200 - 12, &sample.freeze()),
                 };
 
                 let payloads = match payloads {

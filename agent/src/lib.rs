@@ -22,6 +22,7 @@ mod hub;
 mod input;
 pub mod pairing;
 mod rtcp_forward;
+pub mod connector;
 pub mod rustdesk;
 mod share;
 mod video;
@@ -1137,9 +1138,31 @@ async fn run_session_logic(
                 encoder_csc_mode,
                 microphone,
                 ice_servers,
+                source_id,
+                decode_codecs,
                 ..
             } => {
                 let (width, height, fps, bitrate) = clamp_stream_request(width, height, fps, bitrate);
+                // A source asked for must be one this computer has: its own
+                // screen is never shown in place of one that is not there.
+                let source = match source_id.as_deref().filter(|id| !id.is_empty()) {
+                    None => None,
+                    Some(id) => match crate::connector::configured_sources().into_iter().find(|s| s.id == id) {
+                        Some(found) => {
+                            info!("Session for source \"{}\" ({}) through connector {}", found.name, found.id, found.target.connector);
+                            Some(found.target)
+                        }
+                        None => {
+                            warn!("Session asked for a source this computer does not have");
+                            let _ = agent_tx.send(AgentMessage::Signaling(SignalingMessage::SourceStatus {
+                                target_id: client_id.clone(),
+                                status: "failed".into(),
+                                reason: Some("This computer no longer has that source".into()),
+                            }));
+                            continue;
+                        }
+                    },
+                };
                 info!(
                     "Incoming session request from client: {} codec={:?} encoder={:?} res={:?}x{:?} fps={:?} bitrate={:?} display={:?} chroma={:?} encoder_csc_mode={:?} microphone={:?}",
                     client_id, codec, encoder, width, height, fps, bitrate, display_id, chroma, encoder_csc_mode, microphone
@@ -1188,11 +1211,24 @@ async fn run_session_logic(
                     encoder_csc_mode,
                     microphone.unwrap_or(false),
                     ice_servers,
+                    source,
+                    decode_codecs,
                 )
                 .await
                 {
                     Ok(s) => s,
                     Err(e) => {
+                        // A source that could not be shown: the viewer is
+                        // told why, in the connector's words.
+                        if let Some(source_error) = e.downcast_ref::<crate::connector::SourceError>() {
+                            warn!("The source could not be shown: {}", source_error);
+                            let _ = agent_tx.send(AgentMessage::Signaling(SignalingMessage::SourceStatus {
+                                target_id: client_id.clone(),
+                                status: "failed".into(),
+                                reason: Some(source_error.to_string()),
+                            }));
+                            continue;
+                        }
                         error!("Failed to setup WebRTC bridge session: {:?}", e);
                         let _ = agent_tx.send(AgentMessage::Signaling(
                             SignalingMessage::Error {
@@ -1398,6 +1434,11 @@ async fn run_session_logic(
                         encoders,
                         gpu_info: lunaris_media::encode::describe_host_gpu(None),
                         host_os: Some(std::env::consts::OS.to_string()),
+                        // The other computers this one shows: id and name only.
+                        sources: crate::connector::configured_sources()
+                            .into_iter()
+                            .map(|s| common::SourceInfoMsg { id: s.id, name: s.name, connector: s.target.connector })
+                            .collect(),
                     },
                 );
                 if let Err(e) = agent_tx_clone.send(resp) {

@@ -37,6 +37,20 @@ pub async fn attach(pc: &Arc<dyn PeerConnection>, allow_clipboard: bool) -> anyh
 
 // ---------------------------------------------------------------- clipboard
 
+/// Opens the `clipboard` channel of a session that shows another computer
+/// (a connector's source): the viewer's text goes to `set`, and what comes
+/// from `changed` to the viewer. This computer's own clipboard is not
+/// touched.
+pub async fn attach_link(
+    pc: &Arc<dyn PeerConnection>,
+    set: std_mpsc::Sender<String>,
+    changed: tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let reliable = RTCDataChannelInit { ordered: true, ..Default::default() };
+    let clipboard = pc.create_data_channel("clipboard", Some(reliable)).await?;
+    Ok(link_clipboard(clipboard, set, changed))
+}
+
 fn setup_clipboard(channel: Arc<dyn DataChannel>, allowed: bool) -> Vec<tokio::task::JoinHandle<()>> {
     if !allowed {
         // webrtc 0.21: events are polled, not delivered to callbacks.
@@ -54,7 +68,7 @@ fn setup_clipboard(channel: Arc<dyn DataChannel>, allowed: bool) -> Vec<tokio::t
 
     // Text from the client -> the clipboard thread; local changes -> client.
     let (set_tx, set_rx) = std_mpsc::channel::<String>();
-    let (changed_tx, mut changed_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (changed_tx, changed_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     if std::thread::Builder::new()
         .name("lunaris-clipboard".into())
         .spawn(move || clipboard_thread(set_rx, changed_tx))
@@ -62,7 +76,16 @@ fn setup_clipboard(channel: Arc<dyn DataChannel>, allowed: bool) -> Vec<tokio::t
     {
         return Vec::new();
     }
+    link_clipboard(channel, set_tx, changed_rx)
+}
 
+/// The `clipboard` channel's two directions: text from the client goes to
+/// `set_tx`, text from `changed_rx` to the client.
+fn link_clipboard(
+    channel: Arc<dyn DataChannel>,
+    set_tx: std_mpsc::Sender<String>,
+    mut changed_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let set_tx = Mutex::new(set_tx);
     let reader = channel.clone();
     let on_message = tokio::spawn(async move {

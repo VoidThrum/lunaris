@@ -115,6 +115,17 @@ pub mod qobject {
         #[qsignal]
         fn rustdesk_config_loaded(self: Pin<&mut AgentBridge>, enabled: bool, port: i32);
 
+        /// The sources (other computers this one shows) and the connectors
+        /// to add one with, as JSON: `{"connectors": [{id, name, fields:
+        /// [{key, label, kind, default, required}]}], "sources": [{id, name,
+        /// connector, connector_name}]}`. No field values.
+        #[qsignal]
+        fn sources_loaded(self: Pin<&mut AgentBridge>, json: QString);
+
+        /// Answer to `add_source`: "" when it was saved, else why not.
+        #[qsignal]
+        fn source_saved(self: Pin<&mut AgentBridge>, error_msg: QString);
+
         /// Direct connections: on/off, port, access password and this
         /// computer's addresses (one per line).
         #[qsignal]
@@ -158,6 +169,18 @@ pub mod qobject {
         /// (`rustdesk_port` of the config).
         #[qinvokable]
         fn set_rustdesk(self: Pin<&mut AgentBridge>, enabled: bool, port: i32);
+
+        /// Asks for `sources_loaded`.
+        #[qinvokable]
+        fn load_sources(self: Pin<&mut AgentBridge>);
+
+        /// Adds a source; `values_json` is `{"<field key>": "<value>"}`.
+        /// Answered with `source_saved`.
+        #[qinvokable]
+        fn add_source(self: Pin<&mut AgentBridge>, name: QString, connector: QString, values_json: QString);
+
+        #[qinvokable]
+        fn remove_source(self: Pin<&mut AgentBridge>, id: QString);
 
         #[qinvokable]
         fn start_agent(self: Pin<&mut AgentBridge>);
@@ -322,6 +345,41 @@ impl qobject::AgentBridge {
             agent::pairing::ensure_direct_password(&mut config);
         }
         self.as_mut().save_direct_config(config);
+    }
+
+    pub fn load_sources(mut self: Pin<&mut Self>) {
+        let config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
+        let connectors = agent::connector::available(&agent::connector::connectors_dir());
+        let json = agent::connector::sources::listing_json(&config.sources, &connectors);
+        self.as_mut().sources_loaded(QString::from(&json));
+    }
+
+    /// No restart after these two: the agent reads its sources at each session.
+    pub fn add_source(mut self: Pin<&mut Self>, name: QString, connector: QString, values_json: QString) {
+        let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
+        let connectors = agent::connector::available(&agent::connector::connectors_dir());
+        if let Err(error) =
+            agent::connector::sources::add(&mut config, &connectors, &name.to_string(), &connector.to_string(), &values_json.to_string())
+        {
+            self.as_mut().source_saved(QString::from(&error));
+            return;
+        }
+        let id = config.sources.last().map(|source| source.id.clone()).unwrap_or_default();
+        self.as_mut().save_direct_config(config);
+        // `save_direct_config` reports a failure itself; the form is told
+        // whether the source is in the file now.
+        let saved = load_config(agent::pairing::config_path())
+            .is_ok_and(|config| config.sources.iter().any(|source| source.id == id));
+        self.as_mut().source_saved(QString::from(if saved { "" } else { "The settings could not be saved" }));
+        self.as_mut().load_sources();
+    }
+
+    pub fn remove_source(mut self: Pin<&mut Self>, id: QString) {
+        let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
+        if agent::connector::sources::remove(&mut config, &id.to_string()) {
+            self.as_mut().save_direct_config(config);
+        }
+        self.as_mut().load_sources();
     }
 
     pub fn regenerate_direct_password(mut self: Pin<&mut Self>) {

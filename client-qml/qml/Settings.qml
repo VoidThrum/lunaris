@@ -20,6 +20,8 @@ Rectangle {
     property var availableEncoders: ["Auto", "Native", "FFmpeg", "NVENC", "AMF", "QSV", "VAAPI", "Software"]
     property var availableDisplayIds: []
     property var availableDisplayLabels: []
+    // The host's sources (other computers it shows): [{ id, name }].
+    property var availableSources: []
 
     // The settings being edited.
     property string res: "1920x1080"
@@ -32,8 +34,25 @@ Rectangle {
     property string encoder: "auto"
     property string displayId: "default"
     property string renderBackend: "auto_gpu"
+    // The source to show; "" = the host's own screen.
+    property string sourceId: ""
 
-    signal applySettings(string res, int fps, string codec, int bitrate, int queueLimit, bool disableCuda, string renderBackend, string inputProtocol, string encoder, string displayId)
+    signal applySettings(string res, int fps, string codec, int bitrate, int queueLimit, bool disableCuda, string renderBackend, string inputProtocol, string encoder, string displayId, string sourceId)
+
+    // "This computer", the host's sources, and the chosen one when the host
+    // did not list it (removed there, or the list has not arrived), so that
+    // it can be seen and changed.
+    readonly property var sourceOptions: {
+        var options = [{ value: "", label: "This computer" }];
+        var known = settingsRoot.sourceId === "";
+        for (var i = 0; i < settingsRoot.availableSources.length; i++) {
+            var s = settingsRoot.availableSources[i];
+            options.push({ value: s.id, label: s.name });
+            if (s.id === settingsRoot.sourceId) known = true;
+        }
+        if (!known) options.push({ value: settingsRoot.sourceId, label: settingsRoot.sourceId });
+        return options;
+    }
 
     readonly property var categories: [
         { key: "video", label: "Video", icon: "monitor" },
@@ -61,7 +80,18 @@ Rectangle {
 
     function currentRenderBackend() { return settingsRoot.renderBackend; }
 
-    function updateCapabilities(displaysJson, encodersJson) {
+    function updateCapabilities(displaysJson, encodersJson, sourcesJson) {
+        // Hosts without sources and older agents send none.
+        var sources = [];
+        try {
+            var listed = JSON.parse(sourcesJson || "[]");
+            for (var k = 0; k < listed.length; k++) {
+                if (listed[k] && listed[k].id) sources.push({ id: String(listed[k].id), name: String(listed[k].name || listed[k].id) });
+            }
+        } catch (e) {
+            console.log("updateCapabilities: failed to parse the sources:", e);
+        }
+        availableSources = sources;
         try {
             var displays = JSON.parse(displaysJson);
             var encoders = JSON.parse(encodersJson);
@@ -88,7 +118,10 @@ Rectangle {
         }
     }
 
-    function setCurrentSettings(res, fps, codec, bitrate, queueLimit, disableCuda, inputProtocol, encoder, displayId, renderBackend) {
+    function setCurrentSettings(res, fps, codec, bitrate, queueLimit, disableCuda, inputProtocol, encoder, displayId, renderBackend, sourceId) {
+        // Another computer's sources are not this one's: the list comes with its capabilities.
+        settingsRoot.availableSources = [];
+        settingsRoot.sourceId = sourceId || "";
         settingsRoot.res = StreamOptions.resolutions[StreamOptions.resolutionIndex(res)].value;
         settingsRoot.fps = parseInt(fps) || 60;
         settingsRoot.codec = StreamOptions.codecPart(codec);
@@ -107,7 +140,8 @@ Rectangle {
             StreamOptions.composeCodec(settingsRoot.codec, settingsRoot.chroma),
             settingsRoot.bitrate, settingsRoot.queueLimit,
             settingsRoot.renderBackend === "software", settingsRoot.renderBackend,
-            settingsRoot.inputProtocol, settingsRoot.encoder, settingsRoot.displayId);
+            settingsRoot.inputProtocol, settingsRoot.encoder, settingsRoot.displayId,
+            settingsRoot.sourceId);
         settingsRoot.close();
     }
 
@@ -471,6 +505,25 @@ Rectangle {
             }
 
             // ===== Remote computer =====
+            // Which computer: the host itself or one it shows (its sources).
+            // Only for hosts that have sources.
+            SectionTitle { visible: sourceCard.visible; text: I18n.t("Computer") }
+            Card {
+                id: sourceCard
+                visible: settingsRoot.category === "host" && settingsRoot.sourceOptions.length > 1
+                SettingRow {
+                    divider: false
+                    title: I18n.t("Computer to show")
+                    hint: I18n.t("This computer, or another computer it can show.")
+                    ThemedCombo {
+                        width: parent.width
+                        options: settingsRoot.sourceOptions
+                        value: settingsRoot.sourceId
+                        onPicked: (v) => settingsRoot.sourceId = v
+                    }
+                }
+            }
+
             SectionTitle { visible: settingsRoot.category === "host"; text: I18n.t("Encoding") }
             Card {
                 visible: settingsRoot.category === "host"

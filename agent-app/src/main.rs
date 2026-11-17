@@ -6,6 +6,7 @@
 
 #[cfg(feature = "gui")]
 mod agent_gui;
+#[cfg(feature = "gui")]
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 #[no_mangle]

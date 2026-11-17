@@ -299,6 +299,7 @@ fn parse_args() -> Option<AppArgs> {
             input_protocol,
             encoder,
             display_id,
+            source_id: None,
         })
     } else {
         None

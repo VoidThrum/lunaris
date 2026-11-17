@@ -515,9 +515,29 @@ ApplicationWindow {
             homeView.forceActiveFocus();
         }
 
-        onCapabilitiesUpdated: (displaysJson, encodersJson, gpuInfo, hostOs) => {
-            dashboardView.settingsModal.updateCapabilities(displaysJson, encodersJson);
-            homeView.peerCapabilities(displaysJson, encodersJson, hostOs);
+        // The source being shown could not be connected, or closed: the
+        // stream is over, with the host's reason when it gave one.
+        onSourceStatus: (status, reason) => {
+            console.log("Source " + status + ": " + reason);
+            var failed = status === "failed";
+            var message = reason !== ""
+                ? I18n.t(failed ? "Could not connect to the other computer: %1" : "The other computer closed the session: %1").arg(I18n.t(reason))
+                : I18n.t(failed ? "Could not connect to the other computer." : "The other computer closed the session.");
+            bridge.stopStream();
+            if (bridge.hasConnectionArgs()) {
+                // Launched for one stream (deep link): nothing to go back to.
+                window.exitRequested = true;
+                Qt.quit();
+                return;
+            }
+            window.isStreamMode = false;
+            homeView.showError(message);
+            homeView.forceActiveFocus();
+        }
+
+        onCapabilitiesUpdated: (displaysJson, encodersJson, gpuInfo, hostOs, sourcesJson) => {
+            dashboardView.settingsModal.updateCapabilities(displaysJson, encodersJson, sourcesJson);
+            homeView.peerCapabilities(displaysJson, encodersJson, hostOs, sourcesJson);
         }
     }
 
@@ -1329,7 +1349,7 @@ ApplicationWindow {
         visible: !window.isStreamMode
         focus: !window.isStreamMode
 
-        onStartSessionRequested: (server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId) => {
+        onStartSessionRequested: (server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId, sourceId) => {
             window.renderBackend = String(renderBackend || (disableCuda ? "software" : "auto_gpu")).toLowerCase();
             window.useCuda = window.renderBackend !== "software";
             window.isStreamMode = true;
@@ -1338,7 +1358,7 @@ ApplicationWindow {
                 window.streamWidth = parseInt(parts[0]);
                 window.streamHeight = parseInt(parts[1]);
             }
-            bridge.startGameSessionWithBackend(server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, window.renderBackend, inputProtocol, encoder, displayId);
+            bridge.startGameSessionWithBackend(server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, window.renderBackend, inputProtocol, encoder, displayId, sourceId || "");
             bridge.setVideoSink(videoOutput.videoSink);
             bridge.requestSettings();
             rootContainer.forceActiveFocus();

@@ -639,6 +639,10 @@ fn permission(permission: Permission, enabled: bool) -> Message {
 /// hands to its decoder (rustdesk/libs/scrap/src/common/codec.rs
 /// `handle_hwram_video_frame`).
 fn video_message(codec: Codec, display: usize, data: Vec<u8>, key: bool, pts_ms: i64) -> Message {
+    // A constant-bitrate encoder pads its stream with filler data, which the
+    // client's decoder throws away: it is not sent (the WebRTC path leaves
+    // it out too, in its packager).
+    let data = crate::video::annexb::without_filler(data, codec == Codec::H265);
     let frames = EncodedVideoFrames { frames: vec![EncodedVideoFrame { data: Bytes::from(data), key, pts: pts_ms }] };
     Message {
         union: Some(message::Union::VideoFrame(VideoFrame {
@@ -2119,6 +2123,9 @@ mod tests {
         decoder: frame::Decoder,
         buf: BytesMut,
         hash: Hash,
+        /// A probe of the host that `next_reply` read past, not answered
+        /// yet (the host's first one may come before its LoginResponse).
+        skipped_probe: Option<TestDelay>,
     }
 
     impl Client {
@@ -2127,7 +2134,7 @@ mod tests {
         async fn connect(addr: SocketAddr) -> Client {
             let stream = TcpStream::connect(addr).await.unwrap();
             let mut client =
-                Client { stream, decoder: frame::Decoder::new(usize::MAX), buf: BytesMut::new(), hash: Hash::default() };
+                Client { stream, decoder: frame::Decoder::new(usize::MAX), buf: BytesMut::new(), hash: Hash::default(), skipped_probe: None };
             match client.next().await.union {
                 Some(message::Union::Hash(hash)) => client.hash = hash,
                 other => panic!("expected Hash, got {:?}", other),
@@ -2162,7 +2169,11 @@ mod tests {
             loop {
                 let msg = self.next().await;
                 match &msg.union {
-                    Some(message::Union::TestDelay(_)) => {}
+                    Some(message::Union::TestDelay(t)) => {
+                        if !t.from_client {
+                            self.skipped_probe = Some(t.clone());
+                        }
+                    }
                     Some(message::Union::Misc(Misc { union: Some(misc::Union::PermissionInfo(_)) })) => {}
                     _ => return msg,
                 }
@@ -2556,6 +2567,12 @@ mod tests {
 
     /// Answers the host's next delay probe, as the client does.
     async fn answer_probe(client: &mut Client) {
+        // The host sends one probe and waits for its answer: the one read
+        // past during the login is the one to answer.
+        if let Some(t) = client.skipped_probe.take() {
+            client.send(Message { union: Some(message::Union::TestDelay(t)) }).await;
+            return;
+        }
         loop {
             if let Some(message::Union::TestDelay(t)) = client.next().await.union {
                 if !t.from_client {
@@ -3250,5 +3267,157 @@ mod tests {
         let payload = frame::Decoder::new(usize::MAX).decode(&mut buf).unwrap().unwrap();
         assert!(buf.is_empty());
         assert_eq!(Message::decode(payload.freeze()).unwrap(), msg);
+    }
+
+    // --- the RustDesk connector (the agent as a client) against this listener ---
+
+    fn connector_target(addr: SocketAddr, password: &str) -> crate::connector::Target {
+        crate::connector::Target {
+            connector: "rustdesk".into(),
+            values: [("host", addr.ip().to_string()), ("port", addr.port().to_string()), ("password", password.to_string())]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        }
+    }
+
+    async fn connector_event(session: &mut crate::connector::Session) -> crate::connector::Event {
+        tokio::time::timeout(Duration::from_secs(5), session.events.recv()).await.expect("an event in time").expect("the session is open")
+    }
+
+    #[tokio::test]
+    async fn the_connector_gets_the_picture_and_the_sound_of_a_rustdesk_host() {
+        use crate::connector::{Codec as Wanted, Command, Connector, Event, Viewer};
+        let (addr, screen) = start_host_with("password", true, FakeScreen { h265: true, ..Default::default() }).await;
+        let connector = crate::connector::rustdesk::RustdeskConnector;
+        let viewer = Viewer { codecs: vec![Wanted::H265, Wanted::H264], fps: 60 };
+        let mut session = connector.connect(&connector_target(addr, PASSWORD), &viewer).await.expect("logged in");
+
+        // The displays of the PeerInfo come first.
+        match connector_event(&mut session).await {
+            Event::Displays { displays, current } => {
+                assert_eq!(current, 0);
+                assert_eq!((displays[0].width, displays[0].height), (1920, 1080));
+            }
+            other => panic!("displays first, not {:?}", other),
+        }
+        // The host encodes what the viewer prefers and can take.
+        let (_, (events, mut commands)) = restarted(&screen).await;
+        assert_eq!(screen.starts.lock().unwrap().last().unwrap().1, Codec::H265);
+
+        events.send(frame(true, 7)).await.unwrap();
+        events.send(audio(9)).await.unwrap();
+        events.send(frame(false, 8)).await.unwrap();
+        let mut video = Vec::new();
+        let mut sound = Vec::new();
+        while video.len() < 2 || sound.is_empty() {
+            match connector_event(&mut session).await {
+                Event::Video { codec, key, data, capture_time_ms } => {
+                    assert_eq!(codec, Wanted::H265);
+                    assert!(capture_time_ms.is_some());
+                    video.push((key, data.to_vec()));
+                }
+                Event::Audio { channels, data } => sound.push((channels, data.to_vec())),
+                other => panic!("unexpected {:?}", other),
+            }
+        }
+        assert_eq!(video, vec![(true, vec![0, 0, 0, 1, 7, 7]), (false, vec![0, 0, 0, 1, 8, 8])]);
+        assert_eq!(sound, vec![(2, vec![9; 40])]);
+
+        // A key frame asked for reaches the host's encoder (the client's refresh).
+        while commands.try_recv().is_ok() {}
+        session.commands.send(Command::RequestKeyFrame).await.unwrap();
+        loop {
+            if matches!(next_command(&mut commands).await, PipelineCommand::RequestKeyframe) {
+                break;
+            }
+        }
+        // The frame rate wanted goes as the client's custom_fps.
+        session.commands.send(Command::Quality { fps: 30, bitrate_kbps: 0 }).await.unwrap();
+        loop {
+            if matches!(next_command(&mut commands).await, PipelineCommand::SetFrameLimit(30)) {
+                break;
+            }
+        }
+        // The viewer's input reaches the computer shown (here: the fake
+        // host's injector), as the RustDesk client sends it.
+        assert!(screen.injected().is_empty());
+        for command in [
+            Command::PointerMove { x: 30, y: 40 },
+            Command::PointerButton { button: crate::connector::Button::Left, down: true },
+            Command::PointerButton { button: crate::connector::Button::Left, down: false },
+            Command::Wheel { dx: 0, dy: -1 },
+            Command::Key { position: 30, down: true },
+            Command::Key { position: 30, down: false },
+        ] {
+            session.commands.send(command).await.unwrap();
+        }
+        let injected = screen.injected_after(6).await;
+        assert_eq!(injected[0], "move_abs 30 40 of 1920x1080", "{:?}", injected);
+        assert!(injected.iter().filter(|line| line.starts_with("button")).count() >= 3, "{:?}", injected);
+        // Map mode: the key at the same place of the keyboard (the test
+        // host is this platform; the connector sends what a Linux client does).
+        if cfg!(target_os = "linux") {
+            assert!(injected.contains(&"position 30 down".to_string()) && injected.contains(&"position 30 up".to_string()), "{:?}", injected);
+        }
+        // Text typed as it is.
+        session.commands.send(Command::Text { text: "ô".into() }).await.unwrap();
+        assert!(!screen.injected_after(1).await.is_empty());
+
+        // The clipboard, both ways.
+        let (set, changed) = screen.clipboards.lock().unwrap().pop().expect("a clipboard was opened");
+        session.commands.send(Command::Clipboard { text: "from the viewer".into() }).await.unwrap();
+        assert_eq!(clipboard_set(&set).await.as_deref(), Some("from the viewer"));
+        changed.send("from the computer".into()).unwrap();
+        // The cursor's shape.
+        events.send(cursor(5, 6, Some(7))).await.unwrap();
+        let (mut clipboard_text, mut shape) = (None, None);
+        while clipboard_text.is_none() || shape.is_none() {
+            match connector_event(&mut session).await {
+                Event::Clipboard { text } => clipboard_text = Some(text),
+                Event::CursorShape { width, height, hot_x, hot_y, rgba } => shape = Some((width, height, hot_x, hot_y, rgba.to_vec())),
+                Event::CursorPosition { .. } => {}
+                other => panic!("unexpected {:?}", other),
+            }
+        }
+        assert_eq!(clipboard_text.as_deref(), Some("from the computer"));
+        assert_eq!(shape, Some((2, 2, 0, 1, vec![7; 16])));
+
+        // The viewer's bitrate becomes the client's image quality (once it
+        // differs enough), which the host's encoder follows.
+        session.commands.send(Command::Quality { fps: 0, bitrate_kbps: 1500 }).await.unwrap();
+
+        session.commands.send(Command::Close).await.unwrap();
+        loop {
+            if let Event::Closed { reason } = connector_event(&mut session).await {
+                assert_eq!(reason, "Closed");
+                break;
+            }
+        }
+        // The host stops its pipeline when the client has left.
+        loop {
+            if matches!(next_command(&mut commands).await, PipelineCommand::Stop) {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_connector_says_when_the_password_is_wrong_or_nobody_is_there() {
+        use crate::connector::{Codec as Wanted, Connector, Viewer};
+        let (addr, _screen) = start_host("password").await;
+        let connector = crate::connector::rustdesk::RustdeskConnector;
+        let viewer = Viewer { codecs: vec![Wanted::H264], fps: 60 };
+        let error = connector.connect(&connector_target(addr, "not the password"), &viewer).await.err().expect("refused");
+        assert_eq!(error.to_string(), "Wrong password for the RustDesk computer");
+
+        // A port nobody listens on.
+        let free = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let error = connector.connect(&connector_target(free, PASSWORD), &viewer).await.err().expect("refused");
+        assert!(error.to_string().contains("cannot be reached"), "{}", error);
+
+        // The target's password is never in what is printed of it.
+        let target = connector_target(addr, "s3cret-value");
+        assert!(!format!("{:?}", target).contains("s3cret-value"));
     }
 }

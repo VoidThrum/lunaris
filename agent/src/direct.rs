@@ -1108,6 +1108,8 @@ mod tests {
             chroma: None,
             encoder_csc_mode: None,
             microphone: None,
+            source_id: None,
+            decode_codecs: None,
         }
     }
 

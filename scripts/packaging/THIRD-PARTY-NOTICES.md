@@ -64,9 +64,23 @@ under the GNU Affero General Public License v3.0 (AGPL-3.0):
   function (each step names the function it was ported from): the wire
   protocol, login, input handling, cursor, clipboard, file transfer and
   codec negotiation.
+- `agent/src/connector/rustdesk.rs` (the agent as a RustDesk client, for
+  showing a RustDesk computer) follows the client's side the same way:
+  `src/client.rs`, `src/client/io_loop.rs`, `src/keyboard.rs` and
+  `src/ui_session_interface.rs`.
 
 GPL-3.0 section 13 permits combining the two; the AGPL-3.0 continues to apply
 to that part.
+
+## Other ported code
+
+- `agent/src/connector/keys.rs`: the key table is generated from rdev, the
+  keyboard library of RustDesk's client (https://github.com/rustdesk-org/rdev,
+  MIT License, Copyright (c) 2020 Nicolas Patry): `src/keycodes/windows.rs`
+  joined with `src/keycodes/linux.rs`.
+- `agent/src/video/vp9.rs`: the VP9 RTP payloader is ported from pion/rtp
+  (https://github.com/pion/rtp, MIT License, Copyright (c) The Pion
+  community): `codecs/vp9_packet.go` and `codecs/vp9/header.go`.
 
 Libraries the listener links into the agent (all packages):
 

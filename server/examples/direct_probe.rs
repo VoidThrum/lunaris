@@ -263,6 +263,8 @@ async fn main() -> Result<()> {
         chroma: chroma.clone(),
         encoder_csc_mode: None,
         microphone: None,
+        source_id: None,
+        decode_codecs: None,
     })?;
     let offer = recv_until(&mut in_rx, Duration::from_secs(15), |m| {
         matches!(m, SignalingMessage::Sdp { sdp, .. } if matches!(sdp.ty, RtcSdpType::Offer)) || matches!(m, SignalingMessage::Error { .. })

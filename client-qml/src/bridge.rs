@@ -72,6 +72,9 @@ pub struct AppArgs {
     pub input_protocol: String,
     pub encoder: Option<String>,
     pub display_id: Option<String>,
+    /// The source of the host to show (a computer it reaches through a
+    /// connector); None = the host's own screen.
+    pub source_id: Option<String>,
 }
 
 pub static APP_ARGS: std::sync::OnceLock<AppArgs> = std::sync::OnceLock::new();
@@ -248,6 +251,8 @@ pub static PENDING_ENCODER_STATUS: std::sync::Mutex<Option<PendingEncoderStatus>
 pub struct PendingCapabilities {
     pub displays_json: String,
     pub encoders_json: String,
+    /// The host's sources: `[{"id", "name", "connector"}]`, "[]" when it has none.
+    pub sources_json: String,
     pub gpu_info: String,
     pub host_os: String,
 }
@@ -403,6 +408,43 @@ fn save_direct_target_file(target: &DirectTarget) {
 /// Why the stream couldn't start, set by the stream task and reported to QML
 /// by `poll_stats` (`stream_failed`), which leaves the stream view.
 pub static STREAM_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// What the host said about the source being shown (`SourceStatus`: status
+/// and reason), set by the stream task, which then ends; `poll_stats` acts
+/// on it (starts the session again, or tells QML).
+pub static PENDING_SOURCE_STATUS: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Restarts a source asked for in a row, and when the last one was.
+static SOURCE_RESTARTS: std::sync::Mutex<(u32, Option<std::time::Instant>)> = std::sync::Mutex::new((0, None));
+
+/// Restarts closer together than this are "in a row": a source that keeps
+/// changing its codec as soon as the session is back.
+const SOURCE_RESTART_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+const SOURCE_RESTARTS_IN_A_ROW: u32 = 3;
+
+/// Counts a restart the source asked for; false when it is one too many in
+/// a row (the session is then ended instead of started again).
+fn source_restart_allowed(state: &mut (u32, Option<std::time::Instant>), now: std::time::Instant) -> bool {
+    let in_a_row = state.1.is_some_and(|last| now.duration_since(last) < SOURCE_RESTART_WINDOW);
+    state.0 = if in_a_row { state.0 + 1 } else { 1 };
+    state.1 = Some(now);
+    state.0 <= SOURCE_RESTARTS_IN_A_ROW
+}
+
+/// The codecs to name in a session request (`decode_codecs`): what this
+/// client decodes, the one the user chose first ("auto" has no wish).
+fn decode_codecs_for_request(decodable: Vec<String>, chosen: &str) -> Vec<String> {
+    let chosen = match chosen {
+        "hevc" => "h265",
+        other => other,
+    };
+    let mut codecs = decodable;
+    if let Some(at) = codecs.iter().position(|c| c == chosen) {
+        let first = codecs.remove(at);
+        codecs.insert(0, first);
+    }
+    codecs
+}
 
 /// A message for the user from a stream task error.
 fn describe_stream_error(e: &anyhow::Error) -> String {
@@ -815,6 +857,7 @@ pub mod qobject {
             encoders_json: QString,
             gpu_info: QString,
             host_os: QString,
+            sources_json: QString,
         );
 
         #[qsignal]
@@ -895,6 +938,12 @@ pub mod qobject {
         /// The stream could not start or ended with an error (message for the user).
         #[qsignal]
         fn stream_failed(self: Pin<&mut StreamBridge>, message: QString);
+
+        /// The source being shown could not be connected ("failed") or closed
+        /// ("ended"); `reason` is the host's text for the user, may be "".
+        /// The stream is over either way.
+        #[qsignal]
+        fn source_status(self: Pin<&mut StreamBridge>, status: QString, reason: QString);
 
         /// Clipboard/file sharing news for the user (progress, saved, error).
         #[qsignal]
@@ -1039,6 +1088,7 @@ pub mod qobject {
             input_protocol: QString,
             encoder: QString,
             display_id: QString,
+            source_id: QString,
         );
 
         #[qinvokable]
@@ -1059,6 +1109,7 @@ pub mod qobject {
             input_protocol: QString,
             encoder: QString,
             display_id: QString,
+            source_id: QString,
         );
 
         #[qinvokable]
@@ -1139,6 +1190,22 @@ pub mod qobject {
         /// returns an error message or "".
         #[qinvokable]
         fn host_set_rustdesk(self: Pin<&mut StreamBridge>, enabled: bool, port: i32) -> QString;
+
+        /// The sources of this computer (other computers it shows) and the
+        /// connectors to add one with, as JSON: `{"connectors": [{id, name,
+        /// fields: [{key, label, kind, default, required}]}], "sources":
+        /// [{id, name, connector, connector_name}]}`. No field values.
+        #[qinvokable]
+        fn host_sources(self: Pin<&mut StreamBridge>) -> QString;
+
+        /// Adds a source; `values_json` is `{"<field key>": "<value>"}`.
+        /// Returns an error message or "".
+        #[qinvokable]
+        fn host_add_source(self: Pin<&mut StreamBridge>, name: QString, connector: QString, values_json: QString) -> QString;
+
+        /// Removes the source `id`; returns an error message or "".
+        #[qinvokable]
+        fn host_remove_source(self: Pin<&mut StreamBridge>, id: QString) -> QString;
 
         /// The app's own Lunaris server, as JSON: enabled, running, ours,
         /// port, local_url, lan_url, admin_password, data_dir, error.
@@ -1349,6 +1416,7 @@ impl qobject::StreamBridge {
         let input_protocol = args.input_protocol.clone();
         let encoder = args.encoder.clone();
         let display_id = args.display_id.clone();
+        let source_id = args.source_id.clone();
 
         let sink_wrapper = self.as_ref().rust().sink_wrapper.clone();
         let input_senders = self.as_ref().rust().input_senders.clone();
@@ -1370,6 +1438,7 @@ impl qobject::StreamBridge {
                 input_protocol,
                 encoder,
                 display_id,
+                source_id,
                 sink_wrapper,
                 input_senders,
                 active_decoder,
@@ -1584,6 +1653,24 @@ impl qobject::StreamBridge {
             self.as_mut().stream_failed(QString::from(&message));
             return;
         }
+        let source_status = PENDING_SOURCE_STATUS.lock().unwrap().take();
+        if let Some((mut status, mut reason)) = source_status {
+            if status == "restart" {
+                // The source changed its video codec: the same session again,
+                // the way a change of the stream settings restarts it.
+                let again = source_restart_allowed(&mut SOURCE_RESTARTS.lock().unwrap(), std::time::Instant::now());
+                if again {
+                    println!("The source asked for a restart: starting the same session again");
+                    self.as_mut().start_stream();
+                    return;
+                }
+                println!("The source asked for a restart too many times in a row: ending the session");
+                status = "ended".to_string();
+                reason = String::new();
+            }
+            self.as_mut().source_status(QString::from(&status), QString::from(&reason));
+            return;
+        }
         if let Some(message) = crate::share::take_status() {
             self.as_mut().share_status(QString::from(&message));
         }
@@ -1672,6 +1759,7 @@ impl qobject::StreamBridge {
                 cxx_qt_lib::QString::from(&caps.encoders_json),
                 cxx_qt_lib::QString::from(&caps.gpu_info),
                 cxx_qt_lib::QString::from(&caps.host_os),
+                cxx_qt_lib::QString::from(&caps.sources_json),
             );
         }
     }
@@ -2325,9 +2413,10 @@ impl qobject::StreamBridge {
                                             encoders,
                                             gpu_info,
                                             host_os,
+                                            sources,
                                             ..
                                         } => {
-                                            return Ok((displays, encoders, gpu_info, host_os));
+                                            return Ok((displays, encoders, gpu_info, host_os, sources));
                                         }
                                         SignalingMessage::Error { message } => {
                                             return Err(message);
@@ -2350,7 +2439,7 @@ impl qobject::StreamBridge {
             let _ = ws_stream.close(None).await;
 
             match result {
-                Ok(Ok((displays, encoders, gpu_info, host_os))) => {
+                Ok(Ok((displays, encoders, gpu_info, host_os, sources))) => {
                     let displays_json =
                         serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string());
                     let encoders_json =
@@ -2358,6 +2447,7 @@ impl qobject::StreamBridge {
                     *PENDING_CAPABILITIES.lock().unwrap() = Some(PendingCapabilities {
                         displays_json,
                         encoders_json,
+                        sources_json: serde_json::to_string(&sources).unwrap_or_else(|_| "[]".to_string()),
                         gpu_info: gpu_info.unwrap_or_default(),
                         host_os: host_os.unwrap_or_default(),
                     });
@@ -2388,6 +2478,7 @@ impl qobject::StreamBridge {
         input_protocol: QString,
         encoder: QString,
         display_id: QString,
+        source_id: QString,
     ) {
         let render_backend =
             cxx_qt_lib::QString::from(&render_backend_from_disable_cuda(disable_cuda));
@@ -2407,6 +2498,7 @@ impl qobject::StreamBridge {
             input_protocol,
             encoder,
             display_id,
+            source_id,
         );
     }
 
@@ -2427,6 +2519,7 @@ impl qobject::StreamBridge {
         input_protocol: QString,
         encoder: QString,
         display_id: QString,
+        source_id: QString,
     ) {
         let server_str = server.to_string();
         let token_str = token.to_string();
@@ -2440,6 +2533,7 @@ impl qobject::StreamBridge {
         let effective_disable_cuda = render_backend_disables_cuda(&render_backend_str);
         let encoder_str = encoder.to_string().to_lowercase();
         let display_str = display_id.to_string();
+        let source_str = source_id.to_string();
 
         let mut width = 1280;
         let mut height = 720;
@@ -2484,12 +2578,17 @@ impl qobject::StreamBridge {
             } else {
                 Some(display_str)
             },
+            source_id: (!source_str.is_empty()).then_some(source_str),
         };
 
         {
             let mut active_config_lock = ACTIVE_CONFIG.lock().unwrap();
             *active_config_lock = Some(args);
         }
+        // A session the user started: the count of restarts a source asked
+        // for begins anew, and what an earlier session's source said is forgotten.
+        *SOURCE_RESTARTS.lock().unwrap() = (0, None);
+        *PENDING_SOURCE_STATUS.lock().unwrap() = None;
 
         println!("Configuring session from dashboard. Launching stream...");
         self.as_mut().start_stream();
@@ -2791,6 +2890,19 @@ impl qobject::StreamBridge {
             .map_err(|_| "Use a port from 1024 to 65535".to_string())
             .and_then(|port| crate::host::set_rustdesk(enabled, port));
         QString::from(&result.err().unwrap_or_default())
+    }
+
+    pub fn host_sources(self: Pin<&mut Self>) -> QString {
+        QString::from(&crate::host::sources_json())
+    }
+
+    pub fn host_add_source(self: Pin<&mut Self>, name: QString, connector: QString, values_json: QString) -> QString {
+        let result = crate::host::add_source(&name.to_string(), &connector.to_string(), &values_json.to_string());
+        QString::from(&result.err().unwrap_or_default())
+    }
+
+    pub fn host_remove_source(self: Pin<&mut Self>, id: QString) -> QString {
+        QString::from(&crate::host::remove_source(&id.to_string()).err().unwrap_or_default())
     }
 
     pub fn host_set_port(self: Pin<&mut Self>, port: i32) -> QString {
@@ -4902,6 +5014,7 @@ async fn run_webrtc_client_task(
     input_protocol: String,
     encoder: Option<String>,
     display_id: Option<String>,
+    source_id: Option<String>,
     sink_wrapper: VideoSinkWrapper,
     input_senders: Arc<Mutex<Option<super::input::InputSenders>>>,
     active_decoder: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
@@ -5193,6 +5306,10 @@ async fn run_webrtc_client_task(
         chroma: request_chroma,
         encoder_csc_mode: requested_csc,
         microphone: crate::audio::record_microphone().then_some(true),
+        source_id,
+        // What this client decodes: a source is passed on as it is encoded,
+        // so the host has to know what it may send.
+        decode_codecs: Some(decode_codecs_for_request(crate::decoder::decodable_codecs(), &request_codec)),
     };
     let request_with_codec = move |codec: &str| -> ClientMessage {
         let mut sig = request_template.clone();
@@ -5249,6 +5366,7 @@ async fn run_webrtc_client_task(
                         encoders,
                         gpu_info,
                         host_os,
+                        sources,
                         ..
                     } => {
                         if auto_pending.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -5273,6 +5391,7 @@ async fn run_webrtc_client_task(
                         *PENDING_CAPABILITIES.lock().unwrap() = Some(PendingCapabilities {
                             displays_json,
                             encoders_json,
+                            sources_json: serde_json::to_string(&sources).unwrap_or_else(|_| "[]".to_string()),
                             gpu_info: gpu_info.unwrap_or_default(),
                             host_os: host_os_str,
                         });
@@ -5522,6 +5641,16 @@ async fn run_webrtc_client_task(
                         println!("Stream session ended by remote host.");
                         break;
                     }
+                    SignalingMessage::SourceStatus { status, reason, .. } => {
+                        // "failed": the source could not be connected, no
+                        // session follows. "ended": it closed. "restart": it
+                        // changed its codec and the same session is to be
+                        // asked for again. This connection is over in all
+                        // three; `poll_stats` does the rest.
+                        println!("Source status from the host: {}", status);
+                        *PENDING_SOURCE_STATUS.lock().unwrap() = Some((status, reason.unwrap_or_default()));
+                        break;
+                    }
                     SignalingMessage::AccessRequest { status, .. } => {
                         if let Some(refusal) = crate::host::access_refusal(&status) {
                             return Err(anyhow::anyhow!(refusal));
@@ -5546,6 +5675,34 @@ async fn run_webrtc_client_task(
         let _ = pc.close().await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::{decode_codecs_for_request, source_restart_allowed};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn three_restarts_in_a_row_then_no_more() {
+        let start = Instant::now();
+        let mut state = (0, None);
+        for i in 0..3 {
+            assert!(source_restart_allowed(&mut state, start + Duration::from_secs(i * 5)));
+        }
+        assert!(!source_restart_allowed(&mut state, start + Duration::from_secs(15)));
+        // After a session that lasted, the count begins anew.
+        assert!(source_restart_allowed(&mut state, start + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn the_chosen_codec_comes_first() {
+        let all = || vec!["h264".to_string(), "h265".to_string(), "av1".to_string()];
+        assert_eq!(decode_codecs_for_request(all(), "auto"), ["h264", "h265", "av1"]);
+        assert_eq!(decode_codecs_for_request(all(), "av1"), ["av1", "h264", "h265"]);
+        assert_eq!(decode_codecs_for_request(all(), "hevc"), ["h265", "h264", "av1"]);
+        // One this client has no decoder for is not added.
+        assert_eq!(decode_codecs_for_request(vec!["h264".to_string()], "av1"), ["h264"]);
+    }
 }
 
 #[cfg(test)]
