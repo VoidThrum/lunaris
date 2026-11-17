@@ -44,7 +44,7 @@ pub async fn attach(pc: &Arc<dyn PeerConnection>, allow_clipboard: bool) -> anyh
 pub async fn attach_link(
     pc: &Arc<dyn PeerConnection>,
     set: std_mpsc::Sender<String>,
-    changed: tokio::sync::mpsc::UnboundedReceiver<String>,
+    changed: tokio::sync::mpsc::UnboundedReceiver<ClipboardOut>,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let reliable = RTCDataChannelInit { ordered: true, ..Default::default() };
     let clipboard = pc.create_data_channel("clipboard", Some(reliable)).await?;
@@ -76,15 +76,35 @@ fn setup_clipboard(channel: Arc<dyn DataChannel>, allowed: bool) -> Vec<tokio::t
     {
         return Vec::new();
     }
-    link_clipboard(channel, set_tx, changed_rx)
+    // This computer's clipboard thread sends its text as it is.
+    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<ClipboardOut>();
+    let mut changed_rx = changed_rx;
+    let adapter = tokio::spawn(async move {
+        while let Some(text) = changed_rx.recv().await {
+            if out_tx.send(ClipboardOut::Text(text)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut tasks = link_clipboard(channel, set_tx, out_rx);
+    tasks.push(adapter);
+    tasks
 }
 
 /// The `clipboard` channel's two directions: text from the client goes to
 /// `set_tx`, text from `changed_rx` to the client.
+/// What goes to the client on the `clipboard` channel.
+pub enum ClipboardOut {
+    /// The text of the computer shown.
+    Text(String),
+    /// Why the clipboard is not shared (shown to the person).
+    Error(String),
+}
+
 fn link_clipboard(
     channel: Arc<dyn DataChannel>,
     set_tx: std_mpsc::Sender<String>,
-    mut changed_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut changed_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardOut>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let set_tx = Mutex::new(set_tx);
     let reader = channel.clone();
@@ -96,7 +116,13 @@ fn link_clipboard(
                     Ok(ClipboardMsg::Clipboard { text }) if text.len() <= MAX_CLIPBOARD_BYTES => {
                         let _ = set_tx.lock().unwrap().send(text);
                     }
-                    Ok(_) => warn!("Clipboard text from the client is too large; ignored"),
+                    Ok(_) => {
+                        // Not taken, and said so (never cut short).
+                        warn!("Clipboard text from the client is too large; ignored");
+                        let _ = reader
+                            .send_text(&json!({"type": "clipboard_error", "message": "The copied text is too large to send (more than 1 MB)"}).to_string())
+                            .await;
+                    }
                     Err(e) => warn!("Bad clipboard message: {}", e),
                 }
             }
@@ -105,11 +131,14 @@ fn link_clipboard(
 
     let ch = channel.clone();
     let sender = tokio::spawn(async move {
-        while let Some(text) = changed_rx.recv().await {
+        while let Some(out) = changed_rx.recv().await {
             if !matches!(ch.ready_state().await, Ok(RTCDataChannelState::Open)) {
                 continue;
             }
-            let payload = json!({"type": "clipboard", "text": text}).to_string();
+            let payload = match out {
+                ClipboardOut::Text(text) => json!({"type": "clipboard", "text": text}).to_string(),
+                ClipboardOut::Error(message) => json!({"type": "clipboard_error", "message": message}).to_string(),
+            };
             if let Err(e) = ch.send_text(&payload).await {
                 warn!("Could not send the clipboard to the client: {}", e);
             }

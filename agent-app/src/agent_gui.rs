@@ -115,6 +115,10 @@ pub mod qobject {
         #[qsignal]
         fn rustdesk_config_loaded(self: Pin<&mut AgentBridge>, enabled: bool, port: i32);
 
+        /// Whether RustDesk clients may use their file manager here.
+        #[qsignal]
+        fn rustdesk_file_transfer_loaded(self: Pin<&mut AgentBridge>, enabled: bool);
+
         /// Direct connections: on/off, port, access password and this
         /// computer's addresses (one per line).
         #[qsignal]
@@ -158,6 +162,11 @@ pub mod qobject {
         /// (`rustdesk_port` of the config).
         #[qinvokable]
         fn set_rustdesk(self: Pin<&mut AgentBridge>, enabled: bool, port: i32);
+
+        /// Lets RustDesk clients use their file manager on this computer,
+        /// or not (`rustdesk_file_transfer` of the config).
+        #[qinvokable]
+        fn set_rustdesk_file_transfer(self: Pin<&mut AgentBridge>, enabled: bool);
 
         #[qinvokable]
         fn start_agent(self: Pin<&mut AgentBridge>);
@@ -324,6 +333,12 @@ impl qobject::AgentBridge {
         self.as_mut().save_direct_config(config);
     }
 
+    pub fn set_rustdesk_file_transfer(mut self: Pin<&mut Self>, enabled: bool) {
+        let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
+        config.rustdesk_file_transfer = enabled;
+        self.as_mut().save_direct_config(config);
+    }
+
     pub fn regenerate_direct_password(mut self: Pin<&mut Self>) {
         let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
         config.direct_password = agent::pairing::generate_direct_password();
@@ -356,6 +371,7 @@ impl qobject::AgentBridge {
             config.rustdesk_port.is_some(),
             config.rustdesk_port.unwrap_or(agent::rustdesk::DEFAULT_PORT) as i32,
         );
+        self.as_mut().rustdesk_file_transfer_loaded(config.rustdesk_file_transfer);
         self.as_mut().direct_config_loaded(
             config.direct_enabled,
             config.direct_port as i32,

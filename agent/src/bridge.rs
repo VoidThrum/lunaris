@@ -935,7 +935,7 @@ pub async fn setup_bridge_session(
     // this computer's clipboard, pointer, keyboard and controllers are left
     // alone.
     let (viewer_input_tx, viewer_input_rx) = tokio::sync::mpsc::unbounded_channel::<crate::connector::media::ViewerInput>();
-    let (source_clipboard_tx, source_clipboard_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (source_clipboard_tx, source_clipboard_rx) = tokio::sync::mpsc::unbounded_channel::<crate::share::ClipboardOut>();
     if from_connector {
         let (set_tx, set_rx) = std::sync::mpsc::channel::<String>();
         let to_source = viewer_input_tx.clone();
@@ -1378,8 +1378,10 @@ pub async fn setup_bridge_session(
         const RTP_PACKET_BYTES: u64 = 1200;
         // A source's bitrate is its own, not the one asked for here: its
         // frames are only spread over their share of the frame interval.
+        // Its ordinary frames (a few packets) leave at once; only a large one
+        // (a key frame) is spread, at 12 packets a millisecond.
         let pacing_packets_in_1ms: u64 = if from_connector {
-            1
+            12
         } else {
             ((stream_bitrate as u64 * 1000 * 25 / 10) / 8 / RTP_PACKET_BYTES / 1000).max(1)
         };

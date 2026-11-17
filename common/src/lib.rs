@@ -337,6 +337,11 @@ pub enum SignalingMessage {
     /// stream (agent/src/files.rs). Sent on its own signaling connection.
     RequestFileSession {
         host_id: String,
+        /// The source whose files are wanted: one of the host's `sources`
+        /// (a computer it shows through a connector). None = the host's
+        /// own files.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<String>,
     },
     /// Server/hub -> agent: a client wants a file-transfer connection.
     IncomingFileSession {
@@ -345,6 +350,9 @@ pub enum SignalingMessage {
         ice_servers: Option<Vec<RtcIceServer>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requester: Option<String>,
+        /// The source whose files are wanted; None = the host's own files.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<String>,
     },
     // SDP / ICE Exchange
     Sdp {

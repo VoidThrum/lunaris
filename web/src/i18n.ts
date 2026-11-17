@@ -30,6 +30,10 @@ export const setLang = (next: Lang) => {
 };
 
 const vi: Record<string, string> = {
+  'The copied text is too large to send (more than 1 MB)': 'Văn bản đã sao chép quá lớn nên không gửi được (hơn 1 MB)',
+  'The copied text is too large to send over this connection': 'Văn bản đã sao chép quá lớn nên không gửi được qua kết nối này',
+  'The text copied on the other computer is too large to bring over (more than 1 MB)': 'Văn bản sao chép ở máy kia quá lớn nên không mang sang được (hơn 1 MB)',
+  'The other computer does not allow its clipboard to be used': 'Máy kia không cho dùng bộ nhớ tạm của nó',
   // Computers added by address, connections accepted at the computer
   'Add computer': 'Thêm máy',
   'Add a computer by its address': 'Thêm máy bằng địa chỉ IP',
@@ -398,6 +402,13 @@ const vi: Record<string, string> = {
   'Could not connect to the other computer: %1': 'Không kết nối được tới máy kia: %1',
   'The other computer ended the session: %1': 'Máy kia đã kết thúc phiên: %1',
   'Wrong password for the RustDesk computer': 'Sai mật khẩu của máy RustDesk',
+  'This kind of computer has no file transfer': 'Loại máy này không hỗ trợ truyền file',
+  'File transfer is switched off on the RustDesk computer (its "Enable file transfer" permission)': 'Máy RustDesk đã tắt truyền file (quyền "Bật truyền tệp" trên máy đó)',
+  'The computer did not answer in time': 'Máy kia không trả lời kịp',
+  'That is not a file': 'Đó không phải là một file',
+  'That is not a name for a file': 'Tên đó không dùng làm tên file được',
+  'Another download is running': 'Đang có một lượt tải xuống khác',
+  'The RustDesk on that computer is too old to rename files (it needs 1.3.0 or newer)': 'RustDesk trên máy đó quá cũ nên không đổi tên file được (cần bản 1.3.0 trở lên)',
   'The RustDesk computer does not accept a password (only a click at the computer)': 'Máy RustDesk không nhận mật khẩu (chỉ chấp nhận bấm đồng ý tại máy)',
   'This computer no longer has that source': 'Máy này không còn nguồn đó nữa',
   'The computer sent no picture': 'Máy kia không gửi hình',

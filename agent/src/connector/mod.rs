@@ -23,14 +23,21 @@
 //!   one to one). `connectors/template/` in the repository is a minimal one
 //!   and its README the protocol's reference.
 //!
+//! Files are a part of their own (`files.rs`): [`Connector::open_files`]
+//! logs in to a target for its files and gives a [`files::FileSession`],
+//! which the agent's file sessions serve to the Lunaris file manager. A
+//! connector that has none leaves it out.
+//!
 //! An external connector is a program the user chose to run with their own
 //! rights. Nothing installs or downloads one: it exists when the user put
 //! its folder there, and it is started only for a target that names it.
 
+pub mod files;
 pub mod keys;
 pub mod media;
 pub mod process;
 pub mod rustdesk;
+pub mod rustdesk_files;
 pub mod sources;
 
 use std::collections::BTreeMap;
@@ -80,6 +87,9 @@ pub struct Capabilities {
     pub clipboard: bool,
     #[serde(default)]
     pub cursor: bool,
+    /// The target's files can be browsed and copied ([`Connector::open_files`]).
+    #[serde(default)]
+    pub files: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +195,9 @@ pub enum Event {
     Platform { os: String },
     /// The remote computer's clipboard text changed.
     Clipboard { text: String },
+    /// The clipboard cannot be shared (now): the reason, for the viewer
+    /// (the other computer does not allow it, the text is too large).
+    ClipboardError { text: String },
     /// The displays there are and the one shown.
     Displays { displays: Vec<DisplayInfo>, current: usize },
     /// The end; nothing follows.
@@ -230,6 +243,13 @@ pub trait Connector: Send + Sync {
     /// Logs in to `target`. An error is a text for the person who asked
     /// (wrong password, not reachable, ...).
     async fn connect(&self, target: &Target, viewer: &Viewer) -> anyhow::Result<Session>;
+
+    /// Logs in to `target` for its files: a connection of its own, beside
+    /// any picture session. An error is a text for the person who asked. A
+    /// connector that has no files leaves this as it is.
+    async fn open_files(&self, _target: &Target) -> anyhow::Result<files::FileSession> {
+        anyhow::bail!(files::NO_FILES)
+    }
 }
 
 /// The connectors built into the agent.

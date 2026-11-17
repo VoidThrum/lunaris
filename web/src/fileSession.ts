@@ -37,7 +37,8 @@ export const humanSize = (b: number) =>
 export const joinRemote = (dir: string, name: string, sep: string) =>
   dir.endsWith('/') || dir.endsWith('\\') ? dir + name : dir + sep + name;
 
-type Opts = { wsUrl: string; hostId: string; onClose?: (reason: string) => void };
+/** `sourceId`: the files of that source of the host (a computer it shows through a connector), not the host's own. */
+type Opts = { wsUrl: string; hostId: string; sourceId?: string; onClose?: (reason: string) => void };
 
 export class FileSession {
   private ws: WebSocket | null = null;
@@ -67,7 +68,7 @@ export class FileSession {
       const ws = new WebSocket(this.opts.wsUrl);
       this.ws = ws;
       const send = (type: string, payload: object) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ event: 'Signaling', data: { type, payload } }));
-      ws.onopen = () => send('RequestFileSession', { host_id: this.opts.hostId });
+      ws.onopen = () => send('RequestFileSession', this.opts.sourceId ? { host_id: this.opts.hostId, source_id: this.opts.sourceId } : { host_id: this.opts.hostId });
       ws.onerror = () => fail(new Error(t('Cannot reach the server')));
       ws.onclose = () => { if (!this.open) fail(new Error(t('Connection closed'))); else this.closedBy(t('Connection closed')); };
       ws.onmessage = async (event) => {

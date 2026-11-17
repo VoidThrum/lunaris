@@ -91,7 +91,7 @@ QtObject {
     function hostStatus() {
         return JSON.stringify({ enabled: true, running: true, port: 8091, password: "k7m2p9qd", addresses: ["192.168.1.10"],
             hostname: "this-pc", input_ready: true, allow_clipboard: true, allow_file_transfer: true, full_disk_access: false,
-            approve_mode: "password-click", rustdesk_enabled: false, rustdesk_port: 21118, error: "" });
+            approve_mode: "password-click", rustdesk_enabled: false, rustdesk_port: 21118, rustdesk_file_transfer: false, error: "" });
     }
     function hostStart() { return ""; }
     function hostStop() { return ""; }

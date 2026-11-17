@@ -45,6 +45,14 @@ pub const TEST_DELAY_REPLY_ENV: &str = "LUNARIS_CONNECTOR_TEST_DELAY_REPLY_MS";
 /// source is shown: what a viewer is told as the host's when it asks.
 static SOURCE_OS: Mutex<Option<String>> = Mutex::new(None);
 
+/// Whether a source is being shown now (the session's picture is another
+/// computer's).
+static SOURCE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn source_active() -> bool {
+    SOURCE_ACTIVE.load(Ordering::Relaxed)
+}
+
 /// The platform of the source being shown, if one is.
 pub fn source_os() -> Option<String> {
     SOURCE_OS.lock().unwrap().clone()
@@ -72,6 +80,12 @@ struct Counters {
     first_capture_ms: Option<u64>,
     /// Whether the RTP times are (still) made of the source's own times.
     capture_times_used: bool,
+    /// Pictures kept from before the viewer's connection was up, and sent.
+    early: u64,
+    /// The bytes of the frames, and of those how many were filler data
+    /// (bytes a constant-bitrate encoder pads with; they are not sent on).
+    bytes: u64,
+    filler_bytes: u64,
     /// The viewer's input events and the commands made of them (counts).
     input_events: u64,
     input_commands: u64,
@@ -81,6 +95,7 @@ struct Counters {
 /// agent stops the task when the viewer leaves).
 impl Drop for Counters {
     fn drop(&mut self) {
+        SOURCE_ACTIVE.store(false, Ordering::Relaxed);
         *SOURCE_OS.lock().unwrap() = None;
         info!("Connector session: {}; input: {} events, {} commands", self.summary(self.capture_times_used), self.input_events, self.input_commands);
     }
@@ -133,12 +148,15 @@ impl Counters {
             _ => "-".to_string(),
         };
         format!(
-            "frames: {} received, {} forwarded, {} dropped at the packager, {} key, {} key frames asked for; frames per second min {} median {} max {} over {} s ({} by the source's own times); gap between frames ms median {:.1} p95 {:.1} p99 {:.1} max {:.1}; source times {} (worst mismatch with arrival {} ms)",
+            "frames: {} received, {} forwarded, {} dropped at the packager, {} key, {} key frames asked for, {} kept from before the connection; {} bytes a frame on average, {} % of the bytes filler; frames per second min {} median {} max {} over {} s ({} by the source's own times); gap between frames ms median {:.1} p95 {:.1} p99 {:.1} max {:.1}; source times {} (worst mismatch with arrival {} ms)",
             self.received,
             self.forwarded,
             self.dropped,
             self.keys,
             self.key_requests,
+            self.early,
+            self.bytes.checked_div(self.received).unwrap_or(0),
+            (self.filler_bytes * 100).checked_div(self.bytes).unwrap_or(0),
             seconds.first().copied().unwrap_or(0),
             seconds.get(seconds.len() / 2).copied().unwrap_or(0),
             seconds.last().copied().unwrap_or(0),
@@ -425,6 +443,70 @@ impl InputMapper {
     }
 }
 
+/// The pictures that came while the viewer's connection was not up yet:
+/// the last key frame and what followed it, while that is little.
+#[derive(Default)]
+struct Early {
+    frames: Vec<(bytes::Bytes, u32)>,
+    bytes: usize,
+    /// Too much came before the connection was up: nothing is kept until
+    /// the next key frame.
+    gave_up: bool,
+}
+
+/// More than this is not kept (a quarter to half a second of pictures):
+/// the viewer would see them run by before the present one.
+const EARLY_FRAMES: usize = 16;
+/// The pictures kept are handed on a little apart (the key frame gets
+/// more): all at once they would be thrown away further on as a backlog
+/// (the RTP writer keeps a few frames at most).
+const EARLY_KEY_SPACING: Duration = Duration::from_millis(10);
+const EARLY_SPACING: Duration = Duration::from_millis(3);
+const EARLY_BYTES: usize = 4 * 1024 * 1024;
+
+impl Early {
+    fn keep(&mut self, key: bool, data: bytes::Bytes, timestamp: u32) {
+        if key {
+            self.frames.clear();
+            self.bytes = 0;
+            self.gave_up = false;
+        }
+        if self.gave_up || (self.frames.is_empty() && !key) {
+            return;
+        }
+        self.bytes += data.len();
+        self.frames.push((data, timestamp));
+        if self.frames.len() > EARLY_FRAMES || self.bytes > EARLY_BYTES {
+            debug!("Connector: too many pictures before the viewer's connection is up; a key frame will be asked for");
+            self.frames.clear();
+            self.bytes = 0;
+            self.gave_up = true;
+        }
+    }
+
+    /// Sends what was kept; whether there was anything (a whole picture).
+    async fn flush(&mut self, video: &mpsc::Sender<VideoFramePayload>, counters: &mut Counters) -> bool {
+        if self.frames.is_empty() {
+            return false;
+        }
+        self.bytes = 0;
+        let kept = std::mem::take(&mut self.frames);
+        let last = kept.len() - 1;
+        for (n, (data, timestamp)) in kept.into_iter().enumerate() {
+            counters.early += 1;
+            if video.send_timeout(VideoFramePayload { full_frame: data.to_vec(), timestamp }, PACKAGER_WAIT).await.is_err() {
+                // The packager did not take it: the pictures after it are no
+                // use, and a key frame is asked for as before.
+                return false;
+            }
+            if n < last {
+                tokio::time::sleep(if n == 0 { EARLY_KEY_SPACING } else { EARLY_SPACING }).await;
+            }
+        }
+        true
+    }
+}
+
 /// The ends of the agent session a source is connected to.
 pub struct ViewerLink {
     pub video: mpsc::Sender<VideoFramePayload>,
@@ -434,8 +516,8 @@ pub struct ViewerLink {
     /// The session's requests of its pipeline (key frame, rate, stop).
     pub pipeline_commands: mpsc::Receiver<PipelineCommand>,
     pub input: mpsc::UnboundedReceiver<ViewerInput>,
-    /// Clipboard text for the viewer.
-    pub clipboard: mpsc::UnboundedSender<String>,
+    /// Clipboard text (or why there is none) for the viewer.
+    pub clipboard: mpsc::UnboundedSender<crate::share::ClipboardOut>,
     pub general: Arc<dyn webrtc::data_channel::DataChannel>,
     pub signaling: mpsc::UnboundedSender<common::AgentMessage>,
     pub client_id: String,
@@ -495,6 +577,9 @@ pub async fn run(source: Source, link: ViewerLink) {
     let mut report_at = Instant::now() + Duration::from_secs(5);
     let (mut frames, mut keys, mut bytes, mut dropped) = (0u64, 0u64, 0u64, 0u64);
     let mut counters = Counters::default();
+    // The text last passed either way, and how many texts went each way.
+    let mut clipboard_last: Option<String> = None;
+    let (mut clipboard_to_source, mut clipboard_to_viewer) = (0u64, 0u64);
     let mut mapper = InputMapper::default();
     let mut cursor = lunaris_media::types::CursorState {
         x: 0,
@@ -512,6 +597,11 @@ pub async fn run(source: Source, link: ViewerLink) {
     ARRIVALS.lock().unwrap().clear();
     HOP.lock().unwrap().clear();
     MEASURING.store(true, Ordering::Relaxed);
+    SOURCE_ACTIVE.store(true, Ordering::Relaxed);
+    // The pictures that came before the viewer's connection was up, from
+    // the last key frame on: sent the moment it is, so that the first
+    // picture does not wait for another key frame from the computer.
+    let mut early = Early::default();
 
     // What the viewer set: the frame rate and the bitrate it would like.
     let _ = commands.try_send(Command::Quality { fps, bitrate_kbps });
@@ -556,7 +646,13 @@ pub async fn run(source: Source, link: ViewerLink) {
                             }
                         }
                         Some(ViewerInput::Clipboard(text)) => {
-                            let _ = commands.send(Command::Clipboard { text }).await;
+                            // Text that just came from the computer and was put
+                            // on the viewer's clipboard is not sent back to it.
+                            if clipboard_last.as_deref() != Some(text.as_str()) {
+                                clipboard_last = Some(text.clone());
+                                clipboard_to_source += 1;
+                                let _ = commands.send(Command::Clipboard { text }).await;
+                            }
                         }
                         // The session's channels are gone: the viewer left.
                         None => {
@@ -573,6 +669,13 @@ pub async fn run(source: Source, link: ViewerLink) {
                             break ("The viewer left".to_string(), false, "");
                         }
                         Some(PipelineCommand::RequestKeyframe) => {
+                            // The session asks for a whole picture when the
+                            // viewer's connection is up: the pictures kept
+                            // from before start with one.
+                            if connected.load(Ordering::Relaxed) && early.flush(&video, &mut counters).await {
+                                info!("Connector: the first picture is one kept from before the viewer's connection was up");
+                                continue;
+                            }
                             key_awaited.get_or_insert_with(Instant::now);
                             counters.key_requests += 1;
                             Command::RequestKeyFrame
@@ -602,10 +705,17 @@ pub async fn run(source: Source, link: ViewerLink) {
                     }
                 }
                 if !connected.load(Ordering::Relaxed) {
+                    early.keep(key, data, timestamp);
                     continue;
                 }
+                // (If the frame got here before the session's request did.)
+                early.flush(&video, &mut counters).await;
                 counters.frame(now, capture_time_ms, key);
                 counters.capture_times_used = timeline.uses_capture_times();
+                counters.bytes += data.len() as u64;
+                if matches!(codec, Codec::H264 | Codec::H265) {
+                    counters.filler_bytes += crate::video::annexb::filler_bytes(&data, codec == Codec::H265) as u64;
+                }
                 frames += 1;
                 keys += key as u64;
                 bytes += data.len() as u64;
@@ -685,7 +795,17 @@ pub async fn run(source: Source, link: ViewerLink) {
                 let _ = media_events.try_send(MediaEvent::CursorUpdate(cursor.clone()));
             }
             Event::Clipboard { text } => {
-                let _ = clipboard.send(text);
+                // The same text again (the computer telling back what the
+                // viewer just set there) goes no further: no bouncing.
+                if clipboard_last.as_deref() != Some(text.as_str()) {
+                    clipboard_last = Some(text.clone());
+                    clipboard_to_viewer += 1;
+                    let _ = clipboard.send(crate::share::ClipboardOut::Text(text));
+                }
+            }
+            Event::ClipboardError { text } => {
+                info!("Connector: clipboard: {}", text);
+                let _ = clipboard.send(crate::share::ClipboardOut::Error(text));
             }
             // The viewer treats the pointer by the kind of computer shown
             // (it learns it from the encoder status, as of a Lunaris host).
@@ -716,7 +836,7 @@ pub async fn run(source: Source, link: ViewerLink) {
     MEASURING.store(false, Ordering::Relaxed);
     counters.input_events = input_events;
     counters.input_commands = input_commands;
-    info!("Connector: the source ended: {}", reason);
+    info!("Connector: the source ended: {}; clipboard texts: {} to the computer, {} to the viewer", reason, clipboard_to_source, clipboard_to_viewer);
     if by_source {
         // The viewer is told why, and the session is closed: no frozen picture.
         let _ = signaling.send(common::AgentMessage::Signaling(common::SignalingMessage::SourceStatus {
@@ -758,6 +878,41 @@ mod tests {
         assert_eq!(back.rtp(Some(1_000), at(32)), 32 * 90);
         let mut none = Timeline::new(start);
         assert_eq!(none.rtp(None, at(50)), 50 * 90);
+    }
+
+    #[tokio::test]
+    async fn the_first_pictures_are_kept_until_the_viewer_is_connected() {
+        let frame = |n: u8| bytes::Bytes::from(vec![n; 10]);
+        let (video, mut packager) = mpsc::channel::<VideoFramePayload>(16);
+        let mut counters = Counters::default();
+        let mut early = Early::default();
+        // Nothing kept: nothing to send, a key frame has to be asked for.
+        assert!(!early.flush(&video, &mut counters).await);
+        // Frames before a key frame are no use; from the key frame on they are kept.
+        early.keep(false, frame(1), 10);
+        early.keep(true, frame(2), 20);
+        early.keep(false, frame(3), 30);
+        // A newer key frame replaces what was kept.
+        early.keep(true, frame(4), 40);
+        early.keep(false, frame(5), 50);
+        assert!(early.flush(&video, &mut counters).await);
+        let sent: Vec<(u8, u32)> = std::iter::from_fn(|| packager.try_recv().ok()).map(|p| (p.full_frame[0], p.timestamp)).collect();
+        assert_eq!(sent, [(4, 40), (5, 50)]);
+        assert_eq!(counters.early, 2);
+        // Sent once.
+        assert!(!early.flush(&video, &mut counters).await);
+        // Too many before the connection is up: given up, until the next key frame.
+        early.keep(true, frame(6), 60);
+        for n in 0..EARLY_FRAMES as u8 {
+            early.keep(false, frame(7 + n), 70);
+        }
+        assert!(!early.flush(&video, &mut counters).await);
+        early.keep(false, frame(20), 80);
+        assert!(!early.flush(&video, &mut counters).await);
+        early.keep(true, frame(21), 90);
+        assert!(early.flush(&video, &mut counters).await);
+        assert_eq!(packager.try_recv().unwrap().full_frame[0], 21);
+        // (The counters write their line when dropped; nothing to check here.)
     }
 
     #[test]

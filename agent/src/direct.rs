@@ -975,7 +975,7 @@ mod tests {
 
     #[test]
     fn only_requests_need_approval() {
-        let req = SignalingMessage::RequestFileSession { host_id: "h".into() };
+        let req = SignalingMessage::RequestFileSession { host_id: "h".into(), source_id: None };
         assert_eq!(approval_kind(&req), Some(Kind::Files));
         assert!(!allowed_before_approval(&req));
         let caps = SignalingMessage::GetCapabilities { target_id: "h".into() };
@@ -1298,7 +1298,7 @@ mod tests {
         assert!(matches!(inbound(&mut rx).await, SignalingMessage::GetCapabilities { .. }));
         assert!(quiet(&mut rx).await);
 
-        send(&mut c.ws, SignalingMessage::RequestFileSession { host_id: "AGENT".into() }).await;
+        send(&mut c.ws, SignalingMessage::RequestFileSession { host_id: "AGENT".into(), source_id: None }).await;
         assert_eq!(status(&mut c.ws).await, "waiting");
         assert_eq!(status(&mut c.ws).await, "accepted");
         assert!(matches!(inbound(&mut rx).await, SignalingMessage::IncomingFileSession { .. }));

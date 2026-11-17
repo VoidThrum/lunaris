@@ -441,6 +441,26 @@ Rectangle {
                     checked: !!homeView && homeView.hostStatus.rustdesk_enabled === true
                     onToggled: rustdeskCard.apply(checked, parseInt(rustdeskPortField.text) || 21118)
                 }
+                CheckRow {
+                    // Off by default. Held to the same folders as Lunaris's
+                    // own file transfer, and off with it.
+                    text: I18n.t("Let RustDesk clients use their file manager here")
+                    enabled: !!homeView && homeView.hostStatus.rustdesk_enabled === true
+                    checked: !!homeView && homeView.hostStatus.rustdesk_file_transfer === true
+                    onToggled: {
+                        rustdeskCard.error = typeof bridge.hostSetRustdeskFiles === "function"
+                            ? bridge.hostSetRustdeskFiles(checked)
+                            : "This version of the app cannot change it";
+                        homeView.refreshHost();
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    text: I18n.t("They can then read and change files in this computer's home folder (or the whole disk, when file transfer is allowed that), as long as receiving files is switched on.")
+                    color: Theme.textMuted
+                    font.pixelSize: 12
+                }
                 SettingRow {
                     label: I18n.t("Port")
                     hint: I18n.t("Default 21118, the port RustDesk uses for direct IP access. In RustDesk, connect to address:port.")

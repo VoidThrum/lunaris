@@ -26,8 +26,12 @@ Rectangle {
     readonly property string remoteSep: (st.hello && st.hello.sep) ? st.hello.sep : "/"
 
     /// Opens for a computer of the server list (or direct: serverUrl ws://addr).
-    function openFor(serverUrl, token, hostId, hostName) {
-        bridge.filesOpen(serverUrl, token, hostId, hostName);
+    /// With `sourceId`: for that source of the computer, a computer it shows
+    /// through a connector (one the app added for itself: serverUrl
+    /// "bridge:", hostId "direct"). The remote side then is that computer.
+    function openFor(serverUrl, token, hostId, hostName, sourceId) {
+        if (sourceId) bridge.filesOpenSource(serverUrl, token, hostId, hostName, sourceId);
+        else bridge.filesOpen(serverUrl, token, hostId, hostName);
         show();
     }
     /// Opens for the computer being streamed.

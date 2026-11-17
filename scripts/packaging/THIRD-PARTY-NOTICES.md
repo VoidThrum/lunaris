@@ -64,6 +64,12 @@ under the GNU Affero General Public License v3.0 (AGPL-3.0):
   function (each step names the function it was ported from): the wire
   protocol, login, input handling, cursor, clipboard, file transfer and
   codec negotiation.
+- `agent/src/rustdesk/files.rs` (the host's side of RustDesk's file
+  transfer, for a RustDesk client's file manager) follows
+  `src/server/connection.rs` (the file-transfer login, `FileAction`,
+  `FileResponse`), `src/ui_cm_interface.rs` (`handle_fs`) and
+  `libs/base/src/fs.rs` (`read_dir`, `TransferJob`,
+  `is_write_need_confirmation`, `handle_read_jobs`).
 - `agent/src/connector/rustdesk.rs` (the agent as a RustDesk client, for
   showing a RustDesk computer) follows the client's side the same way:
   `src/client.rs`, `src/client/io_loop.rs`, `src/keyboard.rs` and

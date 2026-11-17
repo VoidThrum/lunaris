@@ -1140,13 +1140,17 @@ Rectangle {
                                     // Files of the computer (own connection, FileManager.qml)
                                     Button {
                                         id: filesBtn
-                                        visible: (hostDelegate.status === "Online" || hostDelegate.status === "Busy") && !hostDelegate.isSource
+                                        objectName: "cardFilesButton"
+                                        visible: hostDelegate.status === "Online" || hostDelegate.status === "Busy"
                                         hoverEnabled: true
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
                                         ToolTip.text: I18n.t("Files")
                                         Accessible.name: "Files"
-                                        onClicked: fileManager.openFor(dashboardRoot.serverUrl, dashboardRoot.token, modelData.id, modelData.name)
+                                        // A source: its files, through the computer it is reached through.
+                                        onClicked: hostDelegate.isSource
+                                            ? fileManager.openFor(dashboardRoot.serverUrl, dashboardRoot.token, modelData.host_id, modelData.name, modelData.id)
+                                            : fileManager.openFor(dashboardRoot.serverUrl, dashboardRoot.token, modelData.id, modelData.name)
                                         background: Rectangle {
                                             implicitWidth: 32; implicitHeight: 32; radius: 6
                                             color: filesBtn.hovered ? Theme.accentA(0.1) : "transparent"

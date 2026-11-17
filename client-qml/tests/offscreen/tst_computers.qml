@@ -19,7 +19,7 @@ Item {
     function startSystemMove() {}
 
     StubBridge { id: bridge }
-    Item { id: fileManager; property var opened: []; function openFor(server, token, hostId, name) { opened = opened.concat([hostId]); } }
+    Item { id: fileManager; property var opened: []; property var calls: []; function openFor(server, token, hostId, name, sourceId) { opened = opened.concat([hostId]); calls = calls.concat([[server, token, hostId, name, sourceId || ""]]); } }
 
     readonly property string outDir: String(Qt.resolvedUrl("out")).replace(/^file:\/\//, "")
 
@@ -118,7 +118,15 @@ Item {
             wait(50);
             sourceCard = cardOf("source:den-pc-1a2b");
 
-            // Its menu: no Files, no Rename, no Forget password; Edit instead.
+            // Its files: the same file manager, through the app's helper,
+            // naming the computer as the source; no password is asked for.
+            var filesBefore = fileManager.calls.length;
+            findChild(sourceCard, "peerFilesButton").clicked();
+            compare(fileManager.calls.length, filesBefore + 1);
+            compare(fileManager.calls[filesBefore], ["bridge:", "", "direct", "Den PC", "den-pc-1a2b"]);
+            compare(sessions.count, 0, "opening the files does not start a session");
+
+            // Its menu: Files, but no Rename and no Forget password; Edit instead.
             var more = findChild(sourceCard, "peerMoreButton");
             more.clicked();
             shot("home-card-menu");

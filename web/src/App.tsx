@@ -328,6 +328,8 @@ function App() {
   const [hostsLoading, setHostsLoading] = useState<boolean>(false);
   // File manager open for this host (its own connection, FileManager.tsx).
   const [filesHost, setFilesHost] = useState<Host | null>(null);
+  // ... or for this source: a computer of another type, through the host it is reached through.
+  const [filesSource, setFilesSource] = useState<Source | null>(null);
   // Agents connect with ws:// to the server's HTTP port, also when this page
   // was opened over https (another port).
   const [agentServerUrl, setAgentServerUrl] = useState<string>(() => `ws://${getBackendHost()}`);
@@ -1760,6 +1762,20 @@ function App() {
                                       {t('Connect')}
                                     </button>
                                   )}
+                                  {isOnline && (
+                                    <button
+                                      type="button"
+                                      className="host-action-btn"
+                                      title={t('Files')}
+                                      aria-label={t('Files')}
+                                      onClick={() => setFilesSource(source)}
+                                    >
+                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" />
+                                        <path d="M12 10v6M9 13l3-3 3 3" />
+                                      </svg>
+                                    </button>
+                                  )}
                                   {userRole === 'admin' && (
                                     <button
                                       type="button"
@@ -1819,6 +1835,16 @@ function App() {
           hostName={filesHost.name}
           wsUrl={`${getBackendProtocol().ws}//${getBackendHost()}/ws/client?token=${encodeURIComponent(token)}`}
           onClose={() => setFilesHost(null)}
+        />
+      )}
+      {filesSource && token && (
+        <FileManager
+          key={`files:${filesSource.host_id}:${filesSource.id}`}
+          hostId={filesSource.host_id}
+          sourceId={filesSource.id}
+          hostName={filesSource.name}
+          wsUrl={`${getBackendProtocol().ws}//${getBackendHost()}/ws/client?token=${encodeURIComponent(token)}`}
+          onClose={() => setFilesSource(null)}
         />
       )}
       {linkRequest && (

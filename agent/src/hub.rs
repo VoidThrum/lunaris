@@ -141,7 +141,7 @@ pub fn spawn_router(hub: Arc<Hub>) -> (mpsc::UnboundedSender<AgentMessage>, toki
 pub fn target_of(sig: &SignalingMessage) -> Option<&str> {
     use SignalingMessage::*;
     match sig {
-        RequestSession { host_id, .. } | RequestFileSession { host_id } => Some(host_id),
+        RequestSession { host_id, .. } | RequestFileSession { host_id, .. } => Some(host_id),
         IncomingSession { client_id, .. } | IncomingFileSession { client_id, .. } => Some(client_id),
         Sdp { target_id, .. }
         | IceCandidate { target_id, .. }
@@ -163,7 +163,7 @@ pub fn target_of(sig: &SignalingMessage) -> Option<&str> {
 pub fn with_target(mut sig: SignalingMessage, target: &str) -> SignalingMessage {
     use SignalingMessage::*;
     match &mut sig {
-        RequestSession { host_id, .. } | RequestFileSession { host_id } => *host_id = target.to_string(),
+        RequestSession { host_id, .. } | RequestFileSession { host_id, .. } => *host_id = target.to_string(),
         IncomingSession { client_id, .. } | IncomingFileSession { client_id, .. } => *client_id = target.to_string(),
         Sdp { target_id, .. }
         | IceCandidate { target_id, .. }
@@ -222,10 +222,11 @@ pub fn from_direct_client(sig: SignalingMessage, conn_id: &str) -> Option<Signal
             ice_servers: None,
             requester: None,
         }),
-        RequestFileSession { .. } => Some(IncomingFileSession {
+        RequestFileSession { source_id, .. } => Some(IncomingFileSession {
             client_id: conn_id.to_string(),
             ice_servers: None,
             requester: None,
+            source_id,
         }),
         Sdp {
             sdp,
@@ -264,6 +265,16 @@ mod tests {
                 username_fragment: None,
             },
         }
+    }
+
+    #[test]
+    fn a_direct_file_session_keeps_its_source() {
+        let incoming = |source_id: Option<String>| from_direct_client(SignalingMessage::RequestFileSession { host_id: "direct".into(), source_id }, "conn-7");
+        assert!(matches!(
+            incoming(Some("den-pc".into())),
+            Some(SignalingMessage::IncomingFileSession { client_id, source_id: Some(source), .. }) if client_id == "conn-7" && source == "den-pc"
+        ));
+        assert!(matches!(incoming(None), Some(SignalingMessage::IncomingFileSession { source_id: None, .. })));
     }
 
     #[test]

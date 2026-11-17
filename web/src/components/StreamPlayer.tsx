@@ -4050,6 +4050,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
           hostId={hostId}
           hostName={hostName}
           wsUrl={`${getBackendProtocol().ws}//${getBackendHost()}/ws/client?token=${encodeURIComponent(token)}`}
+          sourceId={sourceId}
           initialUploads={fileManager.uploads}
           onClose={() => setFileManager(null)}
         />

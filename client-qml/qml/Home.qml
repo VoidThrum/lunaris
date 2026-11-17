@@ -579,8 +579,13 @@ Rectangle {
     }
 
     function openPeerFiles(address) {
-        // A computer of another type has no Lunaris file transfer.
-        if (isSource(findPeer(address))) return;
+        // A computer of another type: its files through its connector, by
+        // the app's own helper (which knows its address and password).
+        var source = findPeer(address);
+        if (isSource(source)) {
+            fileManager.openFor("bridge:", "", "direct", source.name || "", source.sourceId || "");
+            return;
+        }
         withPassword(address, function (password) {
             var peer = findPeer(address);
             fileManager.openFor("ws://" + address, password, "direct",
@@ -1521,7 +1526,7 @@ Rectangle {
                 elide: Text.ElideRight
             }
             IconButton {
-                visible: !card.isSource
+                objectName: "peerFilesButton"
                 iconName: "folder"
                 tip: I18n.t("Files")
                 onClicked: home.openPeerFiles(card.peer.address)
@@ -1550,8 +1555,6 @@ Rectangle {
             }
             // What a card of another type has not is left out, not greyed.
             MenuItem {
-                visible: !card.isSource
-                height: visible ? implicitHeight : 0
                 text: I18n.t("Files")
                 onTriggered: home.openPeerFiles(card.peer.address)
             }

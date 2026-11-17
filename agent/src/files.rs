@@ -26,6 +26,17 @@
 //! Turned off on this computer by AgentConfig allow_file_transfer. What it
 //! may reach is AgentConfig file_access ([`Access`]): by default only the
 //! home folder; every path from the peer is checked against it.
+//!
+//! A session for a source (a computer this one shows through a connector,
+//! `IncomingFileSession.source_id`) speaks the same protocol on the same
+//! kind of channel, served from the connector's file session
+//! (`connector/files.rs`) and never from this computer's files
+//! ([`start_for_source`]). The two settings above are about this computer's
+//! own files and do not apply to it: what may be done with the other
+//! computer's files is that computer's to say (its own permission and
+//! password, through the connector), and a path of it means nothing here.
+//! Its `hello` has `"source": true`, and `home` is "" when the connector
+//! cannot tell the folder it starts in.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -44,15 +55,27 @@ use webrtc::peer_connection::{
     RTCPeerConnectionIceEvent, SettingEngineBuilder,
 };
 
+use crate::connector::files::{FileCommand, FileEvent, FileSession, OnExists as SourceOnExists};
+use crate::connector::Target;
+
 /// Chunks the agent sends. Receivers built on webrtc-rs (the desktop client)
 /// read messages into a 65535-byte buffer, so stay below it.
 pub const CHUNK: usize = 48 * 1024;
 const MAX_BUFFERED: usize = 4 * 1024 * 1024;
 const PART: &str = ".lunaris-part";
 /// Most entries `walk` returns (a whole disk is not a sensible download).
-const MAX_WALK: usize = 200_000;
+pub(crate) const MAX_WALK: usize = 200_000;
 /// Messages waiting between the data channel and the handler.
 const QUEUE: usize = 64;
+/// How long a connector has to open a source's files: less than the
+/// viewer waits for `hello`, so that it is told why.
+const SOURCE_OPEN_TIMEOUT: Duration = Duration::from_secs(12);
+/// Requests of a source session taken while the connector has not taken
+/// the ones before.
+const SOURCE_PENDING: usize = 8;
+/// The id of the listing a source session asks for itself (the home
+/// folder, to see whether it has a Downloads folder); no request has it.
+const SOURCE_HOME_LISTING: &str = "\u{0}home";
 
 /// What the peer may reach (AgentConfig file_access).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,7 +110,7 @@ impl Access {
     }
 
     /// The folder the peer starts in.
-    fn start(&self) -> PathBuf {
+    pub(crate) fn start(&self) -> PathBuf {
         match self {
             Access::Root(root) => root.clone(),
             _ => home(),
@@ -145,6 +168,67 @@ pub async fn start(
     allowed: bool,
     access: Access,
 ) -> anyhow::Result<(Arc<dyn PeerConnection>, String)> {
+    let (pc, channel, rx) = open_channel(&client_id, &agent_tx, servers).await?;
+    tokio::spawn(serve(channel, rx, allowed, access, client_id));
+    offer(pc).await
+}
+
+/// Whose files a session is for: `None` for this computer's own (no source
+/// was named), else the source's target, or the words for the person when
+/// this computer has no source of that id (never its own files instead).
+pub fn source_target(source_id: Option<&str>, sources: impl FnOnce() -> Vec<crate::connector::SourceConfig>) -> Option<Result<Target, String>> {
+    let id = source_id.filter(|id| !id.is_empty())?;
+    Some(match sources().into_iter().find(|source| source.id == id) {
+        Some(source) => {
+            info!("File session for source \"{}\" ({}) through connector {}", source.name, source.id, source.target.connector);
+            Ok(source.target)
+        }
+        None => {
+            warn!("File session asked for a source this computer does not have");
+            Err("This computer no longer has that source".to_string())
+        }
+    })
+}
+
+/// Like [`start`], for the files of a source: the channel is served from
+/// the connector's file session with `target`, which is opened now. When
+/// there is no such source (`Err` with the words for the person), or the
+/// connector cannot open it, every request is answered with that error:
+/// this computer's own files are never served in its place.
+pub async fn start_for_source(
+    client_id: String,
+    agent_tx: mpsc::UnboundedSender<common::AgentMessage>,
+    servers: Option<Vec<common::RtcIceServer>>,
+    target: Result<Target, String>,
+) -> anyhow::Result<(Arc<dyn PeerConnection>, String)> {
+    let (pc, channel, rx) = open_channel(&client_id, &agent_tx, servers).await?;
+    let opening = async move {
+        let target = target?;
+        let connector = crate::connector::find(&target.connector, &crate::connector::connectors_dir()).map_err(|e| e.to_string())?;
+        match tokio::time::timeout(SOURCE_OPEN_TIMEOUT, connector.open_files(&target)).await {
+            Ok(session) => session.map_err(|e| e.to_string()),
+            Err(_) => Err("The computer did not answer in time".to_string()),
+        }
+    };
+    tokio::spawn(async move {
+        let session = opening.await;
+        serve_source(channel, rx, session, client_id).await;
+    });
+    offer(pc).await
+}
+
+async fn offer(pc: Arc<dyn PeerConnection>) -> anyhow::Result<(Arc<dyn PeerConnection>, String)> {
+    let offer = pc.create_offer(None).await?;
+    pc.set_local_description(offer.clone()).await?;
+    Ok((pc, offer.sdp))
+}
+
+/// The connection of a file session, its `files` channel and what arrives on it.
+async fn open_channel(
+    client_id: &str,
+    agent_tx: &mpsc::UnboundedSender<common::AgentMessage>,
+    servers: Option<Vec<common::RtcIceServer>>,
+) -> anyhow::Result<(Arc<dyn PeerConnection>, Arc<dyn DataChannel>, mpsc::Receiver<RTCDataChannelMessage>)> {
     let settings = SettingEngineBuilder::new()
         .with_include_loopback_candidate(true)
         .with_network_types(vec![
@@ -156,7 +240,7 @@ pub async fn start(
         PeerConnectionBuilder::new()
             .with_setting_engine(settings)
             .with_configuration(RTCConfigurationBuilder::default().with_ice_servers(ice_servers(servers)).build())
-            .with_handler(Arc::new(IceToSignaling { tx: agent_tx.clone(), client: client_id.clone() }))
+            .with_handler(Arc::new(IceToSignaling { tx: agent_tx.clone(), client: client_id.to_string() }))
             // The wildcard covers every interface but not loopback (the
             // setting above only allows it): list it, as 0.17 gathered it.
             .with_udp_addrs(vec!["0.0.0.0:0", "127.0.0.1:0"])
@@ -180,11 +264,7 @@ pub async fn start(
             }
         }
     });
-    tokio::spawn(serve(channel, rx, allowed, access, client_id));
-
-    let offer = pc.create_offer(None).await?;
-    pc.set_local_description(offer.clone()).await?;
-    Ok((pc, offer.sdp))
+    Ok((pc, channel, rx))
 }
 
 // ---------------------------------------------------------------- requests
@@ -374,6 +454,250 @@ async fn serve(channel: Arc<dyn DataChannel>, mut rx: mpsc::Receiver<RTCDataChan
     info!("File session with {} closed", client);
 }
 
+// ---------------------------------------------------------------- sources
+
+/// A request of the channel's protocol as a command for a connector's file
+/// session; `None` for `hello` (answered here).
+fn source_command(req: Request) -> Option<FileCommand> {
+    Some(match req {
+        Request::Hello { .. } => return None,
+        Request::List { id, path, hidden } => FileCommand::List { id, path, hidden },
+        Request::Walk { id, path } => FileCommand::Walk { id, path },
+        Request::Mkdir { id, path } => FileCommand::Mkdir { id, path },
+        Request::Remove { id, path } => FileCommand::Remove { id, path },
+        Request::Rename { id, path, name } => FileCommand::Rename { id, path, name },
+        Request::Put { id, path, size, mtime, on_exists } => FileCommand::Write {
+            id,
+            path,
+            size,
+            mtime,
+            on_exists: match on_exists {
+                OnExists::Rename => SourceOnExists::Rename,
+                OnExists::Replace => SourceOnExists::Replace,
+                OnExists::Skip => SourceOnExists::Skip,
+            },
+        },
+        Request::PutEnd { id } => FileCommand::WriteEnd { id },
+        Request::Get { id, path, offset } => FileCommand::Read { id, path, offset },
+        Request::Cancel { id } => FileCommand::Cancel { id },
+    })
+}
+
+/// A connector's event as the channel's message; `None` for a file's data
+/// (sent as binary chunks) and for what the protocol has no message for.
+fn source_reply(event: &FileEvent) -> Option<Value> {
+    Some(match event {
+        FileEvent::Dir { id, path, parent, entries } => json!({"type": "dir", "id": id, "path": path, "parent": parent, "entries": entries}),
+        FileEvent::Walk { id, path, files, dirs } => json!({"type": "walk", "id": id, "path": path, "files": files, "dirs": dirs}),
+        FileEvent::Ok { id } => json!({"type": "ok", "id": id}),
+        FileEvent::ReadStart { id, size, mtime, offset } => json!({"type": "get_start", "id": id, "size": size, "mtime": mtime, "offset": offset}),
+        FileEvent::ReadEnd { id, cancelled: true } => json!({"type": "get_end", "id": id, "cancelled": true}),
+        FileEvent::ReadEnd { id, cancelled: false } => json!({"type": "get_end", "id": id}),
+        FileEvent::WriteReady { id, offset, path } => json!({"type": "put_ready", "id": id, "offset": offset, "path": path}),
+        FileEvent::WriteSkip { id, reason, path } => json!({"type": "put_skip", "id": id, "reason": reason, "path": path}),
+        FileEvent::WriteDone { id, path } => json!({"type": "done", "id": id, "path": path}),
+        FileEvent::Error { id, message } => err(id, message),
+        FileEvent::Stat { .. } | FileEvent::ReadData { .. } | FileEvent::Closed { .. } => return None,
+    })
+}
+
+/// `hello` of a source: what the connector knows of the computer. The
+/// folder files dropped on the stream go to is its Downloads folder when
+/// the home folder has one by that name, else the home folder.
+fn source_hello(id: &str, info: &crate::connector::files::FilesInfo, downloads: Option<&str>) -> Value {
+    let home = info.home.clone().unwrap_or_default();
+    json!({
+        "type": "hello", "id": id,
+        "home": home,
+        "downloads": downloads.unwrap_or(&home),
+        "os": info.os,
+        "sep": info.sep,
+        "roots": info.roots,
+        "source": true,
+    })
+}
+
+/// Serves the channel's protocol from a connector's file session (or, when
+/// there is none, answers every request with why).
+async fn serve_source(
+    channel: Arc<dyn DataChannel>,
+    mut rx: mpsc::Receiver<RTCDataChannelMessage>,
+    session: Result<FileSession, String>,
+    client: String,
+) {
+    info!("File session with {} for a source", client);
+    let mut session = match session {
+        Ok(session) => session,
+        Err(reason) => {
+            warn!("Files: the source's files could not be opened: {}", reason);
+            // The viewer is told with its `hello`, and with whatever else it asks.
+            while let Some(msg) = rx.recv().await {
+                if !msg.is_string {
+                    continue;
+                }
+                let id = serde_json::from_slice::<Value>(&msg.data).ok().and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_string));
+                send_json(&channel, err(id.as_deref().unwrap_or(""), &reason)).await;
+            }
+            info!("File session with {} closed", client);
+            return;
+        }
+    };
+    let info = session.info.clone();
+    let sep = info.sep.clone();
+    // Commands the connector has not taken yet (it is never waited for
+    // while its events wait: neither side can hold the other up).
+    let mut pending: std::collections::VecDeque<FileCommand> = Default::default();
+    // The file data on its way to the viewer, and whose it is.
+    let mut data = bytes::Bytes::new();
+    let mut download: Option<String> = None;
+    let mut upload: Option<String> = None;
+    // `hello` waiting for the home folder's listing, and what it showed.
+    let mut hello_waiting: Option<String> = None;
+    let mut downloads: Option<String> = None;
+    let mut closed: Option<String> = None;
+
+    loop {
+        // File data first, as much as the channel takes.
+        let mut blocked = false;
+        while !data.is_empty() {
+            if channel.outstanding_bytes().await.unwrap_or(0) > MAX_BUFFERED {
+                if !matches!(channel.ready_state().await, Ok(RTCDataChannelState::Open)) {
+                    data.clear();
+                }
+                blocked = !data.is_empty();
+                break;
+            }
+            let chunk = data.split_to(data.len().min(CHUNK));
+            if channel.send(bytes::BytesMut::from(&chunk[..])).await.is_err() {
+                data.clear();
+            }
+        }
+        tokio::select! {
+            permit = session.commands.reserve(), if !pending.is_empty() && closed.is_none() => {
+                match permit {
+                    Ok(permit) => permit.send(pending.pop_front().expect("not empty")),
+                    Err(_) => closed = Some("The connection to the computer ended".into()),
+                }
+            }
+            msg = rx.recv(), if pending.len() < SOURCE_PENDING => {
+                let Some(msg) = msg else { break };
+                if !msg.is_string {
+                    // A chunk of the file being uploaded.
+                    if let Some(id) = upload.clone() {
+                        pending.push_back(FileCommand::WriteData { id, data: msg.data.freeze() });
+                    }
+                    continue;
+                }
+                let req: Request = match serde_json::from_slice(&msg.data) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("Files: bad request: {}", e);
+                        continue;
+                    }
+                };
+                if let Some(reason) = &closed {
+                    let id = serde_json::from_slice::<Value>(&msg.data).ok().and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_string));
+                    send_json(&channel, err(id.as_deref().unwrap_or(""), reason)).await;
+                    continue;
+                }
+                match &req {
+                    Request::Hello { id } => {
+                        match (&info.home, &downloads) {
+                            (Some(home), None) => {
+                                hello_waiting = Some(id.clone());
+                                pending.push_back(FileCommand::List { id: SOURCE_HOME_LISTING.into(), path: home.clone(), hidden: false });
+                            }
+                            _ => send_json(&channel, source_hello(id, &info, downloads.as_deref())).await,
+                        }
+                        continue;
+                    }
+                    Request::Put { id, .. } => upload = Some(id.clone()),
+                    // One download at a time: a second one is refused by the
+                    // connector, and the first goes on.
+                    Request::Get { id, .. } => {
+                        if download.is_none() {
+                            download = Some(id.clone());
+                        }
+                    }
+                    Request::Cancel { id } => {
+                        if upload.as_deref() == Some(id.as_str()) {
+                            upload = None;
+                        }
+                        // Nothing more of a cancelled download is sent.
+                        if download.as_deref() == Some(id.as_str()) {
+                            download = None;
+                            data.clear();
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(command) = source_command(req) {
+                    pending.push_back(command);
+                }
+            }
+            event = session.events.recv(), if data.is_empty() && closed.is_none() => {
+                let event = event.unwrap_or(FileEvent::Closed { reason: "The connection to the computer ended".into() });
+                match event {
+                    // The listing asked for here: is there a Downloads folder?
+                    FileEvent::Dir { ref id, ref path, ref entries, .. } if id == SOURCE_HOME_LISTING => {
+                        let found = entries.iter().find(|e| e.dir && e.name.eq_ignore_ascii_case("Downloads"));
+                        let dir = match found {
+                            Some(e) if path.ends_with(['/', '\\']) => format!("{}{}", path, e.name),
+                            Some(e) => format!("{}{}{}", path, sep, e.name),
+                            None => path.clone(),
+                        };
+                        downloads = Some(dir);
+                        if let Some(id) = hello_waiting.take() {
+                            send_json(&channel, source_hello(&id, &info, downloads.as_deref())).await;
+                        }
+                    }
+                    FileEvent::Error { ref id, .. } if id == SOURCE_HOME_LISTING => {
+                        downloads = info.home.clone();
+                        if let Some(id) = hello_waiting.take() {
+                            send_json(&channel, source_hello(&id, &info, downloads.as_deref())).await;
+                        }
+                    }
+                    FileEvent::ReadData { id, data: bytes } => {
+                        if download.as_deref() == Some(id.as_str()) {
+                            data = bytes;
+                        }
+                    }
+                    FileEvent::Closed { reason } => {
+                        // What was under way ends with the reason; so does
+                        // whatever is asked from now on.
+                        for id in hello_waiting.take().into_iter().chain(download.take()).chain(upload.take()) {
+                            send_json(&channel, err(&id, &reason)).await;
+                        }
+                        pending.clear();
+                        closed = Some(reason);
+                    }
+                    event => {
+                        match &event {
+                            FileEvent::ReadEnd { id, .. } if download.as_deref() == Some(id.as_str()) => download = None,
+                            FileEvent::WriteSkip { id, .. } | FileEvent::WriteDone { id, .. } if upload.as_deref() == Some(id.as_str()) => upload = None,
+                            FileEvent::Error { id, .. } => {
+                                if upload.as_deref() == Some(id.as_str()) {
+                                    upload = None;
+                                }
+                                if download.as_deref() == Some(id.as_str()) {
+                                    download = None;
+                                }
+                            }
+                            _ => {}
+                        }
+                        if let Some(reply) = source_reply(&event) {
+                            send_json(&channel, reply).await;
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(5)), if blocked => {}
+        }
+    }
+    let _ = session.commands.try_send(FileCommand::Close);
+    info!("File session with {} closed", client);
+}
+
 fn simple(id: &str, r: std::io::Result<()>) -> Value {
     match r {
         Ok(()) => json!({"type": "ok", "id": id}),
@@ -400,7 +724,7 @@ fn expand(access: &Access, path: &str) -> PathBuf {
 
 /// `fs::canonicalize`, without the `\\?\` prefix Windows adds to a drive
 /// path (the peer shows these paths).
-fn canonical(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+pub(crate) fn canonical(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     let real = std::fs::canonicalize(path)?;
     #[cfg(windows)]
     {
@@ -457,12 +781,16 @@ fn real_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Names Windows opens as devices, with or without an extension.
+/// Names Windows opens as devices, with or without an extension or what
+/// follows a colon (`NUL.txt`, `COM1:9600`; Windows reads the name up to
+/// the first of either), the ports with a superscript digit too (`COM¹`).
 fn is_device_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
-    let b = stem.as_bytes();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
-        || (b.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && (b'1'..=b'9').contains(&b[3]))
+    let stem = name.split(['.', ':']).next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let mut rest = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")).unwrap_or("").chars();
+    matches!((rest.next(), rest.next()), (Some('1'..='9' | '¹' | '²' | '³'), None))
 }
 
 /// Checks on the text of a peer path, before the file system sees it (on
@@ -515,7 +843,7 @@ fn lexically_inside(root: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 /// A path from the peer, checked against `access` (links followed).
-fn resolve(access: &Access, path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve(access: &Access, path: &str) -> Result<PathBuf, String> {
     match access {
         Access::Full => {
             check_path_text(path, true)?;
@@ -540,7 +868,7 @@ fn resolve(access: &Access, path: &str) -> Result<PathBuf, String> {
 /// Like [`resolve`] for an entry that is removed or renamed itself: its
 /// folder is resolved, the last name is kept (a link is acted on, not
 /// followed). The allowed folder itself is not such an entry.
-fn resolve_entry(access: &Access, path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_entry(access: &Access, path: &str) -> Result<PathBuf, String> {
     let Access::Root(root) = access else {
         return resolve(access, path);
     };
@@ -565,7 +893,7 @@ fn resolve_entry(access: &Access, path: &str) -> Result<PathBuf, String> {
 }
 
 /// Whether `path` (a link perhaps) stays inside the allowed folder.
-fn inside(access: &Access, path: &Path) -> bool {
+pub(crate) fn inside(access: &Access, path: &Path) -> bool {
     match access {
         Access::Root(root) => canonical(path).map(|r| r.starts_with(root)).unwrap_or(false),
         _ => true,
@@ -590,7 +918,7 @@ fn rename(id: &str, access: &Access, path: &str, name: &str) -> Value {
     simple(id, std::fs::rename(&p, dest))
 }
 
-fn safe_name(name: &str) -> String {
+pub(crate) fn safe_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
     let cleaned: String = base
         .chars()
@@ -608,7 +936,7 @@ fn safe_name(name: &str) -> String {
     }
 }
 
-fn mtime_of(m: &std::fs::Metadata) -> u64 {
+pub(crate) fn mtime_of(m: &std::fs::Metadata) -> u64 {
     m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)
 }
 
@@ -1089,6 +1417,299 @@ mod tests {
         assert!(lexically_inside(Path::new("/r"), Path::new("a/../../x")).is_none());
         assert_eq!(lexically_inside(Path::new("/r"), Path::new("a/b")), Some(PathBuf::from("/r/a/b")));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_session_names_its_source_or_this_computers_own_files() {
+        let sources = || -> Vec<crate::connector::SourceConfig> {
+            vec![serde_json::from_str(r#"{"id":"office-pc","name":"Máy văn phòng","connector":"rustdesk","host":"192.0.2.5","password":"x"}"#).unwrap()]
+        };
+        // No source: this computer's own files (and the list is not even read).
+        assert!(source_target(None, || panic!("not asked")).is_none());
+        assert!(source_target(Some(""), || panic!("not asked")).is_none());
+        // A source it has: that computer, through its connector.
+        let target = source_target(Some("office-pc"), sources).unwrap().unwrap();
+        assert_eq!((target.connector.as_str(), target.get("host")), ("rustdesk", "192.0.2.5"));
+        // One it does not have: an error, never its own files.
+        assert_eq!(source_target(Some("gone"), sources).unwrap().unwrap_err(), "This computer no longer has that source");
+        assert_eq!(source_target(Some("gone"), Vec::new).unwrap().unwrap_err(), "This computer no longer has that source");
+    }
+
+    #[test]
+    fn a_sources_requests_and_answers_are_the_channels_protocol() {
+        let req = |text: &str| source_command(serde_json::from_str(text).unwrap());
+        assert_eq!(req(r#"{"type":"hello","id":"1"}"#), None);
+        assert_eq!(req(r#"{"type":"list","id":"2","path":"C:\\Users","hidden":true}"#), Some(FileCommand::List { id: "2".into(), path: "C:\\Users".into(), hidden: true }));
+        assert_eq!(req(r#"{"type":"walk","id":"3","path":"/a"}"#), Some(FileCommand::Walk { id: "3".into(), path: "/a".into() }));
+        assert_eq!(req(r#"{"type":"mkdir","id":"4","path":"/a"}"#), Some(FileCommand::Mkdir { id: "4".into(), path: "/a".into() }));
+        assert_eq!(req(r#"{"type":"remove","id":"5","path":"/a"}"#), Some(FileCommand::Remove { id: "5".into(), path: "/a".into() }));
+        assert_eq!(req(r#"{"type":"rename","id":"6","path":"/a","name":"b"}"#), Some(FileCommand::Rename { id: "6".into(), path: "/a".into(), name: "b".into() }));
+        assert_eq!(
+            req(r#"{"type":"put","id":"7","path":"/a","size":9,"mtime":3,"on_exists":"replace"}"#),
+            Some(FileCommand::Write { id: "7".into(), path: "/a".into(), size: 9, mtime: 3, on_exists: SourceOnExists::Replace })
+        );
+        // As the clients send it when they say nothing: kept beside the one there.
+        assert_eq!(
+            req(r#"{"type":"put","id":"7","path":"/a","size":9}"#),
+            Some(FileCommand::Write { id: "7".into(), path: "/a".into(), size: 9, mtime: 0, on_exists: SourceOnExists::Rename })
+        );
+        assert_eq!(req(r#"{"type":"put_end","id":"7"}"#), Some(FileCommand::WriteEnd { id: "7".into() }));
+        assert_eq!(req(r#"{"type":"get","id":"8","path":"/a","offset":5}"#), Some(FileCommand::Read { id: "8".into(), path: "/a".into(), offset: 5 }));
+        assert_eq!(req(r#"{"type":"cancel","id":"8"}"#), Some(FileCommand::Cancel { id: "8".into() }));
+
+        let entry = crate::connector::files::FileEntry { name: "ảnh.png".into(), dir: false, size: 7, mtime: 9, hidden: true };
+        let reply = |event: FileEvent| source_reply(&event).unwrap();
+        assert_eq!(
+            reply(FileEvent::Dir { id: "2".into(), path: "C:\\".into(), parent: None, entries: vec![entry] }),
+            json!({"type": "dir", "id": "2", "path": "C:\\", "parent": null, "entries": [{"name": "ảnh.png", "dir": false, "size": 7, "mtime": 9, "hidden": true}]})
+        );
+        assert_eq!(
+            reply(FileEvent::Walk { id: "3".into(), path: "/a".into(), files: vec![crate::connector::files::WalkFile { rel: "x/y".into(), size: 1, mtime: 2 }], dirs: vec!["x".into()] }),
+            json!({"type": "walk", "id": "3", "path": "/a", "files": [{"rel": "x/y", "size": 1, "mtime": 2}], "dirs": ["x"]})
+        );
+        assert_eq!(reply(FileEvent::Ok { id: "4".into() }), json!({"type": "ok", "id": "4"}));
+        assert_eq!(reply(FileEvent::ReadStart { id: "8".into(), size: 10, mtime: 2, offset: 5 }), json!({"type": "get_start", "id": "8", "size": 10, "mtime": 2, "offset": 5}));
+        assert_eq!(reply(FileEvent::ReadEnd { id: "8".into(), cancelled: false }), json!({"type": "get_end", "id": "8"}));
+        assert_eq!(reply(FileEvent::ReadEnd { id: "8".into(), cancelled: true }), json!({"type": "get_end", "id": "8", "cancelled": true}));
+        assert_eq!(reply(FileEvent::WriteReady { id: "7".into(), offset: 4, path: "/a".into() }), json!({"type": "put_ready", "id": "7", "offset": 4, "path": "/a"}));
+        assert_eq!(reply(FileEvent::WriteSkip { id: "7".into(), reason: "identical".into(), path: "/a".into() }), json!({"type": "put_skip", "id": "7", "reason": "identical", "path": "/a"}));
+        assert_eq!(reply(FileEvent::WriteDone { id: "7".into(), path: "/a (2)".into() }), json!({"type": "done", "id": "7", "path": "/a (2)"}));
+        assert_eq!(reply(FileEvent::Error { id: "5".into(), message: "Không được phép".into() }), json!({"type": "error", "id": "5", "message": "Không được phép"}));
+        assert!(source_reply(&FileEvent::ReadData { id: "8".into(), data: bytes::Bytes::new() }).is_none());
+
+        // hello: what the connector knows; no home when it cannot tell.
+        let mut info = crate::connector::files::FilesInfo {
+            os: "windows".into(),
+            sep: "\\".into(),
+            home: Some("C:\\Users\\An".into()),
+            roots: vec![crate::connector::files::Place { name: "C:".into(), path: "C:\\".into() }],
+        };
+        assert_eq!(
+            source_hello("1", &info, Some("C:\\Users\\An\\Downloads")),
+            json!({"type": "hello", "id": "1", "home": "C:\\Users\\An", "downloads": "C:\\Users\\An\\Downloads", "os": "windows", "sep": "\\", "roots": [{"name": "C:", "path": "C:\\"}], "source": true})
+        );
+        info.home = None;
+        let hello = source_hello("1", &info, None);
+        assert_eq!((hello["home"].as_str(), hello["downloads"].as_str()), (Some(""), Some("")));
+    }
+
+    /// The whole way of a source's file session: the viewer's end of the
+    /// `files` channel (as the clients have it), this agent's session for a
+    /// source, the RustDesk connector, and a RustDesk-protocol host over a
+    /// folder (`connector::rustdesk_files::tests::start_host`).
+    mod source_session {
+        use super::*;
+        use crate::connector::rustdesk_files::tests::{places, says_not_there, start_host, target, text, tmp, HostOptions};
+        use webrtc::peer_connection::{RTCIceCandidateInit, RTCSessionDescription};
+
+        struct ViewerEvents {
+            ice: mpsc::UnboundedSender<RTCIceCandidateInit>,
+            ready: mpsc::UnboundedSender<Arc<dyn DataChannel>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PeerConnectionEventHandler for ViewerEvents {
+            async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
+                if let Ok(c) = event.candidate.to_json() {
+                    let _ = self.ice.send(c);
+                }
+            }
+
+            async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
+                let _ = self.ready.send(data_channel);
+            }
+        }
+
+        struct Viewer {
+            channel: Arc<dyn DataChannel>,
+            messages: mpsc::UnboundedReceiver<RTCDataChannelMessage>,
+            _connections: (Arc<dyn PeerConnection>, Arc<dyn PeerConnection>),
+        }
+
+        impl Viewer {
+            /// Connects to a file session for `source` on this computer only.
+            async fn connect(source: Result<Target, String>) -> Viewer {
+                let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<common::AgentMessage>();
+                let (agent_pc, offer) = start_for_source("viewer".into(), agent_tx, Some(Vec::new()), source).await.unwrap();
+                let (ice_tx, mut ice_rx) = mpsc::unbounded_channel();
+                let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+                let settings = SettingEngineBuilder::new()
+                    .with_include_loopback_candidate(true)
+                    .with_network_types(vec![rtc::ice::network_type::NetworkType::Udp4])
+                    .build();
+                let pc: Arc<dyn PeerConnection> = Arc::new(
+                    PeerConnectionBuilder::new()
+                        .with_setting_engine(settings)
+                        .with_configuration(RTCConfigurationBuilder::default().with_ice_servers(Vec::new()).build())
+                        .with_handler(Arc::new(ViewerEvents { ice: ice_tx, ready: ready_tx }))
+                        .with_udp_addrs(vec!["127.0.0.1:0"])
+                        .build()
+                        .await
+                        .unwrap(),
+                );
+                pc.set_remote_description(RTCSessionDescription::offer(offer).unwrap()).await.unwrap();
+                let answer = pc.create_answer(None).await.unwrap();
+                pc.set_local_description(answer.clone()).await.unwrap();
+                agent_pc.set_remote_description(RTCSessionDescription::answer(answer.sdp).unwrap()).await.unwrap();
+                // Candidates both ways, as signaling would carry them.
+                let (to_viewer, to_agent) = (pc.clone(), agent_pc.clone());
+                tokio::spawn(async move {
+                    while let Some(common::AgentMessage::Signaling(sig)) = agent_rx.recv().await {
+                        if let common::SignalingMessage::IceCandidate { candidate: c, .. } = sig {
+                            let _ = to_viewer
+                                .add_ice_candidate(RTCIceCandidateInit {
+                                    candidate: c.candidate,
+                                    sdp_mid: c.sdp_mid,
+                                    sdp_mline_index: c.sdp_mline_index,
+                                    username_fragment: c.username_fragment,
+                                    ..Default::default()
+                                })
+                                .await;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    while let Some(candidate) = ice_rx.recv().await {
+                        let _ = to_agent.add_ice_candidate(candidate).await;
+                    }
+                });
+                let channel = tokio::time::timeout(Duration::from_secs(30), ready_rx.recv()).await.expect("the channel opens").unwrap();
+                let (tx, messages) = mpsc::unbounded_channel();
+                let reader = channel.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = reader.poll().await {
+                        if let DataChannelEvent::OnMessage(msg) = event {
+                            if tx.send(msg).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                Viewer { channel, messages, _connections: (pc, agent_pc) }
+            }
+
+            async fn message(&mut self) -> RTCDataChannelMessage {
+                tokio::time::timeout(Duration::from_secs(30), self.messages.recv()).await.expect("an answer in time").expect("the channel is open")
+            }
+
+            /// A request and its answer.
+            async fn ask(&mut self, request: Value) -> Value {
+                self.channel.send_text(&request.to_string()).await.unwrap();
+                self.answer().await
+            }
+
+            async fn answer(&mut self) -> Value {
+                let msg = self.message().await;
+                assert!(msg.is_string, "an answer, not file data");
+                serde_json::from_slice(&msg.data).unwrap()
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn the_file_manager_works_on_a_rustdesk_computer() {
+            let home = tmp("agent-source");
+            std::fs::create_dir_all(home.join("Downloads")).unwrap();
+            std::fs::create_dir_all(home.join("Tài liệu/con")).unwrap();
+            let words = "Một con ngựa đau cả tàu bỏ cỏ. ".repeat(10_000).into_bytes();
+            std::fs::write(home.join("Tài liệu/tục ngữ.txt"), &words).unwrap();
+            std::fs::write(home.join("Tài liệu/con/a.bin"), b"abc").unwrap();
+            let host = start_host(&home, HostOptions::default()).await;
+            // The other computer is one of this system here: its paths,
+            // its separator, its places ("/", or the drives of Windows).
+            let home_text = text(&home);
+            let at = |name: &str| text(&home.join(name));
+            let mut v = Viewer::connect(Ok(target(host.address, &host.password))).await;
+
+            // hello: the other computer's home, its Downloads folder, its places.
+            let hello = v.ask(json!({"type": "hello", "id": "h"})).await;
+            assert_eq!(
+                hello,
+                json!({
+                    "type": "hello", "id": "h", "home": home_text, "downloads": at("Downloads"),
+                    "os": std::env::consts::OS, "sep": std::path::MAIN_SEPARATOR_STR, "source": true,
+                    "roots": places(&home),
+                })
+            );
+            // The folder it starts in, as the clients ask for it.
+            let dir = v.ask(json!({"type": "list", "id": "l1", "path": hello["home"], "hidden": false})).await;
+            assert_eq!((dir["type"].as_str(), dir["path"].as_str(), dir["parent"].as_str()), (Some("dir"), Some(home_text.as_str()), home.parent().and_then(|p| p.to_str())));
+            let mut names: Vec<&str> = dir["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+            names.sort();
+            assert_eq!(names, ["Downloads", "Tài liệu"]);
+            assert!(dir["entries"].as_array().unwrap().iter().all(|e| e["dir"] == true));
+
+            // An upload in the clients' chunks, then the same file again.
+            let data: Vec<u8> = (0..1_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+            let put = json!({"type": "put", "id": "u1", "path": at("Downloads/lên.bin"), "size": data.len(), "mtime": 1_700_000_000u64, "on_exists": "rename"});
+            assert_eq!(v.ask(put.clone()).await, json!({"type": "put_ready", "id": "u1", "offset": 0, "path": at("Downloads/lên.bin")}));
+            for chunk in data.chunks(CHUNK) {
+                v.channel.send(bytes::BytesMut::from(chunk)).await.unwrap();
+            }
+            assert_eq!(v.ask(json!({"type": "put_end", "id": "u1"})).await, json!({"type": "done", "id": "u1", "path": at("Downloads/lên.bin")}));
+            assert!(std::fs::read(home.join("Downloads/lên.bin")).unwrap() == data);
+            let mut again = put;
+            again["id"] = json!("u2");
+            assert_eq!(v.ask(again).await, json!({"type": "put_skip", "id": "u2", "reason": "identical", "path": at("Downloads/lên.bin")}));
+
+            // A download, whole and from an offset: get_start, chunks no
+            // larger than the channel takes, get_end.
+            for offset in [0usize, 123_456] {
+                v.channel.send_text(&json!({"type": "get", "id": "d1", "path": at("Tài liệu/tục ngữ.txt"), "offset": offset}).to_string()).await.unwrap();
+                let start = v.answer().await;
+                assert_eq!((start["type"].as_str(), start["size"].as_u64(), start["offset"].as_u64()), (Some("get_start"), Some(words.len() as u64), Some(offset as u64)));
+                let mut got = Vec::new();
+                let end = loop {
+                    let msg = v.message().await;
+                    if msg.is_string {
+                        break serde_json::from_slice::<Value>(&msg.data).unwrap();
+                    }
+                    assert!(msg.data.len() <= CHUNK);
+                    got.extend_from_slice(&msg.data);
+                };
+                assert_eq!(end, json!({"type": "get_end", "id": "d1"}));
+                assert!(got == words[offset..]);
+            }
+
+            // Everything under a folder; a new folder; a new name; gone.
+            let walk = v.ask(json!({"type": "walk", "id": "w", "path": at("Tài liệu")})).await;
+            let mut files: Vec<&str> = walk["files"].as_array().unwrap().iter().map(|f| f["rel"].as_str().unwrap()).collect();
+            files.sort();
+            assert_eq!((walk["type"].as_str(), files, &walk["dirs"]), (Some("walk"), vec!["con/a.bin", "tục ngữ.txt"], &json!(["con"])));
+            assert_eq!(v.ask(json!({"type": "mkdir", "id": "m", "path": at("Mới")})).await, json!({"type": "ok", "id": "m"}));
+            assert_eq!(v.ask(json!({"type": "rename", "id": "r", "path": at("Mới"), "name": "Cũ"})).await, json!({"type": "ok", "id": "r"}));
+            assert!(home.join("Cũ").is_dir() && !home.join("Mới").exists());
+            assert_eq!(v.ask(json!({"type": "remove", "id": "x", "path": at("Tài liệu")})).await, json!({"type": "ok", "id": "x"}));
+            assert!(!home.join("Tài liệu").exists());
+            // The other computer's words for what goes wrong.
+            let error = v.ask(json!({"type": "list", "id": "l2", "path": at("không có"), "hidden": false})).await;
+            assert_eq!((error["type"].as_str(), error["id"].as_str()), (Some("error"), Some("l2")));
+            assert!(says_not_there(error["message"].as_str().unwrap()), "{}", error);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_source_that_cannot_be_opened_is_an_error_not_this_computers_files() {
+            let home = tmp("agent-source-refused");
+            // A source this computer does not have (any more).
+            let mut v = Viewer::connect(Err("This computer no longer has that source".into())).await;
+            assert_eq!(v.ask(json!({"type": "hello", "id": "h"})).await, json!({"type": "error", "id": "h", "message": "This computer no longer has that source"}));
+            let listing = v.ask(json!({"type": "list", "id": "l", "path": "", "hidden": false})).await;
+            assert_eq!(listing, json!({"type": "error", "id": "l", "message": "This computer no longer has that source"}));
+            // A computer that does not give its files, and a wrong password.
+            let closed = start_host(&home, HostOptions { file_permission: false, ..Default::default() }).await;
+            let mut v = Viewer::connect(Ok(target(closed.address, &closed.password))).await;
+            let hello = v.ask(json!({"type": "hello", "id": "h"})).await;
+            assert!(hello["type"] == "error" && hello["message"].as_str().unwrap().contains("File transfer is switched off on the RustDesk computer"), "{}", hello);
+            let host = start_host(&home, HostOptions::default()).await;
+            let mut v = Viewer::connect(Ok(target(host.address, "sai"))).await;
+            assert_eq!(v.ask(json!({"type": "hello", "id": "h"})).await, json!({"type": "error", "id": "h", "message": "Wrong password for the RustDesk computer"}));
+            // A connector without files.
+            let none: Target = serde_json::from_value(json!({"connector": "no-such-connector-installed"})).unwrap();
+            let mut v = Viewer::connect(Ok(none)).await;
+            let hello = v.ask(json!({"type": "hello", "id": "h"})).await;
+            assert_eq!(hello["type"], "error", "{}", hello);
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     #[test]

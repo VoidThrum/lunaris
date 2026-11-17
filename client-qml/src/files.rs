@@ -229,14 +229,18 @@ fn conn() -> Result<Arc<Conn>, String> {
     CONN.lock().unwrap().clone().ok_or_else(|| "not connected".to_string())
 }
 
-/// Opens the file connection to `host_id` (closing any other).
-pub fn open(server_url: String, token: String, host_id: String, host_name: String) {
+/// Opens the file connection to `host_id` (closing any other): to its own
+/// files, or to those of `source_id`, a computer it shows through a
+/// connector. For a computer the app added for itself the server is
+/// "bridge:" (own_computers.rs) and the source is that computer.
+pub fn open(server_url: String, token: String, host_id: String, host_name: String, source_id: Option<String>) {
+    let source_id = source_id.filter(|id| !id.is_empty());
     close();
     with_state(|s| {
         *s = Shared { host_name, status: "Connecting…".into(), ..Default::default() };
     });
     runtime().spawn(async move {
-        if let Err(e) = connect(server_url, token, host_id).await {
+        if let Err(e) = connect(server_url, token, host_id, source_id).await {
             with_state(|s| {
                 s.status.clear();
                 s.error = e;
@@ -289,7 +293,19 @@ impl PeerConnectionEventHandler for FilesHandler {
     }
 }
 
-async fn connect(server_url: String, token: String, host_id: String) -> Result<(), String> {
+async fn connect(server_url: String, token: String, host_id: String, source_id: Option<String>) -> Result<(), String> {
+    // A computer the app added for itself: the session goes to the app's
+    // helper on this computer (started now if it is not running), as the
+    // stream's does. Its address and password never leave this task.
+    let (server_url, token) = if crate::own_computers::is_bridge(&server_url) {
+        let (host, source) = (host_id.clone(), source_id.clone());
+        let (address, password) = tokio::task::spawn_blocking(move || crate::own_computers::session_endpoint(&host, source.as_deref()))
+            .await
+            .map_err(|e| e.to_string())??;
+        (format!("ws://{}", address), password)
+    } else {
+        (server_url, token)
+    };
     // Straight to an agent: TLS and a password proof, no password in the URL
     // (the same connection the stream uses).
     let direct = (host_id == "direct")
@@ -321,7 +337,7 @@ async fn connect(server_url: String, token: String, host_id: String) -> Result<(
         }
         let _ = ws_tx.close().await;
     });
-    let _ = out_tx.send(SignalingMessage::RequestFileSession { host_id: host_id.clone() });
+    let _ = out_tx.send(SignalingMessage::RequestFileSession { host_id: host_id.clone(), source_id: source_id.clone() });
 
     let mut pc: Option<Arc<dyn PeerConnection>> = None;
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<Arc<dyn DataChannel>>();
@@ -1150,7 +1166,7 @@ mod e2e {
         let big: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
         std::fs::write(local.join("up.bin"), &big).unwrap();
 
-        open(env("LUNARIS_TEST_SERVER"), env("LUNARIS_TEST_TOKEN"), env("LUNARIS_TEST_HOST"), "test".into());
+        open(env("LUNARIS_TEST_SERVER"), env("LUNARIS_TEST_TOKEN"), env("LUNARIS_TEST_HOST"), "test".into(), std::env::var("LUNARIS_TEST_SOURCE").ok());
         let t0 = Instant::now();
         wait("connected", 30, |v| v["connected"] == true);
         println!("connected in {:?}", t0.elapsed());

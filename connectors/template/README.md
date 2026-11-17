@@ -69,6 +69,7 @@ cp target/release/connector-template connectors/template/connector.json \
 | `fields` | What a target is described by. `kind` is `text`, `port` or `secret`; `default` and `required` are optional. A `secret` is never shown or written to a log. |
 | `capabilities.video` | The codecs the connector can deliver: `h264`, `h265`, `vp8`, `vp9`, `av1`. |
 | `capabilities.audio`, `input`, `clipboard`, `cursor` | What else it does. |
+| `capabilities.files` | The computer's files can be browsed and copied (see "Files" below). Left out or `false`: the connector is never started for files, and the viewer is told "This kind of computer has no file transfer". |
 
 A target is the connector's id and a value for each field:
 `{"connector": "template", "fps": "30"}`.
@@ -128,7 +129,8 @@ it cannot (wrong password, not reachable, no codec in common), it sends
 | `{"type":"cursor_position","x":10,"y":20,"visible":true}` | – | In pixels of the display shown. |
 | `{"type":"cursor_embedded","embedded":true}` | – | The pointer is part of the picture now (`true`), so the viewer must not draw its own; or no longer (`false`). |
 | `{"type":"platform","os":"windows"}` | – | What kind of computer it is: `windows`, `linux`, `macos`, `android`. Once, at the start. |
-| `{"type":"clipboard"}` | the text, UTF-8 | The other computer's clipboard changed. |
+| `{"type":"clipboard"}` | the text, UTF-8 | The other computer's clipboard changed. Text of at most 1 MiB; the agent does not pass on the same text twice in a row, nor text it has just sent itself. |
+| `{"type":"clipboard_error"}` | the reason, UTF-8 | The clipboard cannot be shared (the other computer does not allow it, the text is too large). Shown to the viewer; say it once, not for every attempt. |
 | `{"type":"displays","displays":[{"name":"1","width":1920,"height":1080}],"current":0}` | – | At the start, and when the list, a size or the display shown changes. |
 | `{"type":"closed","reason":"Wrong password"}` | – | The end. Nothing follows; the program exits. |
 
@@ -153,6 +155,45 @@ next.
 | `{"type":"quality","fps":30,"bitrate_kbps":0}` | – | What the viewer would like; 0 is "no wish". |
 | `{"type":"switch_display","index":1}` | – | An index into the last `displays`. |
 | `{"type":"close"}` | – | Send `closed` and exit. The agent also closes the program's input and stops the program 2 s later if it is still there. |
+
+## Files
+
+The Lunaris file manager works on a computer of another type when its
+connector says `"files": true` in its capabilities. A file session is a
+session of its own, beside any picture session: the agent starts the
+program once more, says `hello` as above, and then sends `open_files` in
+the place of `connect`:
+
+| # | Direction | Header | |
+|---|---|---|---|
+| 3 | agent → connector | `{"type":"open_files","target":{...}}` | The target as in `connect`. |
+| 4 | connector → agent | `{"type":"files_ready","os":"windows","sep":"\\","home":"C:\\Users\\An","roots":[{"name":"C:","path":"C:\\"}]}` | Within 30 s, after logging in. `sep` is the path separator there; `home` the folder to start in (leave it out when it cannot be told: `""` as a path then means "where you start"); `roots` the places to offer (drives, the home folder). When the files cannot be opened: `{"type":"closed","reason":"..."}`, a text for the person (wrong password, file transfer switched off there, ...). |
+
+Then requests and answers. Every request has an `id` (the requester's
+text) and every answer names it. Paths are the other computer's own, as
+text. Any failure is `{"type":"file_error","id":"...","message":"..."}`
+with a text for the person; the session goes on.
+
+| Request (agent → connector) | Answer (connector → agent) | |
+|---|---|---|
+| `{"type":"file_list","id":"1","path":"C:\\Users","hidden":false}` | `{"type":"file_dir","id":"1","path":"C:\\Users","parent":"C:\\","entries":[{"name":"An","dir":true,"size":0,"mtime":1700000000,"hidden":false}]}` | `parent` is left out or `null` where nothing is above. `mtime` is seconds since 1970 (0: not known). `hidden` entries only when asked for. |
+| `{"type":"file_stat","id":"2","path":"..."}` | `{"type":"file_stat","id":"2","entry":{...}}` | `entry` is `null` when nothing is there by that name. |
+| `{"type":"file_walk","id":"3","path":"..."}` | `{"type":"file_walk","id":"3","path":"...","files":[{"rel":"a/b.txt","size":2,"mtime":0}],"dirs":["a"]}` | Every file under a folder, for copying it: `rel` is its path from the folder, written with `/`. |
+| `{"type":"file_mkdir","id":"4","path":"..."}` | `{"type":"file_ok","id":"4"}` | The folders above it too. |
+| `{"type":"file_remove","id":"5","path":"..."}` | `{"type":"file_ok","id":"5"}` | A file, or a folder with what is in it. A link is removed itself, not what it leads to. |
+| `{"type":"file_rename","id":"6","path":"...","name":"new name"}` | `{"type":"file_ok","id":"6"}` | In the same folder. Not onto a name that is taken. |
+| `{"type":"file_read","id":"7","path":"...","offset":0}` | `{"type":"file_read_start","id":"7","size":10,"mtime":1700000000,"offset":0}`, then `{"type":"file_read_data","id":"7"}` with the next bytes as payload, as often as needed, then `{"type":"file_read_end","id":"7"}` | A download. `offset` > 0: the viewer has that much already; send from there. The sizes of the payloads are the progress. Keep a payload under a few megabytes. One download at a time. |
+| `{"type":"file_write","id":"8","path":"...","size":6,"mtime":1700000000,"on_exists":"rename"}` | `{"type":"file_write_ready","id":"8","offset":0,"path":"..."}` or `{"type":"file_write_skip","id":"8","reason":"identical","path":"..."}` | An upload. `on_exists` says what to do when another file has that name: `rename` (keep both: write under another name and say which in `path`), `replace`, `skip` (answer `file_write_skip` with reason `exists`). The same file there already (size and time): `file_write_skip` with reason `identical`. `offset` > 0: this much of this same file is there from an upload that broke off; the data continues from there. |
+| `{"type":"file_write_data","id":"8"}` with the next bytes as payload, then `{"type":"file_write_end","id":"8"}` | `{"type":"file_write_done","id":"8","path":"..."}` | The file is whole only now: until then keep it under another name, so that a broken upload leaves no half file under the real one. |
+| `{"type":"file_cancel","id":"7"}` | for a download: `{"type":"file_read_end","id":"7","cancelled":true}`, and nothing more of it; for an upload: nothing | Stops a transfer. |
+| `{"type":"close"}` | `{"type":"closed","reason":"Closed"}` | The end of the session. |
+
+The built-in RustDesk connector (`agent/src/connector/rustdesk_files.rs`)
+is an implementation of the same interface (`agent/src/connector/files.rs`).
+
+This template has no files: its manifest does not say `files`, so the agent
+never asks; if it is sent `open_files` all the same it answers `closed`
+with "This kind of computer has no file transfer".
 
 ## What this template does with them
 

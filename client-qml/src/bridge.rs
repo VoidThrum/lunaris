@@ -1218,6 +1218,11 @@ pub mod qobject {
         #[qinvokable]
         fn host_set_rustdesk(self: Pin<&mut StreamBridge>, enabled: bool, port: i32) -> QString;
 
+        /// Lets RustDesk clients use their file manager on this computer,
+        /// or not; returns an error message or "".
+        #[qinvokable]
+        fn host_set_rustdesk_files(self: Pin<&mut StreamBridge>, enabled: bool) -> QString;
+
         /// The types a computer can be added with besides Lunaris, as JSON:
         /// `[{id, name, fields: [{key, label, kind, default, required}]}]`.
         #[qinvokable]
@@ -1286,6 +1291,11 @@ pub mod qobject {
         /// manager page. Open for a computer, or for the one being streamed.
         #[qinvokable]
         fn files_open(self: Pin<&mut StreamBridge>, server_url: QString, token: QString, host_id: QString, host_name: QString);
+        /// The files of a source of `host_id` (a computer it shows through
+        /// a connector). For a computer the app added for itself:
+        /// server "bridge:", host "direct", no token.
+        #[qinvokable]
+        fn files_open_source(self: Pin<&mut StreamBridge>, server_url: QString, token: QString, host_id: QString, host_name: QString, source_id: QString);
         #[qinvokable]
         fn files_open_current(self: Pin<&mut StreamBridge>) -> bool;
         #[qinvokable]
@@ -2943,6 +2953,10 @@ impl qobject::StreamBridge {
         QString::from(&result.err().unwrap_or_default())
     }
 
+    pub fn host_set_rustdesk_files(self: Pin<&mut Self>, enabled: bool) -> QString {
+        QString::from(&crate::host::set_rustdesk_file_transfer(enabled).err().unwrap_or_default())
+    }
+
     pub fn bridge_connectors(self: Pin<&mut Self>) -> QString {
         QString::from(&crate::own_computers::connectors_json())
     }
@@ -3015,15 +3029,20 @@ impl qobject::StreamBridge {
     }
 
     pub fn files_open(self: Pin<&mut Self>, server_url: QString, token: QString, host_id: QString, host_name: QString) {
-        crate::files::open(server_url.to_string(), token.to_string(), host_id.to_string(), host_name.to_string());
+        crate::files::open(server_url.to_string(), token.to_string(), host_id.to_string(), host_name.to_string(), None);
+    }
+
+    pub fn files_open_source(self: Pin<&mut Self>, server_url: QString, token: QString, host_id: QString, host_name: QString, source_id: QString) {
+        crate::files::open(server_url.to_string(), token.to_string(), host_id.to_string(), host_name.to_string(), Some(source_id.to_string()));
     }
 
     pub fn files_open_current(self: Pin<&mut Self>) -> bool {
         let args = ACTIVE_CONFIG.lock().unwrap().clone().or_else(|| APP_ARGS.get().cloned());
         match args {
-            // The helper for the app's own computers of other types has no files.
-            Some(a) if !a.server_url.is_empty() && !crate::own_computers::is_bridge(&a.server_url) => {
-                crate::files::open(a.server_url, a.token, a.host_id, a.host_name);
+            // The files of what is being shown: the computer's own, or the
+            // source's (a computer the app added for itself is one).
+            Some(a) if !a.server_url.is_empty() => {
+                crate::files::open(a.server_url, a.token, a.host_id, a.host_name, a.source_id);
                 true
             }
             _ => false,

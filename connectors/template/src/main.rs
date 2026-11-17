@@ -23,6 +23,9 @@ const VERSION: u32 = 1;
 enum FromAgent {
     Hello { version: u32 },
     Connect { target: Target, viewer: Viewer },
+    /// In the place of `connect`: a session for the target's files, which
+    /// this connector has none of (its manifest does not say `files`).
+    OpenFiles {},
     PointerMove { x: i32, y: i32 },
     PointerMoveRelative { dx: i32, dy: i32 },
     PointerButton { button: String, down: bool },
@@ -222,6 +225,7 @@ fn run() -> Result<(), String> {
     let Some((header, _)) = receive(&mut stdin).map_err(io_err)? else { return Ok(()) };
     let (target, viewer) = match serde_json::from_slice::<FromAgent>(&header) {
         Ok(FromAgent::Connect { target, viewer }) => (target, viewer),
+        Ok(FromAgent::OpenFiles {}) => return Err("This kind of computer has no file transfer".into()),
         _ => return Err("the second message was not connect".into()),
     };
     let file = if target.file.is_empty() { "pattern.ivf" } else { &target.file };
@@ -309,7 +313,7 @@ fn run() -> Result<(), String> {
                 FromAgent::Key { position: _, down } => eprintln!("template connector: a key {}", if down { "down" } else { "up" }),
                 FromAgent::Text => eprintln!("template connector: text of {} bytes", payload.len()),
                 FromAgent::SwitchDisplay { index } => eprintln!("template connector: display {} asked for (there is one)", index),
-                FromAgent::Hello { .. } | FromAgent::Connect { .. } => {}
+                FromAgent::Hello { .. } | FromAgent::Connect { .. } | FromAgent::OpenFiles {} => {}
             },
             // The agent closed our input: the session is over.
             Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),

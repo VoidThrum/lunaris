@@ -116,6 +116,20 @@ fn text_of(clipboard: &Clipboard) -> Option<String> {
     String::from_utf8(data).ok()
 }
 
+/// Whether there is text among `clipboards` that is too large to take
+/// (more than share.rs lets pass): it is not cut short, and the person is
+/// told instead.
+pub(crate) fn has_oversized_text(clipboards: &[Clipboard]) -> bool {
+    clipboards.iter().any(|clipboard| {
+        ClipboardFormat::try_from(clipboard.format) == Ok(ClipboardFormat::Text)
+            && if clipboard.compress {
+                !clipboard.content.is_empty() && decompress(&clipboard.content, MAX_CLIPBOARD_BYTES).is_none()
+            } else {
+                clipboard.content.len() > MAX_CLIPBOARD_BYTES
+            }
+    })
+}
+
 /// The text a client's clipboard message carries
 /// (rustdesk/src/server/connection.rs `on_message`: `Clipboard` and
 /// `MultiClipboards` both end in `update_clipboard`).

@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use super::clipboard::{self, ClipboardLink};
 use super::cursor::CursorSender;
+use super::files::{self, FileHost};
 use super::input::{HostOs, Injector, Input, RealInjector, RecordingInjector};
 use super::qos::{self, VideoQoS};
 use super::proto::back_notification::{self, BlockInputState, PrivacyModeState};
@@ -82,6 +83,12 @@ const MAX_QUEUED_VIDEO: usize = 4;
 /// Messages other than video waiting for the socket; a peer that lets this
 /// many pile up is not reading.
 const MAX_QUEUED_MESSAGES: usize = 256;
+/// Blocks of a file that may wait for the socket (128 KiB each): the file
+/// is read as fast as the client takes it, not into memory.
+const MAX_QUEUED_FILE_BLOCKS: usize = 8;
+/// rustdesk/src/server/connection.rs `handle_login_request`: the login
+/// error of a host whose "Enable file transfer" permission is off.
+pub(crate) const NO_FILE_PERMISSION: &str = "No permission of file transfer";
 /// A key frame asked for and not delivered is asked for again after this.
 const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
 /// Sound waiting for the socket (10 ms a frame): more than this is dropped
@@ -423,16 +430,17 @@ fn spawn_input(injector: Box<dyn Injector>, display: &Display) -> Option<std::sy
 /// Asks the person at this computer to accept a connection; `None` when the
 /// question was withdrawn (the receiver's sender dropped or used).
 pub(crate) type Asker = Arc<
-    dyn Fn(String, tokio::sync::oneshot::Receiver<()>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Decision>> + Send>>
+    dyn Fn(String, crate::approval::Kind, tokio::sync::oneshot::Receiver<()>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Decision>> + Send>>
         + Send
         + Sync,
 >;
 
-/// approval.rs `ask_unless`, as direct.rs asks for a screen session.
+/// approval.rs `ask_unless`, as direct.rs asks for a screen session or a
+/// file session.
 pub(crate) fn system_asker() -> Asker {
-    Arc::new(|requester, withdrawn| {
+    Arc::new(|requester, kind, withdrawn| {
         Box::pin(async move {
-            crate::approval::ask_unless(&requester, crate::approval::Kind::Control, async {
+            crate::approval::ask_unless(&requester, kind, async {
                 let _ = withdrawn.await;
             })
             .await
@@ -784,6 +792,8 @@ struct Session {
     /// The `AudioFormat` the client was told.
     audio_format: Option<(u32, u32)>,
     approval: Option<PendingApproval>,
+    /// This computer's files, on a file-transfer connection (files.rs).
+    files: Option<FileHost>,
     /// Why the connection ends, for the log.
     reason: String,
 }
@@ -860,9 +870,14 @@ impl Session {
             return;
         };
         let requester = crate::direct::requester_label(&lr.my_name, self.ip, false);
+        // A file-transfer connection is asked about as one.
+        let kind = match lr.union {
+            Some(login_request::Union::FileTransfer(_)) => crate::approval::Kind::Files,
+            _ => crate::approval::Kind::Control,
+        };
         let (withdraw, withdrawn) = tokio::sync::oneshot::channel();
         self.approval = Some(PendingApproval {
-            answer: tokio::spawn((self.ctx.asker)(requester, withdrawn)),
+            answer: tokio::spawn((self.ctx.asker)(requester, kind, withdrawn)),
             _withdraw: withdraw,
             _prompt: prompt,
             lr: lr.clone(),
@@ -1156,10 +1171,13 @@ impl Session {
     /// rustdesk/src/server/connection.rs `on_message`, the `LoginRequest`
     /// branch. Returns false when the connection ends.
     async fn on_login_request(&mut self, lr: LoginRequest) -> bool {
-        // Only remote desktop is offered; the refusals are RustDesk's own for
-        // a host that does not permit the other kinds.
+        // Remote desktop is offered, and file transfer when the agent's
+        // `rustdesk_file_transfer` is on (`Self::permission(
+        // keys::OPTION_ENABLE_FILE_TRANSFER, ..)`); the refusals are
+        // RustDesk's own for a host that does not permit the other kinds.
         let refused = match lr.union {
-            Some(login_request::Union::FileTransfer(_)) => Some("No permission of file transfer"),
+            Some(login_request::Union::FileTransfer(_)) if self.ctx.config.file_transfer => None,
+            Some(login_request::Union::FileTransfer(_)) => Some(NO_FILE_PERMISSION),
             Some(login_request::Union::ViewCamera(_)) => Some("No permission of viewing camera"),
             Some(login_request::Union::Terminal(_)) => Some("No permission of terminal"),
             Some(login_request::Union::PortForward(_)) => Some("No permission of IP tunneling"),
@@ -1223,6 +1241,10 @@ impl Session {
     /// the connection is let in, hears what it is connected to and gets the
     /// picture.
     async fn authorize(&mut self, lr: LoginRequest) -> bool {
+        if let Some(login_request::Union::FileTransfer(ft)) = &lr.union {
+            let (dir, show_hidden) = (ft.dir.clone(), ft.show_hidden);
+            return self.authorize_files(lr, &dir, show_hidden).await;
+        }
         let waiting = Instant::now();
         let viewing = loop {
             if let Some(viewing) = Viewing::take(&self.ctx) {
@@ -1367,6 +1389,72 @@ impl Session {
             _viewing: viewing,
         });
         true
+    }
+
+    /// rustdesk/src/server/connection.rs `send_logon_response_and_keep_alive`
+    /// for a file-transfer connection (`self.file_transfer.is_some()`): the
+    /// client hears what it is connected to (`res.set_peer_info(pi)`: no
+    /// displays and no codecs), then the listing of the folder it starts in
+    /// (`self.read_dir(dir, show_hidden)`). No picture, no input and no
+    /// clipboard on this connection, and it does not take the viewer's
+    /// place.
+    async fn authorize_files(&mut self, lr: LoginRequest, dir: &str, show_hidden: bool) -> bool {
+        let config = &self.ctx.config;
+        let host = match FileHost::new(config.file_access.clone(), config.file_home.clone(), &lr.version) {
+            Ok(host) => host,
+            Err(reason) => {
+                warn!("RustDesk file transfer from {} refused: {}", self.ip, reason);
+                self.send(login_error(&reason));
+                self.reason = "no folder for file transfer".into();
+                return false;
+            }
+        };
+        self.authorized = true;
+        self.slot = None;
+        // Let in: a question still on screen is taken down.
+        self.approval = None;
+        self.peer_version = lr.version.clone();
+        self.peer_platform = lr.my_platform.clone();
+        info!(
+            "RustDesk client logged in from {} for file transfer: id={:?} name={:?} platform={:?} version={:?}",
+            self.ip, lr.my_id, lr.my_name, lr.my_platform, lr.version
+        );
+        let info = PeerInfo { encoding: None, resolutions: None, ..peer_info(&config.name, &[], 0, false) };
+        let response = Message {
+            union: Some(message::Union::LoginResponse(LoginResponse {
+                union: Some(login_response::Union::PeerInfo(info)),
+                ..Default::default()
+            })),
+        };
+        if !self.send(response) {
+            return false;
+        }
+        let listing = host.first_listing(dir, show_hidden).await;
+        self.files = Some(host);
+        self.send(listing)
+    }
+
+    /// rustdesk/src/server/connection.rs `Connection::start`, the
+    /// `file_timer` branch (libs/base/src/fs.rs `handle_read_jobs`): the
+    /// next block of a file the client downloads. RustDesk's timer ticks
+    /// every millisecond while there is a job and waits for the socket with
+    /// each block; here a block goes as soon as the socket took the ones
+    /// before, and `idle` (wait a tick) is set when nothing could be sent.
+    /// Returns false when the connection ends.
+    fn on_file_timer(&mut self, idle: &mut bool) -> bool {
+        *idle = true;
+        // Not more than a few blocks wait for the socket.
+        if self.tx.capacity() + MAX_QUEUED_FILE_BLOCKS < MAX_QUEUED_MESSAGES {
+            return true;
+        }
+        let Some(files) = self.files.as_mut() else { return true };
+        match files.next_read() {
+            files::Step::Send(msg) => {
+                *idle = false;
+                self.send(msg)
+            }
+            files::Step::Idle => true,
+        }
     }
 
     /// rustdesk/src/server/connection.rs `on_message`. Returns false when
@@ -1530,9 +1618,26 @@ impl Session {
                 self.set_clipboard(&mcb.clipboards);
                 true
             }
-            // Files are not offered.
-            Some(message::Union::Cliprdr(_) | message::Union::FileAction(_) | message::Union::FileResponse(_)) => {
-                debug!("RustDesk session: file message ignored");
+            // `let mut handle_fa = self.file_transfer.is_some()`: file
+            // actions are served on a file-transfer connection (files.rs),
+            // and ignored on any other.
+            Some(message::Union::FileAction(action)) => {
+                let Some(files) = self.files.as_mut() else {
+                    debug!("RustDesk session: file action ignored (not a file-transfer connection)");
+                    return true;
+                };
+                let replies = files.on_action(action).await;
+                replies.into_iter().all(|reply| self.send(reply))
+            }
+            // The data of an upload (`ipc::FS::WriteBlock`, ...).
+            Some(message::Union::FileResponse(response)) => {
+                let Some(files) = self.files.as_mut() else { return true };
+                let replies = files.on_response(response);
+                replies.into_iter().all(|reply| self.send(reply))
+            }
+            // Copying files through the clipboard is not offered.
+            Some(message::Union::Cliprdr(_)) => {
+                debug!("RustDesk session: file clipboard message ignored");
                 true
             }
             other => {
@@ -1746,6 +1851,17 @@ async fn next_approval(approval: &mut Option<PendingApproval>) -> Option<Decisio
     }
 }
 
+/// rustdesk/src/server/connection.rs `file_timer` (`MILLI1` while a file is
+/// read): a tick when there was nothing to send, else at once, after the
+/// connection's other events had their turn.
+async fn file_tick(idle: bool) {
+    if idle {
+        tokio::time::sleep(Duration::from_millis(1)).await
+    } else {
+        tokio::task::yield_now().await
+    }
+}
+
 /// rustdesk/src/server/connection.rs `login_deadline`.
 async fn login_deadline(authorized: bool, started: Instant) {
     if authorized {
@@ -1799,6 +1915,7 @@ pub(crate) async fn serve(stream: TcpStream, peer: SocketAddr, slot: UnauthSlot,
         cursor: CursorSender::default(),
         audio_format: None,
         approval: None,
+        files: None,
         reason: String::new(),
     };
 
@@ -1814,14 +1931,17 @@ pub(crate) async fn serve(stream: TcpStream, peer: SocketAddr, slot: UnauthSlot,
     // `Connection::start`: a RustDesk host tells a connection what it may
     // not do, and says nothing of what it may. Mouse, keyboard and sound are
     // offered; the clipboard when the agent's `allow_clipboard` is on;
-    // files, restart, recording, blocking input and privacy mode are not.
+    // files when its `rustdesk_file_transfer` is on (`if !conn.file`);
+    // restart, recording, blocking input and privacy mode are not.
     let mut denied = vec![
-        Permission::File,
         Permission::Restart,
         Permission::Recording,
         Permission::BlockInput,
         Permission::PrivacyMode,
     ];
+    if !session.ctx.config.file_transfer {
+        denied.insert(0, Permission::File);
+    }
     if !session.ctx.config.allow_clipboard {
         denied.insert(0, Permission::Clipboard);
     }
@@ -1831,6 +1951,8 @@ pub(crate) async fn serve(stream: TcpStream, peer: SocketAddr, slot: UnauthSlot,
 
     let mut test_delay_timer = tokio::time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT);
     test_delay_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Whether the last turn of the file timer had nothing to send.
+    let mut files_idle = false;
 
     'connection: while open {
         tokio::select! {
@@ -1912,6 +2034,12 @@ pub(crate) async fn serve(stream: TcpStream, peer: SocketAddr, slot: UnauthSlot,
             }
             event = next_media(&mut session.video), if session.queued.video.load(Ordering::Relaxed) < MAX_QUEUED_VIDEO => {
                 if !session.on_media(event) {
+                    break;
+                }
+            }
+            // `conn.file_timer`: while the client downloads.
+            _ = file_tick(files_idle), if session.files.as_ref().is_some_and(|files| files.has_read_jobs()) => {
+                if !session.on_file_timer(&mut files_idle) {
                     break;
                 }
             }
@@ -2090,10 +2218,13 @@ mod tests {
             allow_clipboard,
             agent_id: "test-agent".into(),
             name: "testhost".into(),
+            file_transfer: false,
+            file_access: crate::files::Access::Denied("not in this test".into()),
+            file_home: None,
         };
         // The person here: answers from `answers`, or never.
         let person = screen.clone();
-        let asker: Asker = Arc::new(move |requester, withdrawn| {
+        let asker: Asker = Arc::new(move |requester, _kind, withdrawn| {
             person.asked.lock().unwrap().push(requester);
             let answer = {
                 let mut answers = person.answers.lock().unwrap();
@@ -3336,10 +3467,11 @@ mod tests {
                 break;
             }
         }
-        // The frame rate wanted goes as the client's custom_fps.
+        // The frame rate wanted goes as the client's custom_fps, a little
+        // raised (a RustDesk host delivers about 97 % of what it is asked for).
         session.commands.send(Command::Quality { fps: 30, bitrate_kbps: 0 }).await.unwrap();
         loop {
-            if matches!(next_command(&mut commands).await, PipelineCommand::SetFrameLimit(30)) {
+            if matches!(next_command(&mut commands).await, PipelineCommand::SetFrameLimit(31)) {
                 break;
             }
         }
@@ -3404,6 +3536,36 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn the_connector_tells_the_viewer_once_when_the_host_keeps_its_clipboard() {
+        use crate::connector::{Codec as Wanted, Command, Connector, Event, Viewer};
+        // The host does not share its clipboard (it says so before its LoginResponse).
+        let (addr, screen) = start_host_with("password", false, FakeScreen::default()).await;
+        let connector = crate::connector::rustdesk::RustdeskConnector;
+        let viewer = Viewer { codecs: vec![Wanted::H264], fps: 60 };
+        let mut session = connector.connect(&connector_target(addr, PASSWORD), &viewer).await.expect("logged in");
+        session.commands.send(Command::Clipboard { text: "first".into() }).await.unwrap();
+        session.commands.send(Command::Clipboard { text: "second".into() }).await.unwrap();
+        // A pointer move after them, to know both were dealt with.
+        session.commands.send(Command::PointerMove { x: 1, y: 1 }).await.unwrap();
+        let mut told = 0;
+        let injected = loop {
+            match tokio::time::timeout(Duration::from_millis(600), session.events.recv()).await {
+                Ok(Some(Event::ClipboardError { text })) => {
+                    assert!(text.contains("does not allow its clipboard"), "{}", text);
+                    told += 1;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the session ended"),
+                Err(_) => break screen.injected(),
+            }
+        };
+        assert_eq!(told, 1, "told once, not for every text");
+        assert!(!injected.is_empty(), "the pointer still works");
+        // The host opened no clipboard for this client.
+        assert!(screen.clipboards.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

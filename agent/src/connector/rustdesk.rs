@@ -10,7 +10,8 @@
 //!
 //! It carries the picture, the sound, the cursor, clipboard text both ways,
 //! the pointer, keys (map mode, to Windows and Linux hosts), typed text and
-//! the choice of the display. Files are not carried.
+//! the choice of the display. Its files are a connection of their own:
+//! `rustdesk_files.rs`.
 
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ use tracing::{debug, info, warn};
 
 use super::{keys, Button, Capabilities, Codec, Command, Connector, Description, DisplayInfo, Event, Field, Session, Target, Viewer};
 use crate::rustdesk::proto::{
-    key_event, login_response, message, misc, supported_decoding::PreferCodec, video_frame, ControlKey, CursorData,
+    key_event, login_response, message, misc, permission_info, supported_decoding::PreferCodec, video_frame, ControlKey, CursorData,
     EncodedVideoFrames, Hash, KeyEvent, KeyboardMode, LoginRequest, Message, Misc, MouseEvent, OptionMessage, PeerInfo,
     SupportedDecoding, SwitchDisplay,
 };
@@ -33,8 +34,8 @@ use crate::rustdesk::{clipboard, cursor, frame, login, qos};
 /// (client.rs `Client::_start`: `check_port(peer, RELAY_PORT + 1)`).
 pub const DEFAULT_PORT: u16 = 21118;
 /// hbb_common/src/config.rs `CONNECT_TIMEOUT` and `READ_TIMEOUT`.
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(18_000);
-const READ_TIMEOUT: Duration = Duration::from_millis(18_000);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_millis(18_000);
+pub(super) const READ_TIMEOUT: Duration = Duration::from_millis(18_000);
 /// The version of the client this follows; a host chooses what it sends by it.
 const CLIENT_VERSION: &str = "1.5.3";
 /// common.rs `MIN_VER_MULTI_UI_SESSION`.
@@ -66,8 +67,14 @@ impl Connector for RustdeskConnector {
                 input: true,
                 clipboard: true,
                 cursor: true,
+                files: true,
             },
         }
+    }
+
+    /// The computer's files: `rustdesk_files.rs`.
+    async fn open_files(&self, target: &Target) -> anyhow::Result<super::files::FileSession> {
+        super::rustdesk_files::open(target).await
     }
 
     async fn connect(&self, target: &Target, viewer: &Viewer) -> anyhow::Result<Session> {
@@ -104,6 +111,9 @@ impl Connector for RustdeskConnector {
 
         // io_loop.rs handle_msg_from_peer: the host's Hash, then our
         // LoginRequest, then its LoginResponse.
+        // connection.rs: what the host does not allow is said before its
+        // LoginResponse (`Misc::PermissionInfo`).
+        let mut clipboard_allowed = true;
         let peer_info = loop {
             let msg = tokio::time::timeout(READ_TIMEOUT, conn.next())
                 .await
@@ -113,6 +123,11 @@ impl Connector for RustdeskConnector {
             match msg.union {
                 Some(message::Union::Hash(hash)) => {
                     conn.send(&login_message(&address, target.get("password"), &hash, viewer)).await?;
+                }
+                Some(message::Union::Misc(Misc { union: Some(misc::Union::PermissionInfo(info)) })) => {
+                    if info.permission == permission_info::Permission::Clipboard as i32 {
+                        clipboard_allowed = info.enabled;
+                    }
                 }
                 Some(message::Union::LoginResponse(response)) => match response.union {
                     Some(login_response::Union::Error(error)) => anyhow::bail!("{}", login_error(&error)),
@@ -144,9 +159,9 @@ impl Connector for RustdeskConnector {
         let _ = event_tx.try_send(Event::Platform { os: platform_of(&peer_info) });
         let _ = event_tx.try_send(displays_event(&peer_info));
         let wanted = viewer.codecs.clone();
-        let fps_percent = target.get(FPS_PERCENT_KEY).trim().parse::<u32>().ok().filter(|p| (100..=200).contains(p)).unwrap_or(100);
+        let fps_percent = target.get(FPS_PERCENT_KEY).trim().parse::<u32>().ok().filter(|p| (100..=200).contains(p)).unwrap_or(DEFAULT_FPS_PERCENT);
         tokio::spawn(async move {
-            let reason = run(conn, peer_info, wanted, fps_percent, &event_tx, command_rx).await;
+            let reason = run(conn, peer_info, wanted, fps_percent, clipboard_allowed, &event_tx, command_rx).await;
             debug!("RustDesk connector: session with {} ended: {}", address, reason);
             let _ = event_tx.send(Event::Closed { reason }).await;
         });
@@ -154,15 +169,15 @@ impl Connector for RustdeskConnector {
     }
 }
 
-struct Conn {
-    stream: TcpStream,
-    decoder: frame::Decoder,
-    buf: BytesMut,
+pub(super) struct Conn {
+    pub(super) stream: TcpStream,
+    pub(super) decoder: frame::Decoder,
+    pub(super) buf: BytesMut,
 }
 
 impl Conn {
     /// hbb_common/src/bytes_codec.rs: one framed protobuf `Message`.
-    async fn send(&mut self, msg: &Message) -> std::io::Result<()> {
+    pub(super) async fn send(&mut self, msg: &Message) -> std::io::Result<()> {
         let len = msg.encoded_len();
         let mut buf = BytesMut::with_capacity(len + 4);
         frame::put_header(len, &mut buf)?;
@@ -171,7 +186,7 @@ impl Conn {
     }
 
     /// The next message; `None` when the host closed the connection.
-    async fn next(&mut self) -> std::io::Result<Option<Message>> {
+    pub(super) async fn next(&mut self) -> std::io::Result<Option<Message>> {
         loop {
             if let Some(payload) = self.decoder.decode(&mut self.buf)? {
                 match Message::decode(payload.freeze()) {
@@ -213,7 +228,7 @@ fn supported_decoding(viewer: &Viewer) -> SupportedDecoding {
 /// client.rs `handle_hash` with a preset password, then
 /// `handle_login_from_ui` and `LoginConfigHandler::create_login_msg`:
 /// the password goes as sha256(sha256(password + salt) + challenge).
-fn login_message(address: &str, password: &str, hash: &Hash, viewer: &Viewer) -> Message {
+pub(super) fn login_message(address: &str, password: &str, hash: &Hash, viewer: &Viewer) -> Message {
     let proof = login::proof(&login::h1(password, &hash.salt), &hash.challenge);
     Message {
         union: Some(message::Union::LoginRequest(LoginRequest {
@@ -244,7 +259,7 @@ fn login_message(address: &str, password: &str, hash: &Hash, viewer: &Viewer) ->
 
 /// client.rs `handle_login_error`: the host's words, with what they mean
 /// for someone who set the target up.
-fn login_error(error: &str) -> String {
+pub(super) fn login_error(error: &str) -> String {
     match error {
         login::LOGIN_MSG_PASSWORD_WRONG => "Wrong password for the RustDesk computer".to_string(),
         login::LOGIN_MSG_NO_PASSWORD_ACCESS => "The RustDesk computer does not accept a password (only a click at the computer)".to_string(),
@@ -357,6 +372,10 @@ struct Remote {
     /// The frame rate asked of the host, in per cent of the viewer's (see
     /// `FPS_PERCENT_KEY`).
     fps_percent: u32,
+    /// Whether the host lets its clipboard be used, and whether the viewer
+    /// was told that it does not.
+    clipboard_allowed: bool,
+    clipboard_refusal_told: bool,
     probe_answers_us: Vec<u32>,
     probes_logged: bool,
     host_delay_ms: u32,
@@ -372,19 +391,43 @@ impl Drop for Remote {
 
 /// The platform of a host as the viewers are told it ("windows", "linux",
 /// "macos", "android"): `PeerInfo.platform` in lower case without spaces.
-fn platform_of(info: &PeerInfo) -> String {
+pub(super) fn platform_of(info: &PeerInfo) -> String {
     let mut platform = info.platform.to_lowercase();
     platform.retain(|c| !c.is_whitespace());
     platform
 }
 
+/// The frame rate asked of the host, in per cent of the viewer's.
+///
+/// A RustDesk host paces its capture by sleeping the rest of each frame's
+/// time (server/video_service.rs `run`: `c.frame(spf)`, the work, then
+/// `sleep(spf - elapsed)`), so each round takes the frame's time plus what
+/// the sleep overshoots, and it delivers somewhat fewer frames than it was
+/// asked for. Measured on a Windows host (RustDesk 1.5.3): asked for 60 it
+/// gave 58.4 a second at best, asked for 72 it gave 69.2 to 69.8: about
+/// 97 % either way. Asking for 3 % more (rounded up: 62 for 60) lands on
+/// the viewer's rate.
+///
+/// More is not asked for by default, because what comes cannot be thinned
+/// out here: RustDesk's encoders make one chain of frames that each depend
+/// on the one before (hwcodec.rs `DEFAULT_GOP` is `i32::MAX`, and neither
+/// it nor the VP8/VP9/AV1 encoders use temporal layers), so leaving a
+/// frame out would break the picture until the next key frame. A host
+/// that keeps its rate exactly gives the viewer 62 for 60, which it takes.
+const DEFAULT_FPS_PERCENT: u32 = 103;
+
 /// A value of a source in the config file that no form shows (for trying
-/// out): the frame rate asked of the host in per cent of the viewer's, 100
-/// to 200. A RustDesk host paces its capture by sleeping the rest of each
-/// frame's time (server/video_service.rs `run`: `sleep(spf - elapsed)`),
-/// so what it delivers is somewhat under what it was asked for; asking for
-/// more can make up for that.
+/// out): the per cent above, 100 to 200.
 pub const FPS_PERCENT_KEY: &str = "fps_percent";
+
+/// The frame rate to ask the host for (client.rs `set_custom_fps` takes
+/// what the person set; the host takes 1 to 120, video_qos.rs `MAX_FPS`).
+fn asked_fps(viewer_fps: u32, percent: u32) -> u32 {
+    (viewer_fps * percent).div_ceil(100).clamp(1, 120)
+}
+
+const CLIPBOARD_NOT_ALLOWED: &str = "The other computer does not allow its clipboard to be used";
+const CLIPBOARD_TOO_LARGE: &str = "The text copied on the other computer is too large to bring over (more than 1 MB)";
 
 /// The left button held and the pointer moved this far (pixels) is a drag.
 const DRAG_PIXELS: i32 = 4;
@@ -414,7 +457,9 @@ impl Remote {
             cursor_is_arrow: true,
             embedded: false,
             pending: Vec::new(),
-            fps_percent: 100,
+            fps_percent: DEFAULT_FPS_PERCENT,
+            clipboard_allowed: true,
+            clipboard_refusal_told: false,
             probe_answers_us: Vec::new(),
             probes_logged: false,
             host_delay_ms: 0,
@@ -652,13 +697,23 @@ impl Remote {
                 union: Some(message::Union::KeyEvent(KeyEvent { union: Some(key_event::Union::Seq(text)), ..Default::default() })),
             }],
             // clipboard.rs: the text, as `MultiClipboards` to hosts that know it.
-            Command::Clipboard { text } => vec![clipboard::text_message(&text, &self.version, &self.platform_name())],
+            Command::Clipboard { text } => {
+                // A host that does not allow its clipboard takes no text
+                // (connection.rs drops it); the viewer is told, once.
+                if !self.clipboard_allowed {
+                    if !std::mem::replace(&mut self.clipboard_refusal_told, true) {
+                        self.pending.push(Event::ClipboardError { text: CLIPBOARD_NOT_ALLOWED.into() });
+                    }
+                    return Vec::new();
+                }
+                vec![clipboard::text_message(&text, &self.version, &self.platform_name())]
+            }
             Command::RequestKeyFrame => vec![refresh_message(&self.version, self.display)],
             Command::Quality { fps, bitrate_kbps } => {
                 let mut out = Vec::new();
                 // client.rs LoginConfigHandler::set_custom_fps.
                 if fps > 0 {
-                    let fps = (fps * self.fps_percent / 100).clamp(1, 120);
+                    let fps = asked_fps(fps, self.fps_percent);
                     out.push(misc(misc::Union::Option(OptionMessage { custom_fps: fps as i32, ..Default::default() })));
                 }
                 // The protocol has no message for a bitrate. What a person
@@ -697,6 +752,17 @@ impl Remote {
             }
             Command::Close => Vec::new(),
         }
+    }
+
+    /// io_loop.rs: `Clipboard` and `MultiClipboards` both end in the
+    /// client's clipboard. Text is what is carried (as between Lunaris
+    /// computers); other formats (rich text, HTML, pictures, files) are
+    /// not. Text too large to carry is not cut short: the viewer is told.
+    fn clipboard_from(&mut self, clipboards: &[crate::rustdesk::proto::Clipboard]) -> Option<Event> {
+        if let Some(text) = clipboard::text_from(clipboards) {
+            return Some(Event::Clipboard { text });
+        }
+        clipboard::has_oversized_text(clipboards).then(|| Event::ClipboardError { text: CLIPBOARD_TOO_LARGE.into() })
     }
 
     /// The delay probes of the session, in numbers, for the log (once).
@@ -738,11 +804,13 @@ async fn run(
     peer_info: PeerInfo,
     wanted: Vec<Codec>,
     fps_percent: u32,
+    clipboard_allowed: bool,
     events: &mpsc::Sender<Event>,
     mut commands: mpsc::Receiver<Command>,
 ) -> String {
     let mut remote = Remote::new(&peer_info);
     remote.fps_percent = fps_percent;
+    remote.clipboard_allowed = clipboard_allowed;
     let mut channels: u8 = 2;
     // Test only (see connector/media.rs): answer the host's delay probes late.
     let test_reply_delay = std::env::var(super::media::TEST_DELAY_REPLY_ENV).ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_millis);
@@ -856,11 +924,24 @@ async fn run(
                     }
                     // io_loop.rs: `Clipboard` and `MultiClipboards` both end
                     // in the client's clipboard; text is what is carried.
-                    Some(message::Union::Clipboard(one)) => other = clipboard::text_from(&[one]).map(|text| Event::Clipboard { text }),
-                    Some(message::Union::MultiClipboards(many)) => other = clipboard::text_from(&many.clipboards).map(|text| Event::Clipboard { text }),
+                    Some(message::Union::Clipboard(one)) => other = remote.clipboard_from(&[one]),
+                    Some(message::Union::MultiClipboards(many)) => other = remote.clipboard_from(&many.clipboards),
+                    // connection.rs: a permission switched at the computer
+                    // while connected.
+                    Some(message::Union::Misc(Misc { union: Some(misc::Union::PermissionInfo(info)) })) => {
+                        if info.permission == permission_info::Permission::Clipboard as i32 {
+                            remote.clipboard_allowed = info.enabled;
+                            remote.clipboard_refusal_told = false;
+                        }
+                    }
                     _ => {}
                 }
                 if let Some(event) = other {
+                    if events.send(event).await.is_err() {
+                        return "The viewer left".into();
+                    }
+                }
+                for event in std::mem::take(&mut remote.pending) {
                     if events.send(event).await.is_err() {
                         return "The viewer left".into();
                     }
@@ -992,6 +1073,44 @@ mod tests {
     }
 
     #[test]
+    fn the_clipboard_is_text_and_what_cannot_be_carried_is_said() {
+        use crate::rustdesk::proto::{Clipboard, ClipboardFormat};
+        let mut r = remote("Windows");
+        let text = |s: &str| match clipboard::text_message(s, "1.4.9", "Windows").union {
+            Some(message::Union::MultiClipboards(many)) => many.clipboards,
+            Some(message::Union::Clipboard(one)) => vec![one],
+            _ => unreachable!(),
+        };
+        // Vietnamese text, short and long (the long one goes compressed).
+        let short = "Tiếng Việt có dấu: ắ ằ ẳ ẵ ặ";
+        assert_eq!(r.clipboard_from(&text(short)), Some(Event::Clipboard { text: short.into() }));
+        let long = "Xin chào thế giới. ".repeat(20_000);
+        let sent = text(&long);
+        assert!(sent[0].compress && sent[0].content.len() < long.len() / 10);
+        assert_eq!(r.clipboard_from(&sent), Some(Event::Clipboard { text: long.clone() }));
+        // Text among other formats: the text is taken, the rest left.
+        let html = Clipboard { format: ClipboardFormat::Html as i32, content: Bytes::from_static(b"<b>x</b>"), ..Default::default() };
+        let mut mixed = vec![html.clone()];
+        mixed.extend(text("plain"));
+        assert_eq!(r.clipboard_from(&mixed), Some(Event::Clipboard { text: "plain".into() }));
+        // Only another format: nothing, and nothing said.
+        assert_eq!(r.clipboard_from(&[html]), None);
+        // More than a megabyte of text: not cut short, the viewer is told.
+        let huge = "0123456789".repeat(110_000);
+        assert_eq!(r.clipboard_from(&text(&huge)), Some(Event::ClipboardError { text: CLIPBOARD_TOO_LARGE.into() }));
+        let plain_huge = Clipboard { format: ClipboardFormat::Text as i32, content: Bytes::from(huge.into_bytes()), ..Default::default() };
+        assert_eq!(r.clipboard_from(&[plain_huge]), Some(Event::ClipboardError { text: CLIPBOARD_TOO_LARGE.into() }));
+
+        // To the host: as a real client sends it, unless the host does not allow it.
+        assert_eq!(r.command(Command::Clipboard { text: short.into() }).len(), 1);
+        assert!(r.pending.is_empty());
+        r.clipboard_allowed = false;
+        assert!(r.command(Command::Clipboard { text: "a".into() }).is_empty());
+        assert!(r.command(Command::Clipboard { text: "b".into() }).is_empty());
+        assert_eq!(std::mem::take(&mut r.pending), [Event::ClipboardError { text: CLIPBOARD_NOT_ALLOWED.into() }], "told once");
+    }
+
+    #[test]
     fn the_image_quality_follows_the_viewers_bitrate_calmly() {
         let s = Duration::from_secs;
         // Down: by 15 % or more, 2 s after the last change at the earliest.
@@ -1013,7 +1132,10 @@ mod tests {
         assert!(!sent(&mut r, 6_000), "not within 2 s of the last change");
         r.quality_sent = r.quality_sent.map(|(percent, at)| (percent, at - s(3)));
         assert!(sent(&mut r, 6_000));
-        // The frame rate wanted goes as it is, every time.
+        // The frame rate wanted is asked for every time, a little raised
+        // (the host delivers about 97 % of what it is asked for).
         assert_eq!(r.command(Command::Quality { fps: 60, bitrate_kbps: 0 }).len(), 1);
+        assert_eq!((asked_fps(60, DEFAULT_FPS_PERCENT), asked_fps(30, DEFAULT_FPS_PERCENT), asked_fps(144, DEFAULT_FPS_PERCENT)), (62, 31, 120));
+        assert_eq!((asked_fps(60, 100), asked_fps(60, 120), asked_fps(0, 103)), (60, 72, 1));
     }
 }

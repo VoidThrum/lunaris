@@ -8,6 +8,8 @@ import { t } from '../i18n';
 
 type Props = {
   hostId: string;
+  /** The files of this source of the host (a computer it shows through a connector) instead of the host's own. */
+  sourceId?: string;
   hostName: string;
   wsUrl: string;
   onClose: () => void;
@@ -51,7 +53,7 @@ async function droppedFiles(dt: DataTransfer): Promise<PickedFile[]> {
   return Array.from(dt.files).map(f => ({ file: f, rel: f.name }));
 }
 
-export default function FileManager({ hostId, hostName, wsUrl, onClose, initialUploads }: Props) {
+export default function FileManager({ hostId, sourceId, hostName, wsUrl, onClose, initialUploads }: Props) {
   const sessionRef = useRef<FileSession | null>(null);
   const [hello, setHello] = useState<Hello | null>(null);
   const [status, setStatus] = useState<string>(t('Connecting…'));
@@ -94,7 +96,7 @@ export default function FileManager({ hostId, hostName, wsUrl, onClose, initialU
 
   // Connect once.
   useEffect(() => {
-    const s = new FileSession({ wsUrl, hostId, onClose: (reason) => { setStatus(reason); setError(reason); } });
+    const s = new FileSession({ wsUrl, hostId, sourceId, onClose: (reason) => { setStatus(reason); setError(reason); } });
     sessionRef.current = s;
     let alive = true;
     s.connect()
@@ -111,7 +113,7 @@ export default function FileManager({ hostId, hostName, wsUrl, onClose, initialU
       .catch((e) => { if (alive) { setStatus(''); setError(e.message); } });
     return () => { alive = false; s.close(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsUrl, hostId]);
+  }, [wsUrl, hostId, sourceId]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !(e.target instanceof HTMLInputElement)) onClose(); };

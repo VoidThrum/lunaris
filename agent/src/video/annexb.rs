@@ -117,6 +117,32 @@ fn find_001(data: &[u8], from: usize) -> Option<usize> {
     None
 }
 
+/// How many bytes of an Annex-B access unit are filler data NAL units
+/// (start codes included).
+pub fn filler_bytes(frame: &[u8], h265: bool) -> usize {
+    let is_filler = |header: u8| if h265 { (header >> 1) & 0x3f == 38 } else { header & 0x1f == 12 };
+    let mut total = 0;
+    // (start of the unit, whether it is filler)
+    let mut open: Option<(usize, bool)> = None;
+    let mut i = 0;
+    while i + 3 <= frame.len() {
+        if frame[i] == 0 && frame[i + 1] == 0 && frame[i + 2] == 1 {
+            let start = if i > 0 && frame[i - 1] == 0 { i - 1 } else { i };
+            if let Some((from, true)) = open {
+                total += start - from;
+            }
+            open = Some((start, frame.get(i + 3).copied().is_some_and(is_filler)));
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    if let Some((from, true)) = open {
+        total += frame.len() - from;
+    }
+    total
+}
+
 /// An Annex-B access unit without its filler data NAL units (H.264 type 12,
 /// H.265 type 38, FD_NUT): bytes a constant-bitrate encoder adds to keep
 /// its rate, which a decoder throws away. On a still screen they are most
@@ -445,6 +471,11 @@ mod filler_tests {
         let hevc_slice = [0, 0, 0, 1, 0x02, 0x01, 0xD0, 0x10];
         let hevc_filler = [0, 0, 1, 0x4C, 0x01, 0xFF, 0xFF, 0x80];
         assert_eq!(without_filler([&hevc_slice[..], &hevc_filler[..]].concat(), true), hevc_slice.to_vec());
+        // The count agrees with what is taken out.
+        let both: Vec<u8> = [&filler[..], &sei[..], &filler[..], &slice[..]].concat();
+        assert_eq!(super::filler_bytes(&both, false), both.len() - without_filler(both.clone(), false).len());
+        assert_eq!(super::filler_bytes(&plain, false), 0);
+        assert_eq!(super::filler_bytes(&[], false), 0);
         // Odd input is left alone.
         assert_eq!(without_filler(vec![], false), Vec::<u8>::new());
         assert_eq!(without_filler(vec![0, 0, 1], false), vec![0, 0, 1]);

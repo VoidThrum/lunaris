@@ -87,9 +87,20 @@ export class WebShare {
 
   private sendText(text: string) {
     if (!readClipboardSync() || !this.clipboard || this.clipboard.readyState !== 'open') return;
-    if (!text || text === this.lastText || text.length > MAX_CLIPBOARD) return;
+    if (!text || text === this.lastText) return;
     this.lastText = text;
-    this.clipboard.send(JSON.stringify({ type: 'clipboard', text }));
+    // Text that is too large is not sent in part: the person is told. Besides
+    // the limit of 1 MB, the connection has its own for one message (the
+    // browser refuses a larger one).
+    if (text.length > MAX_CLIPBOARD) {
+      this.notify(t('The copied text is too large to send (more than 1 MB)'));
+      return;
+    }
+    try {
+      this.clipboard.send(JSON.stringify({ type: 'clipboard', text }));
+    } catch {
+      this.notify(t('The copied text is too large to send over this connection'));
+    }
   }
 
   /**

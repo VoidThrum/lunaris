@@ -83,6 +83,13 @@ pub struct AgentConfig {
     /// 21118.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rustdesk_port: Option<u16>,
+    /// RustDesk clients may also use their file manager on this computer
+    /// (rustdesk/files.rs), within what `file_access` allows, when
+    /// `allow_file_transfer` is on too. Off by default: without it a
+    /// file-transfer connection is refused as a RustDesk host with "Enable
+    /// file transfer" off refuses it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rustdesk_file_transfer: bool,
     /// Other computers this one shows to its viewers, through connectors
     /// (connector/mod.rs): `[{"id", "name", "connector", and the connector's
     /// fields (address, password, ...)}]`. Whoever may use this computer may

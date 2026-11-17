@@ -6,8 +6,10 @@
 //! Off unless `rustdesk_port` is set in the agent's config. Offered: the
 //! screen (one display, one viewer at a time), mouse and keyboard
 //! (`input.rs`), the cursor's shape (`cursor.rs`), clipboard text
-//! (`clipboard.rs`, when the agent's `allow_clipboard` is on) and sound. Not
-//! offered: files, RustDesk ids, rendezvous and relay servers.
+//! (`clipboard.rs`, when the agent's `allow_clipboard` is on), sound, and
+//! this computer's files for the client's file manager (`files.rs`, when the
+//! agent's `rustdesk_file_transfer` is on; held to the agent's `file_access`).
+//! Not offered: RustDesk ids, rendezvous and relay servers.
 //!
 //! The wire protocol is ported from RustDesk 1.5.3 (AGPL-3.0); every step
 //! names the function it follows. In short, as a RustDesk host does for a
@@ -32,6 +34,7 @@
 
 pub(crate) mod clipboard;
 pub(crate) mod cursor;
+pub(crate) mod files;
 pub mod frame;
 mod input;
 pub(crate) mod qos;
@@ -69,6 +72,14 @@ pub struct RustdeskConfig {
     pub agent_id: String,
     /// This computer's name, shown by the client.
     pub name: String,
+    /// The agent's `rustdesk_file_transfer` (and `allow_file_transfer`):
+    /// RustDesk clients may open their file manager on this computer.
+    pub file_transfer: bool,
+    /// The agent's `file_access`: what their file manager may reach.
+    pub file_access: crate::files::Access,
+    /// The folder a file manager starts in; `None` for the one
+    /// `file_access` gives (the home folder, or the allowed folder).
+    pub file_home: Option<std::path::PathBuf>,
 }
 
 /// What every connection of the listener shares.
@@ -116,10 +127,11 @@ pub(crate) async fn serve_listener(
 ) -> anyhow::Result<()> {
     let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
     info!(
-        "RustDesk-compatible listener on {} (unencrypted; {:?}; clipboard {})",
+        "RustDesk-compatible listener on {} (unencrypted; {:?}; clipboard {}; file transfer {})",
         local,
         config.approve_mode,
-        if config.allow_clipboard { "on" } else { "off" }
+        if config.allow_clipboard { "on" } else { "off" },
+        if config.file_transfer { "on" } else { "off" }
     );
     let ctx = Arc::new(Shared {
         config,

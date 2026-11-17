@@ -884,7 +884,7 @@ async fn handle_client_signaling(
     match sig {
         // A file-transfer connection (on its own client WebSocket): routed
         // like a session, without touching the host's streaming state.
-        SignalingMessage::RequestFileSession { host_id } => {
+        SignalingMessage::RequestFileSession { host_id, source_id } => {
             let agent_tx = state.agents.read().unwrap().get(&host_id).cloned();
             match agent_tx {
                 Some(agent_tx) => {
@@ -896,6 +896,8 @@ async fn handle_client_signaling(
                         client_id: conn_id.to_string(),
                         ice_servers: Some(ice_servers),
                         requester,
+                        // The files of one of the host's sources, when named.
+                        source_id,
                     }));
                 }
                 None => {
@@ -1253,7 +1255,7 @@ async fn handle_client_signaling(
 fn addressed_host(sig: &SignalingMessage) -> Option<&str> {
     match sig {
         SignalingMessage::RequestSession { host_id, .. }
-        | SignalingMessage::RequestFileSession { host_id } => Some(host_id),
+        | SignalingMessage::RequestFileSession { host_id, .. } => Some(host_id),
         SignalingMessage::Sdp { target_id, .. }
         | SignalingMessage::IceCandidate { target_id, .. }
         | SignalingMessage::EndSession { target_id }
@@ -1459,6 +1461,60 @@ mod tests {
             Some(ServerToAgentMessage::Signaling(SignalingMessage::EndSession { .. }))
         ));
         assert_eq!(host_status(&state, "h1").await, "Online");
+    }
+
+    /// A file session for one of a host's sources names it to the agent;
+    /// clients and agents from before the field mean, and are told, "the
+    /// host's own files" exactly as before.
+    #[tokio::test]
+    async fn a_file_session_names_its_source_and_older_peers_still_work() {
+        let state = state().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash, role, is_active) VALUES ('a', 'a', 'x', 'admin', 1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO hosts (id, name, status) VALUES ('h1', 'H1', 'Online')").execute(&state.db).await.unwrap();
+        let (agent_tx, mut agent_rx) = crate::queue::channel::<ServerToAgentMessage>();
+        state.agents.write().unwrap().insert("h1".into(), agent_tx);
+        let (client_tx, _client_rx) = crate::queue::channel::<ServerToClientMessage>();
+        state.clients.write().unwrap().insert("c1".into(), client_tx);
+
+        // A new client, as it is on the wire.
+        let new_client: SignalingMessage =
+            serde_json::from_str(r#"{"type":"RequestFileSession","payload":{"host_id":"h1","source_id":"office-pc"}}"#).unwrap();
+        handle_client_signaling(new_client, "a", "c1", state.clone()).await;
+        match agent_rx.rx_try() {
+            Some(message @ ServerToAgentMessage::Signaling(SignalingMessage::IncomingFileSession { .. })) => {
+                let ServerToAgentMessage::Signaling(SignalingMessage::IncomingFileSession { client_id, source_id, .. }) = &message else { unreachable!() };
+                assert_eq!((client_id.as_str(), source_id.as_deref()), ("c1", Some("office-pc")));
+                assert!(serde_json::to_string(&message).unwrap().contains(r#""source_id":"office-pc""#));
+            }
+            _ => panic!("the agent got no IncomingFileSession"),
+        }
+        // The file session did not touch the host's streaming state.
+        assert_eq!(host_status(&state, "h1").await, "Online");
+
+        // A client from before the field.
+        let old_client: SignalingMessage = serde_json::from_str(r#"{"type":"RequestFileSession","payload":{"host_id":"h1"}}"#).unwrap();
+        assert!(matches!(&old_client, SignalingMessage::RequestFileSession { source_id: None, .. }));
+        handle_client_signaling(old_client, "a", "c1", state.clone()).await;
+        match agent_rx.rx_try() {
+            Some(message @ ServerToAgentMessage::Signaling(SignalingMessage::IncomingFileSession { .. })) => {
+                assert!(matches!(&message, ServerToAgentMessage::Signaling(SignalingMessage::IncomingFileSession { source_id: None, .. })));
+                // What an agent from before the field is sent has no trace of it.
+                assert!(!serde_json::to_string(&message).unwrap().contains("source_id"));
+            }
+            _ => panic!("the agent got no IncomingFileSession"),
+        }
+        // What an old server sends an agent (no field) still parses, as "own files";
+        // and a new client's request without a source is the old request, byte for byte.
+        let from_old_server: SignalingMessage =
+            serde_json::from_str(r#"{"type":"IncomingFileSession","payload":{"client_id":"c1","requester":"bob"}}"#).unwrap();
+        assert!(matches!(from_old_server, SignalingMessage::IncomingFileSession { source_id: None, .. }));
+        assert_eq!(
+            serde_json::to_string(&SignalingMessage::RequestFileSession { host_id: "h1".into(), source_id: None }).unwrap(),
+            r#"{"type":"RequestFileSession","payload":{"host_id":"h1"}}"#
+        );
     }
 
     /// The source asked for and the codecs the client decodes reach the

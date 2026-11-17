@@ -45,6 +45,7 @@ ApplicationWindow {
     property int directPort: 8091
     property bool rustdeskEnabled: false
     property int rustdeskPort: 21118
+    property bool rustdeskFileTransfer: false
     property string directPassword: ""
     property var directAddresses: []
 
@@ -355,6 +356,18 @@ ApplicationWindow {
                     checked: window.rustdeskEnabled
                     onToggled: { bridge.setRustdesk(checked, window.rustdeskPort); restartIfSharing() }
                 }
+                Toggle {
+                    text: "Let RustDesk clients use their file manager here"
+                    enabled: window.rustdeskEnabled
+                    checked: window.rustdeskFileTransfer
+                    onToggled: { bridge.setRustdeskFileTransfer(checked); restartIfSharing() }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: "They can then read and change files in this computer's home folder (or what file transfer may reach here)."
+                    color: Theme.textMuted; font.pixelSize: 12
+                }
                 Text {
                     Layout.fillWidth: true
                     wrapMode: Text.Wrap
@@ -481,6 +494,7 @@ ApplicationWindow {
         function onRustdeskConfigLoaded(enabled, port) {
             window.rustdeskEnabled = enabled; window.rustdeskPort = port
         }
+        function onRustdeskFileTransferLoaded(enabled) { window.rustdeskFileTransfer = enabled }
         function onDirectConfigLoaded(enabled, port, password, addresses) {
             window.directEnabled = enabled; window.directPort = port; window.directPassword = password
             var a = addresses.toString(); window.directAddresses = a === "" ? [] : a.split("\n")

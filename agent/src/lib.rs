@@ -405,6 +405,11 @@ pub async fn run_agent(
             allow_clipboard: config.allow_clipboard,
             agent_id: config.client_unique_id.clone(),
             name: name.clone(),
+            // RustDesk's file manager: its own switch, and never when file
+            // transfer is off on this computer; held to `file_access`.
+            file_transfer: config.rustdesk_file_transfer && config.allow_file_transfer,
+            file_access: files::Access::from_config(&file_access_setting(&config)),
+            file_home: None,
         };
         tasks.0.push(tokio::spawn(async move {
             if let Err(e) = rustdesk::run_listener(rustdesk_config).await {
@@ -1097,21 +1102,32 @@ async fn run_session_logic(
     while let Some(sig) = inbound.recv().await {
         // Answers, candidates and ends of file sessions go to them.
         let sig = match sig {
-            SignalingMessage::IncomingFileSession { client_id, .. } if bridge_agent::is_bridge_only() => {
-                // The bridge-only agent has no files to give.
+            SignalingMessage::IncomingFileSession { client_id, ref source_id, .. }
+                if bridge_agent::is_bridge_only() && source_id.as_deref().unwrap_or("").is_empty() =>
+            {
+                // The bridge-only agent has no files of its own to give
+                // (the files of a source it shows are that computer's).
                 warn!("File transfer asked of the bridge-only agent by {}: refused", client_id);
                 continue;
             }
-            SignalingMessage::IncomingFileSession { client_id, ice_servers, .. } => {
+            SignalingMessage::IncomingFileSession { client_id, ice_servers, source_id, .. } => {
                 info!("File transfer session requested by {}", client_id);
                 if let Some(old) = file_sessions.remove(&client_id) {
                     let _ = old.close().await;
                 }
-                let access = files::Access::from_config(&file_access_setting(&config));
-                if let files::Access::Denied(reason) = &access {
-                    warn!("{}", reason);
-                }
-                match files::start(client_id.clone(), agent_tx.clone(), ice_servers, config.allow_file_transfer, access).await {
+                // The files of a source are served from its connector, never
+                // from this computer; a source that is not there is an error.
+                let started = match files::source_target(source_id.as_deref(), crate::connector::configured_sources) {
+                    Some(target) => files::start_for_source(client_id.clone(), agent_tx.clone(), ice_servers, target).await,
+                    None => {
+                        let access = files::Access::from_config(&file_access_setting(&config));
+                        if let files::Access::Denied(reason) = &access {
+                            warn!("{}", reason);
+                        }
+                        files::start(client_id.clone(), agent_tx.clone(), ice_servers, config.allow_file_transfer, access).await
+                    }
+                };
+                match started {
                     Ok((pc, sdp)) => {
                         file_sessions.insert(client_id.clone(), pc);
                         let _ = agent_tx.send(AgentMessage::Signaling(SignalingMessage::Sdp {
@@ -1443,7 +1459,10 @@ async fn run_session_logic(
                 let mut displays = Vec::new();
                 // The bridge-only agent has nothing of this computer to tell:
                 // no displays, no encoders; only its sources.
-                let own_screen = !bridge_agent::is_bridge_only();
+                // Nor while another computer is being shown: the viewer asks
+                // about what it sees, and that computer's displays reach it
+                // with the picture.
+                let own_screen = !bridge_agent::is_bridge_only() && !crate::connector::media::source_active();
                 match if own_screen { lunaris_media::capture::list_displays_for_capabilities().await } else { Ok(Vec::new()) } {
                     Ok(display_list) => {
                         info!("[GetCapabilities] Discovered {} display(s)", display_list.len());
@@ -1566,7 +1585,7 @@ mod server_gate_tests {
     use super::*;
 
     fn incoming(client: &str) -> SignalingMessage {
-        SignalingMessage::IncomingFileSession { client_id: client.into(), ice_servers: None, requester: Some("bob".into()) }
+        SignalingMessage::IncomingFileSession { client_id: client.into(), ice_servers: None, requester: Some("bob".into()), source_id: None }
     }
 
     fn answer(client: &str) -> SignalingMessage {

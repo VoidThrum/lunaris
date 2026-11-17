@@ -40,6 +40,9 @@ struct HostStatus {
     /// and the port they use (21118, RustDesk's own, when it is off).
     rustdesk_enabled: bool,
     rustdesk_port: u16,
+    /// RustDesk clients may also use their file manager here
+    /// (`rustdesk_file_transfer`; agent/src/rustdesk/files.rs).
+    rustdesk_file_transfer: bool,
     error: String,
 }
 
@@ -203,6 +206,7 @@ pub fn status_json() -> String {
             approve_mode: config.approve_mode.clone(),
             rustdesk_enabled: config.rustdesk_port.is_some(),
             rustdesk_port: config.rustdesk_port.unwrap_or(agent::rustdesk::DEFAULT_PORT),
+            rustdesk_file_transfer: config.rustdesk_file_transfer,
             error: String::new(),
         },
         Err(error) => HostStatus {
@@ -219,6 +223,7 @@ pub fn status_json() -> String {
             approve_mode: "password-click".into(),
             rustdesk_enabled: false,
             rustdesk_port: agent::rustdesk::DEFAULT_PORT,
+            rustdesk_file_transfer: false,
             error,
         },
     };
@@ -600,6 +605,16 @@ pub fn set_rustdesk(enabled: bool, port: u16) -> Result<(), String> {
         return Err("That port is the one for direct connections".into());
     }
     config.rustdesk_port = enabled.then_some(port);
+    save(&config)?;
+    restart_if_ours()
+}
+
+/// Whether RustDesk clients may use their file manager on this computer
+/// (`rustdesk_file_transfer` of the agent's config; off by default).
+/// Restarts the app's agent.
+pub fn set_rustdesk_file_transfer(enabled: bool) -> Result<(), String> {
+    let mut config = load_or_create_config()?;
+    config.rustdesk_file_transfer = enabled;
     save(&config)?;
     restart_if_ours()
 }
