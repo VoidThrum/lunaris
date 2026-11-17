@@ -212,6 +212,9 @@ pub struct PendingHostCursor {
     pub visible: bool,
     pub kind: String,
     pub in_window_move_size: bool,
+    /// The host's `pointer_maybe_in_picture` (absent = false): its pointer
+    /// may be drawn into the picture; `pointer_in_picture` then looks.
+    pub pointer_maybe_in_picture: bool,
     pub image_data_url: String,
     pub image_width: i32,
     pub image_height: i32,
@@ -842,6 +845,12 @@ pub mod qobject {
             in_window_move_size: bool,
         );
 
+        /// `maybe`: the host says its pointer may be drawn into the picture
+        /// (information only). `found`: the client saw it there during this
+        /// drag: hide the viewer's own pointer as for `in_window_move_size`.
+        #[qsignal]
+        fn pointer_in_picture_updated(self: Pin<&mut StreamBridge>, maybe: bool, found: bool);
+
         #[qsignal]
         fn host_cursor_image_updated(
             self: Pin<&mut StreamBridge>,
@@ -1401,6 +1410,7 @@ impl qobject::StreamBridge {
     pub fn start_stream(mut self: Pin<&mut Self>) {
         println!("Starting WebRTC streaming pipeline...");
         self.as_mut().stop_stream();
+        super::pointer_in_picture::reset();
         *STREAM_STATS.lock().unwrap() = Some(StreamStats {
             ping: 0.0,
             decode: 0.0,
@@ -1557,11 +1567,20 @@ impl qobject::StreamBridge {
         if let Ok(guard) = self.as_ref().rust().input_senders.try_lock() {
             if let Some(ref s) = *guard {
                 super::input::handle_mouse_move(x, y, width, height, rx, ry, pointer_locked, s);
+                // The absolute positions sent are where the host's pointer
+                // is looked for in the picture.
+                if !pointer_locked {
+                    super::pointer_in_picture::note_position(x, y, width, height);
+                }
             }
         }
     }
 
     pub fn send_mouse_click(self: Pin<&mut Self>, button: i32, is_down: bool) {
+        // Button 1 is the left one (main.qml getButtonCode).
+        if button == 1 {
+            super::pointer_in_picture::note_left_button(is_down);
+        }
         let binding = self.as_ref();
         let senders = binding.rust().input_senders.lock().unwrap();
         if let Some(ref s) = *senders {
@@ -1769,6 +1788,10 @@ impl qobject::StreamBridge {
                     cursor.image_hotspot_y,
                 );
             }
+        }
+
+        if let Some((maybe, found)) = super::pointer_in_picture::take_update() {
+            self.as_mut().pointer_in_picture_updated(maybe, found);
         }
 
         let host_os = { PENDING_HOST_OS.lock().unwrap().take() };
@@ -3345,6 +3368,31 @@ fn encode_cursor_png_data_url(image: &serde_json::Value) -> Option<(String, i32,
     ))
 }
 
+/// The cursor image of a `host_cursor` message as pixels (RGBA, straight
+/// alpha), for `pointer_in_picture`.
+fn host_cursor_image(image: &serde_json::Value) -> Option<super::pointer_in_picture::CursorImage> {
+    use common::base64::Engine;
+
+    let width = image.get("width")?.as_u64()?;
+    let height = image.get("height")?.as_u64()?;
+    if width == 0 || height == 0 || width > 256 || height > 256 {
+        return None;
+    }
+    let rgba = common::base64::engine::general_purpose::STANDARD
+        .decode(image.get("rgba")?.as_str()?)
+        .ok()?;
+    if rgba.len() != width as usize * height as usize * 4 {
+        return None;
+    }
+    Some(super::pointer_in_picture::CursorImage {
+        width: width as i32,
+        height: height as i32,
+        hot_x: image.get("hotspot_x")?.as_i64()? as i32,
+        hot_y: image.get("hotspot_y")?.as_i64()? as i32,
+        rgba,
+    })
+}
+
 fn handle_host_cursor_message(data: &[u8]) {
     let Ok(text) = std::str::from_utf8(data) else {
         return;
@@ -3376,10 +3424,19 @@ fn handle_host_cursor_message(data: &[u8]) {
         .get("in_window_move_size")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let pointer_maybe_in_picture = value
+        .get("pointer_maybe_in_picture")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let (image_data_url, image_width, image_height, image_hotspot_x, image_hotspot_y) = value
         .get("image")
         .and_then(encode_cursor_png_data_url)
         .unwrap_or_else(|| (String::new(), 0, 0, 0, 0));
+    // The matcher looks for the cursor image last delivered.
+    if let Some(cursor) = value.get("image").and_then(host_cursor_image) {
+        super::pointer_in_picture::note_cursor(cursor);
+    }
+    super::pointer_in_picture::note_maybe(pointer_maybe_in_picture);
 
     *PENDING_HOST_CURSOR.lock().unwrap() = Some(PendingHostCursor {
         x: x.round() as i32,
@@ -3387,6 +3444,7 @@ fn handle_host_cursor_message(data: &[u8]) {
         visible,
         kind,
         in_window_move_size,
+        pointer_maybe_in_picture,
         image_data_url,
         image_width,
         image_height,
@@ -3707,6 +3765,7 @@ impl PeerConnectionEventHandler for ClientEventHandler {
                                     visible: false,
                                     kind: "arrow".to_string(),
                                     in_window_move_size: false,
+                                    pointer_maybe_in_picture: false,
                                     image_data_url: String::new(),
                                     image_width: 0,
                                     image_height: 0,
@@ -5848,5 +5907,28 @@ mod chroma_tests {
     fn detects_high_444_profile() {
         assert!(is_h264_444_fmtp("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=f4002a"));
         assert!(!is_h264_444_fmtp("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42002a"));
+    }
+}
+
+#[cfg(test)]
+mod host_cursor_tests {
+    use super::{handle_host_cursor_message, PENDING_HOST_CURSOR};
+
+    /// `pointer_maybe_in_picture` is optional: hosts from before it, and
+    /// hosts that know when their pointer is in the picture, do not send it.
+    #[test]
+    fn pointer_maybe_in_picture_is_optional() {
+        let take = |json: &str| {
+            handle_host_cursor_message(json.as_bytes());
+            PENDING_HOST_CURSOR.lock().unwrap().take().expect("a host_cursor message")
+        };
+        let cursor = take(r#"{"type":"host_cursor","x":10,"y":20,"visible":true,"kind":"arrow","in_window_move_size":true}"#);
+        assert!(cursor.in_window_move_size);
+        assert!(!cursor.pointer_maybe_in_picture);
+        let cursor = take(r#"{"type":"host_cursor","x":10,"y":20,"pointer_maybe_in_picture":true}"#);
+        assert!(cursor.pointer_maybe_in_picture);
+        assert!(!cursor.in_window_move_size);
+        let cursor = take(r#"{"type":"host_cursor","x":10,"y":20,"pointer_maybe_in_picture":false}"#);
+        assert!(!cursor.pointer_maybe_in_picture);
     }
 }

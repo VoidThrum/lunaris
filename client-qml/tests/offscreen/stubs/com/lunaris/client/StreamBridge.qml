@@ -15,6 +15,7 @@ StubBridge {
 
     signal statsUpdated(real ping, real decode, real frames, real bit, string requestedCodec, string negotiatedCodec, string decodeBackend, string presentBackend, bool gpuDecodeEnabled, string fallbackReason, int packetLossEvents, int packetsLost, int queueLagEvents, int maxQueueLag, string connectionType)
     signal hostCursorUpdated(int x, int y, bool visible, string kind, bool inWindowMoveSize)
+    signal pointerInPictureUpdated(bool maybe, bool found)
     signal hostCursorImageUpdated(string kind, string source, int width, int height, int hotspotX, int hotspotY)
     signal hostOsUpdated(string hostOs)
     signal hostInfoUpdated(string gpuInfo, string hostOs)

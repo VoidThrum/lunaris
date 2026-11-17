@@ -595,11 +595,11 @@ impl Remote {
     /// picture, and its displays' `cursor_embedded` is fixed per display.
     /// What is known here is the viewer's own input: the left button held
     /// and the pointer dragged, begun while the cursor was the arrow, is
-    /// what moving a window looks like. That is told to the viewer as the
-    /// same state. It is a likeness, not knowledge: other drags that begin
-    /// on the arrow (a scroll bar, a selection frame on the desktop) are
-    /// taken for it too, and the viewer shows no pointer of its own during
-    /// them; drags that begin on another cursor (text, drawing) are not.
+    /// what moving a window looks like. It is a likeness, not knowledge
+    /// (a scroll bar or a selection frame on the desktop looks the same), so
+    /// it is told to the viewer as "the pointer may be in the picture": the
+    /// viewer keeps its own pointer, looks for the computer's in the
+    /// picture, and hides its own only when it finds it there.
     fn pointer_moved(&mut self) {
         if self.platform != "windows" || !self.left_down || !self.press_with_arrow || self.embedded {
             return;
@@ -607,7 +607,7 @@ impl Remote {
         let (dx, dy) = (self.pointer.0 - self.press.0, self.pointer.1 - self.press.1);
         if dx.abs() >= DRAG_PIXELS || dy.abs() >= DRAG_PIXELS {
             self.embedded = true;
-            self.pending.push(Event::CursorEmbedded { embedded: true });
+            self.pending.push(Event::CursorMaybeEmbedded { maybe: true });
         }
     }
 
@@ -618,7 +618,7 @@ impl Remote {
             self.press_with_arrow = self.cursor_is_arrow;
         } else if self.embedded {
             self.embedded = false;
-            self.pending.push(Event::CursorEmbedded { embedded: false });
+            self.pending.push(Event::CursorMaybeEmbedded { maybe: false });
         }
     }
 
@@ -998,7 +998,7 @@ mod tests {
         std::mem::take(&mut remote.pending)
             .into_iter()
             .filter_map(|event| match event {
-                Event::CursorEmbedded { embedded } => Some(embedded),
+                Event::CursorMaybeEmbedded { maybe } => Some(maybe),
                 _ => None,
             })
             .collect()

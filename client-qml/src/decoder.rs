@@ -334,11 +334,12 @@ impl HardwareDecoder {
         if hw_device_type != ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
             unsafe {
                 (*codec_ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device_ctx);
-                // Surfaces held outside the decoder: the frame on screen and
-                // the frames waiting in the pacing queue (up to 8).
+                // Surfaces held outside the decoder: the frame on screen,
+                // the frames waiting in the pacing queue (up to 8), and the
+                // one frame the pointer matcher may be reading (luma_tap).
                 #[cfg(target_os = "linux")]
                 {
-                    (*codec_ctx).extra_hw_frames = 10;
+                    (*codec_ctx).extra_hw_frames = 11;
                 }
                 if d3d11_device {
                     (*codec_ctx).get_format = Some(d3d11_get_format);
@@ -609,6 +610,12 @@ impl HardwareDecoder {
             println!("Video colours: {} {} range", if bt709 { "BT.709" } else { "BT.601" }, if full_range { "full" } else { "studio" });
         }
         crate::bridge::qobject::set_video_color(bt709, full_range);
+        // The host's pointer is looked for in the picture during some drags
+        // (pointer_in_picture): one atomic load otherwise. The frame goes
+        // to the renderer below as always.
+        if crate::pointer_in_picture::frame_wanted() {
+            unsafe { crate::luma_tap::offer(gpu_frame, bt709, full_range) };
+        }
         let is_cuda = format == ffi::AVPixelFormat::AV_PIX_FMT_CUDA as i32;
         let cuda_gl_failed = crate::bridge::qobject::cuda_gl_render_failed();
         if cuda_gl_failed {

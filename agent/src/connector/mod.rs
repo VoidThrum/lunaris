@@ -190,6 +190,12 @@ pub enum Event {
     /// The pointer is part of the picture now (`true`), so a viewer that
     /// draws a pointer of its own would show two; or no longer (`false`).
     CursorEmbedded { embedded: bool },
+    /// The pointer *may* be part of the picture now (`true`): the connector
+    /// cannot tell, only that it looks like a moment in which it would be
+    /// (a window being moved). The viewer keeps its own pointer and looks
+    /// for the computer's in the picture; it hides its own only if it finds
+    /// it. `false`: the moment is over.
+    CursorMaybeEmbedded { maybe: bool },
     /// What kind of computer it is: "windows", "linux", "macos", "android"
     /// (viewers treat the pointer differently by it).
     Platform { os: String },

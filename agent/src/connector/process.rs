@@ -131,6 +131,7 @@ pub enum EventHeader {
     CursorShape { width: u32, height: u32, hot_x: u32, hot_y: u32 },
     CursorPosition { x: i32, y: i32, visible: bool },
     CursorEmbedded { embedded: bool },
+    CursorMaybeEmbedded { maybe: bool },
     Platform { os: String },
     /// Payload: the text, UTF-8.
     Clipboard,
@@ -225,6 +226,7 @@ pub fn event_from_wire(header: EventHeader, payload: Bytes) -> Option<Event> {
         }
         EventHeader::CursorPosition { x, y, visible } => Event::CursorPosition { x, y, visible },
         EventHeader::CursorEmbedded { embedded } => Event::CursorEmbedded { embedded },
+        EventHeader::CursorMaybeEmbedded { maybe } => Event::CursorMaybeEmbedded { maybe },
         EventHeader::Platform { os } => Event::Platform { os },
         EventHeader::Clipboard => Event::Clipboard { text: String::from_utf8(payload.to_vec()).ok()? },
         EventHeader::ClipboardError => Event::ClipboardError { text: String::from_utf8(payload.to_vec()).ok()? },

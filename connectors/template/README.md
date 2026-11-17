@@ -128,6 +128,7 @@ it cannot (wrong password, not reachable, no codec in common), it sends
 | `{"type":"cursor_shape","width":16,"height":16,"hot_x":0,"hot_y":0}` | `width * height * 4` bytes, RGBA | |
 | `{"type":"cursor_position","x":10,"y":20,"visible":true}` | – | In pixels of the display shown. |
 | `{"type":"cursor_embedded","embedded":true}` | – | The pointer is part of the picture now (`true`), so the viewer must not draw its own; or no longer (`false`). |
+| `{"type":"cursor_maybe_embedded","maybe":true}` | – | The pointer *may* be part of the picture now (the connector cannot know, only that it is a moment in which it would be, such as a window being moved). The viewer keeps its own pointer, looks for the computer's in the picture and hides its own only when it finds it. `false`: the moment is over. Use `cursor_embedded` when you know. |
 | `{"type":"platform","os":"windows"}` | – | What kind of computer it is: `windows`, `linux`, `macos`, `android`. Once, at the start. |
 | `{"type":"clipboard"}` | the text, UTF-8 | The other computer's clipboard changed. Text of at most 1 MiB; the agent does not pass on the same text twice in a row, nor text it has just sent itself. |
 | `{"type":"clipboard_error"}` | the reason, UTF-8 | The clipboard cannot be shared (the other computer does not allow it, the text is too large). Shown to the viewer; say it once, not for every attempt. |

@@ -45,6 +45,14 @@ pub const TEST_DELAY_REPLY_ENV: &str = "LUNARIS_CONNECTOR_TEST_DELAY_REPLY_MS";
 /// source is shown: what a viewer is told as the host's when it asks.
 static SOURCE_OS: Mutex<Option<String>> = Mutex::new(None);
 
+/// Whether the source's pointer may be part of its picture now (see
+/// `Event::CursorMaybeEmbedded`); goes out with the cursor messages.
+static POINTER_MAYBE_IN_PICTURE: AtomicBool = AtomicBool::new(false);
+
+pub fn pointer_maybe_in_picture() -> bool {
+    POINTER_MAYBE_IN_PICTURE.load(Ordering::Relaxed)
+}
+
 /// Whether a source is being shown now (the session's picture is another
 /// computer's).
 static SOURCE_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -96,6 +104,7 @@ struct Counters {
 impl Drop for Counters {
     fn drop(&mut self) {
         SOURCE_ACTIVE.store(false, Ordering::Relaxed);
+        POINTER_MAYBE_IN_PICTURE.store(false, Ordering::Relaxed);
         *SOURCE_OS.lock().unwrap() = None;
         info!("Connector session: {}; input: {} events, {} commands", self.summary(self.capture_times_used), self.input_events, self.input_commands);
     }
@@ -826,6 +835,13 @@ pub async fn run(source: Source, link: ViewerLink) {
             // The pointer is in the picture: what a Lunaris host on Windows
             // reports while a window is moved (`in_window_move_size`), and
             // the viewers then do not draw their own.
+            // Not known, only likely: the viewer is told so in the same
+            // message (`pointer_maybe_in_picture`, bridge.rs) and decides by
+            // looking at the picture.
+            Event::CursorMaybeEmbedded { maybe } => {
+                POINTER_MAYBE_IN_PICTURE.store(maybe, Ordering::Relaxed);
+                let _ = media_events.try_send(MediaEvent::CursorUpdate(cursor.clone()));
+            }
             Event::CursorEmbedded { embedded } => {
                 cursor.in_window_move_size = embedded;
                 let _ = media_events.try_send(MediaEvent::CursorUpdate(cursor.clone()));

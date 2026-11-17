@@ -1297,6 +1297,10 @@ pub async fn setup_bridge_session(
                         "kind": cursor_kind,
                         "image": image,
                         "in_window_move_size": cursor.in_window_move_size,
+                        // A source that cannot know (connector/media.rs): the
+                        // viewer looks for the pointer in the picture itself.
+                        // Viewers from before this field keep their own pointer.
+                        "pointer_maybe_in_picture": crate::connector::media::pointer_maybe_in_picture(),
                     })
                     .to_string();
                     let cached_payload = serde_json::json!({
@@ -1307,6 +1311,10 @@ pub async fn setup_bridge_session(
                         "kind": cursor_kind,
                         "image": latest_cursor_image.clone(),
                         "in_window_move_size": cursor.in_window_move_size,
+                        // A source that cannot know (connector/media.rs): the
+                        // viewer looks for the pointer in the picture itself.
+                        // Viewers from before this field keep their own pointer.
+                        "pointer_maybe_in_picture": crate::connector::media::pointer_maybe_in_picture(),
                     })
                     .to_string();
                     *latest_host_cursor_for_media.lock().await = Some(cached_payload.clone());

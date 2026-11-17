@@ -7,6 +7,7 @@ import { GamepadSender } from '../gamepad';
 import FileManager from './FileManager';
 import { TouchGestures, type GestureActions, type TouchPoint } from '../touchGestures';
 import { accessRefusal } from '../accessRequest';
+import { PictureReader, PointerInPictureDrag, SentPositions, buildTemplates, matchRegion, searchGroups, type Template } from '../pointerInPicture';
 
 /** Windows virtual-key codes for the phone keys bar and keyboard keys. */
 /** The keys bar above the phone keyboard, in order. The first eleven are the
@@ -261,6 +262,22 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     kind: 'arrow',
     inWindowMoveSize: false,
   });
+  // Finding the host's pointer in the picture (pointerInPicture.ts): a host
+  // that cannot know says "the pointer may be in the picture"; while the left
+  // button is held the picture is looked at, and the three places that hide
+  // the pointers for `inWindowMoveSize` hide for `pointerDragRef.current.inPicture` too.
+  const leftButtonHeldRef = useRef<boolean>(false);
+  const pointerMaybeInPictureRef = useRef<boolean>(false);
+  const [pointerDragRef] = useState(() => ({ current: new PointerInPictureDrag() }));
+  const [sentPositionsRef] = useState(() => ({ current: new SentPositions() }));
+  /** The host cursor image last delivered, and its templates once a drag needed them. */
+  const hostCursorImagePayloadRef = useRef<HostCursorImagePayload | null>(null);
+  const pointerTemplatesRef = useRef<{ image: HostCursorImagePayload; templates: Template[] } | null>(null);
+  const pictureReaderRef = useRef<PictureReader | null>(null);
+  const pointerPictureUnreadableRef = useRef<boolean>(false);
+  const pointerCheckBusyRef = useRef<boolean>(false);
+  const stopPointerCheckLoopRef = useRef<(() => void) | null>(null);
+  const updateHostCursorDOMRef = useRef<() => void>(() => {});
   const isHardwareMouseActiveRef = useRef<boolean>(false);
   const localCursorPosRef = useRef<{ x: number, y: number }>({ x: 960, y: 540 });
   const mouseAccumulatorXRef = useRef<number>(0);
@@ -585,6 +602,10 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
 
   useEffect(() => {
     updateVirtualCursorDOMRef.current = updateVirtualCursorDOM;
+    updateHostCursorDOMRef.current = () => {
+      const hostCursor = hostCursorPosRef.current;
+      updateHostCursorDOM(hostCursor.x, hostCursor.y, hostCursor.visible, hostCursor.kind);
+    };
   });
 
 
@@ -775,6 +796,132 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     console.log(`[Lunaris] ${msg}`);
   };
 
+  /** A pointer position sent to the host (stream pixels), kept for the
+   *  matcher while the left button is held. */
+  const recordSentPointer = (x: number, y: number) => {
+    if (leftButtonHeldRef.current) sentPositionsRef.current.record(x, y, performance.now());
+  };
+
+  const stopPointerCheckLoop = () => {
+    const stop = stopPointerCheckLoopRef.current;
+    stopPointerCheckLoopRef.current = null;
+    if (stop) stop();
+  };
+
+  /** One look at the decoded picture for the host's pointer. */
+  const runPointerCheck = async (video: HTMLVideoElement) => {
+    const drag = pointerDragRef.current;
+    const now = performance.now();
+    if (pointerCheckBusyRef.current || !drag.wantsCheck(now)) return;
+    if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) return; // no picture yet
+
+    const image = hostCursorImagePayloadRef.current;
+    if (image && pointerTemplatesRef.current?.image !== image) {
+      let templates: Template[] = [];
+      try {
+        const binary = atob(image.rgba);
+        if (binary.length === image.width * image.height * 4) {
+          const rgba = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i += 1) rgba[i] = binary.charCodeAt(i);
+          templates = buildTemplates({ width: image.width, height: image.height, hotspotX: image.hotspotX, hotspotY: image.hotspotY, rgba });
+        }
+      } catch {
+        // Not a cursor image that can be looked for.
+      }
+      pointerTemplatesRef.current = { image, templates };
+    }
+    const templates = drag.templatesToTry(pointerTemplatesRef.current?.templates ?? []);
+    const positions = sentPositionsRef.current.recent(now);
+    if (positions.length === 0) {
+      positions.push({ x: Math.round(localCursorPosRef.current.x), y: Math.round(localCursorPosRef.current.y) });
+    }
+    let matched = 0;
+    const groups = searchGroups(positions, templates, video.videoWidth, video.videoHeight);
+    if (groups.length > 0) {
+      if (!pictureReaderRef.current) pictureReaderRef.current = new PictureReader();
+      const reader = pictureReaderRef.current;
+      const generation = drag.generation;
+      pointerCheckBusyRef.current = true;
+      let unreadable = false;
+      try {
+        for (const group of groups) {
+          const region = await reader.readVideo(video, group.box);
+          if (!region) {
+            unreadable = true;
+            break;
+          }
+          matched = matchRegion(region, templates, group.positions);
+          if (matched > 0) break;
+        }
+      } finally {
+        pointerCheckBusyRef.current = false;
+      }
+      if (!drag.active || drag.generation !== generation) return; // that drag is over
+      if (unreadable) {
+        // The picture cannot be read here: the viewer's pointer stays.
+        pointerPictureUnreadableRef.current = true;
+        addLog(`pointer in the picture: the picture cannot be read (${reader.error}); the viewer's pointer stays`);
+        stopPointerCheckLoop();
+        return;
+      }
+    }
+    if (drag.noteCheck(now, matched)) {
+      stopPointerCheckLoop();
+      updateHostCursorDOMRef.current();
+      updateVirtualCursorDOMRef.current();
+    }
+  };
+
+  /** Looks at each presented frame (at most one per 30 ms) while a drag is on. */
+  const startPointerCheckLoop = () => {
+    stopPointerCheckLoop();
+    if (pointerPictureUnreadableRef.current) return;
+    // The decoded picture is always a <video>: the canvas renderer keeps the
+    // track on the hidden one as well.
+    const video = useCanvasRendererRef.current ? hiddenVideoRef.current : (videoRef.current as HTMLVideoElement | null);
+    if (!video || !(video instanceof HTMLVideoElement)) return;
+    const hasFrameCallback = 'requestVideoFrameCallback' in video;
+    let stopped = false;
+    let callbackId = 0;
+    let lastFrameAt = performance.now();
+    const onFrame = () => {
+      if (stopped) return;
+      lastFrameAt = performance.now();
+      void runPointerCheck(video);
+      if (!stopped) callbackId = video.requestVideoFrameCallback(onFrame);
+    };
+    if (hasFrameCallback) callbackId = video.requestVideoFrameCallback(onFrame);
+    // No frame callbacks in this browser, or none coming (a still picture, a
+    // video that is not laid out): look at the picture as it is.
+    const timerId = window.setInterval(() => {
+      if (stopped) return;
+      if (!hasFrameCallback || performance.now() - lastFrameAt > 100) void runPointerCheck(video);
+    }, 33);
+    stopPointerCheckLoopRef.current = () => {
+      stopped = true;
+      window.clearInterval(timerId);
+      if (callbackId && hasFrameCallback) video.cancelVideoFrameCallback(callbackId);
+    };
+  };
+
+  /** The left button or the host's "maybe" changed: start or end a drag. */
+  const syncPointerInPictureDrag = () => {
+    const drag = pointerDragRef.current;
+    const wasActive = drag.active;
+    const wasInPicture = drag.inPicture;
+    const line = drag.update(leftButtonHeldRef.current, pointerMaybeInPictureRef.current);
+    if (drag.active && !wasActive) {
+      startPointerCheckLoop();
+    } else if (!drag.active && wasActive) {
+      stopPointerCheckLoop();
+      if (line) addLog(line);
+      if (wasInPicture) {
+        updateHostCursorDOMRef.current();
+        updateVirtualCursorDOMRef.current();
+      }
+    }
+  };
+
   const getHostPointFromClient = (clientX: number, clientY: number) => {
     const video = videoRef.current;
     if (!video) return null;
@@ -843,6 +990,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     rawPredictionXRef.current = -1;
     rawPredictionYRef.current = -1;
     localCursorPosRef.current = { x: targetX, y: targetY };
+    recordSentPointer(targetX, targetY);
     lastHostCursorLocalPredictionAtRef.current = performance.now();
     updateVirtualCursorDOMRef.current();
 
@@ -1066,6 +1214,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
             const seq = (mouseSeqRef.current++) >>> 0;
             view.setUint32(9, seq, false);
             mouseAbsoluteChannel.send(buffer);
+            recordSentPointer(localCursorPosRef.current.x, localCursorPosRef.current.y);
 
             lastHostCursorLocalPredictionAtRef.current = performance.now();
             updateVirtualCursorDOMRef.current();
@@ -1129,7 +1278,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
               if (touchModeRef.current === 'trackpad' || hideLocalCursor || shouldUseWindowsPrediction) {
                 updateVirtualCursorDOMRef.current();
               }
-              if (!(hostCursorMouseDownRef.current && agentHostOs === "windows" && hostCursorPosRef.current.inWindowMoveSize)) {
+              recordSentPointer(predictedX, predictedY);
+              if (!(hostCursorMouseDownRef.current && agentHostOs === "windows" && (hostCursorPosRef.current.inWindowMoveSize || pointerDragRef.current.inPicture))) {
                 const hostCursor = hostCursorPosRef.current;
                 lastHostCursorLocalPredictionAtRef.current = performance.now();
                 updateHostCursorDOM(predictedX, predictedY, true, hostCursor.kind, null);
@@ -2175,6 +2325,15 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       const inWindowMoveSize = Boolean(message.in_window_move_size);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return;
 
+      // A host that cannot know whether its pointer is in its picture: the
+      // picture is looked at while the left button is held (pointerInPicture.ts).
+      if (image) hostCursorImagePayloadRef.current = image;
+      const maybeInPicture = message.pointer_maybe_in_picture === true;
+      if (maybeInPicture !== pointerMaybeInPictureRef.current) {
+        pointerMaybeInPictureRef.current = maybeInPicture;
+        syncPointerInPictureDrag();
+      }
+
       applyNativeCursorImage(localCursorImageRef.current, localCursorImageMetricsRef, kind, image);
       updateHostCssCursor(kind, image);
 
@@ -2287,6 +2446,12 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
           hostCursorImageMetricsRef.current = null;
           localCursorImageMetricsRef.current = null;
           hasNativeCursorImageRef.current = false;
+          hostCursorImagePayloadRef.current = null;
+          pointerTemplatesRef.current = null;
+          if (pointerMaybeInPictureRef.current) {
+            pointerMaybeInPictureRef.current = false;
+            syncPointerInPictureDrag();
+          }
           hostCssCursorRef.current = null;
           hostCssCursorNativeRef.current = false;
           setHostCssCursor(null);
@@ -2729,6 +2894,12 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     if (hiddenVideoRef.current) {
       hiddenVideoRef.current.srcObject = null;
     }
+    if (pointerMaybeInPictureRef.current) {
+      pointerMaybeInPictureRef.current = false;
+      syncPointerInPictureDrag();
+    }
+    stopPointerCheckLoop();
+    pointerPictureUnreadableRef.current = false;
     stopCanvasRender();
     
     // Close WebTransport
@@ -2979,7 +3150,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       || !wrapper
       || !visible
       || isHardwareMouseActiveRef.current
-      || (hostCursorMouseDownRef.current && agentHostOs === "windows" && inWindowMoveSize)
+      || (hostCursorMouseDownRef.current && agentHostOs === "windows" && (inWindowMoveSize || pointerDragRef.current.inPicture))
     ) {
       if (cursorEl) cursorEl.style.display = 'none';
       return;
@@ -3054,6 +3225,10 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
 
   useEffect(() => {
     const releaseHostCursorSuppression = () => {
+      if (leftButtonHeldRef.current) {
+        leftButtonHeldRef.current = false;
+        if (pointerDragRef.current.active) syncPointerInPictureDrag();
+      }
       if (!hostCursorMouseDownRef.current) return;
       hostCursorMouseDownRef.current = false;
       const hostCursor = hostCursorPosRef.current;
@@ -3083,7 +3258,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     if (!cursorEl || !video || !wrapper) return;
 
     const hostCursor = hostCursorPosRef.current;
-    if (agentHostOs === "windows" && hostCursorMouseDownRef.current && hostCursor.inWindowMoveSize) {
+    if (agentHostOs === "windows" && hostCursorMouseDownRef.current && (hostCursor.inWindowMoveSize || pointerDragRef.current.inPicture)) {
       cursorEl.style.display = 'none';
       return;
     }
@@ -3757,6 +3932,16 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     }
 
     hostCursorMouseDownRef.current = isDown ? true : e.buttons !== 0;
+    const leftHeld = e.button === 0 ? isDown : (e.buttons & 1) !== 0;
+    if (leftHeld !== leftButtonHeldRef.current) {
+      leftButtonHeldRef.current = leftHeld;
+      if (leftHeld) {
+        // Where the button went down: the last position sent.
+        sentPositionsRef.current.clear();
+        recordSentPointer(localCursorPosRef.current.x, localCursorPosRef.current.y);
+      }
+      if (pointerMaybeInPictureRef.current || pointerDragRef.current.active) syncPointerInPictureDrag();
+    }
     const hostCursor = hostCursorPosRef.current;
     updateHostCursorDOM(hostCursor.x, hostCursor.y, hostCursor.visible, hostCursor.kind);
     updateVirtualCursorDOMRef.current();

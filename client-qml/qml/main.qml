@@ -132,6 +132,12 @@ ApplicationWindow {
     property string hostCursorKind: "arrow"
     property bool hostCursorMouseDown: false
     property bool hostCursorInWindowMoveSize: false
+    // A host that cannot say when its pointer is drawn into its picture (a
+    // computer of another type) only says it may be; the client then looks
+    // for it in the decoded picture (pointer_in_picture.rs). "Maybe" alone
+    // hides nothing.
+    property bool pointerMaybeInPicture: false
+    property bool pointerFoundInPicture: false
     property string agentHostOs: "unknown"
     property int localCursorX: streamWidth / 2
     property int localCursorY: streamHeight / 2
@@ -258,10 +264,13 @@ ApplicationWindow {
         window.localCursorVisible = true;
     }
 
+    // The host draws its own pointer into the picture: the host says so
+    // (a Windows host while a window is moved), or the client found it there
+    // during this drag.
     function shouldHidePredictedCursor() {
-        return window.agentHostOs === "windows"
-            && window.hostCursorMouseDown
-            && window.hostCursorInWindowMoveSize;
+        return window.hostCursorMouseDown
+            && ((window.agentHostOs === "windows" && window.hostCursorInWindowMoveSize)
+                || window.pointerFoundInPicture);
     }
 
     // Hold ESC to unlock cursor properties
@@ -424,6 +433,11 @@ ApplicationWindow {
                 window.localCursorVisible = true
                 window.localCursorInitialized = true
             }
+        }
+
+        onPointerInPictureUpdated: (maybe, found) => {
+            window.pointerMaybeInPicture = maybe
+            window.pointerFoundInPicture = found
         }
 
         onHostCursorImageUpdated: (kind, source, width, height, hotspotX, hotspotY) => {
@@ -729,6 +743,8 @@ ApplicationWindow {
 
             onReleased: (mouse) => {
                 window.hostCursorMouseDown = mouse.buttons !== 0;
+                // The pointer was found for the drag that ends here.
+                if (!(mouse.buttons & Qt.LeftButton)) window.pointerFoundInPicture = false;
                 if (!window.isPointerLocked) {
                     var mapped = streamView.mapToItem(videoContainer, mouse.x, mouse.y);
                     window.updateLocalCursorPrediction(mapped.x, mapped.y);
