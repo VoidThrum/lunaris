@@ -206,7 +206,7 @@ async fn first_listing(conn: &mut Conn, time: Duration) -> anyhow::Result<Option
 /// asked for with each listing) and without the option message
 /// (`get_option_message` gives none for a file transfer).
 fn file_login_message(address: &str, password: &str, hash: &proto::Hash) -> Message {
-    let mut msg = login_message(address, password, hash, &Viewer { codecs: Vec::new(), fps: 0 });
+    let mut msg = login_message(address, password, hash, &Viewer { codecs: Vec::new(), fps: 0, width: 0, height: 0, bitrate_kbps: 0 });
     if let Some(message::Union::LoginRequest(request)) = msg.union.as_mut() {
         request.option = None;
         request.union = Some(login_request::Union::FileTransfer(proto::FileTransfer { dir: String::new(), show_hidden: true }));

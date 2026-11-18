@@ -51,6 +51,7 @@ Item {
         "upload": "M12 16V4 M7 9l5-5 5 5 M4 16v4h16v-4",
         "clipboard": "M9 4h6v3H9z M7 5H5v16h14V5h-2",
         "folder": "M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z",
+        "keyboard": "M3 6h18v12H3z M7 10h.01 M11 10h.01 M15 10h.01 M7 14h10",
         "file": "M6 3h8l4 4v14H6z M14 3v4h4",
         "arrowUp": "M12 19V5 M5 12l7-7 7 7",
         "gamepad": "M7 7h10a5 5 0 0 1 4.9 6l-.8 4a2.5 2.5 0 0 1-4.4 1.1L15 16H9l-1.7 2.1a2.5 2.5 0 0 1-4.4-1.1l-.8-4A5 5 0 0 1 7 7z M7.5 10v3 M6 11.5h3 M15.5 11h.01 M17.5 13h.01"

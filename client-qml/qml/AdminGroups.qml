@@ -49,6 +49,7 @@ Item {
         anchors.left: parent.left
         anchors.right: parent.right
         visible: page.error !== ""
+        textFormat: Text.PlainText
         text: page.error
         color: Theme.danger
         font.pixelSize: 13
@@ -87,12 +88,13 @@ Item {
                         Layout.fillWidth: true
                         spacing: 8
                         Icon { name: "grid"; size: 16; color: Theme.accentFg }
-                        Text { Layout.fillWidth: true; text: modelData.name; color: Theme.textStrong; font.pixelSize: 15; font.weight: Font.DemiBold; elide: Text.ElideRight }
+                        Text { textFormat: Text.PlainText; Layout.fillWidth: true; text: modelData.name; color: Theme.textStrong; font.pixelSize: 15; font.weight: Font.DemiBold; elide: Text.ElideRight }
                         IconButton { iconName: "edit"; tip: I18n.t("Rename"); onClicked: groupDialog.openFor(modelData) }
                         IconButton { iconName: "trash"; tip: I18n.t("Delete"); iconColor: Theme.danger; onClicked: deleteDialog.openFor(modelData) }
                     }
                     Text {
                         Layout.fillWidth: true
+                        textFormat: Text.PlainText
                         text: modelData.note ? modelData.note : I18n.t("No description")
                         color: modelData.note ? Theme.textMuted : Theme.textSubtle
                         font.pixelSize: 12
@@ -149,7 +151,7 @@ Item {
         contentItem: ColumnLayout {
             spacing: 12
             Text { text: groupDialog.group ? I18n.t("Edit group") : I18n.t("New group"); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
-            Text { visible: groupDialog.err !== ""; text: groupDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Text { textFormat: Text.PlainText; visible: groupDialog.err !== ""; text: groupDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             Text { text: I18n.t("Name"); color: Theme.textMuted; font.pixelSize: 12 }
             InputField { id: gName; placeholder: I18n.t("e.g. Office"); onAccepted: gNote.input.forceActiveFocus() }
             Text { text: I18n.t("Description (optional)"); color: Theme.textMuted; font.pixelSize: 12 }
@@ -198,9 +200,9 @@ Item {
         }
         contentItem: ColumnLayout {
             spacing: 12
-            Text { text: membersDialog.group ? I18n.t("Members of %1").arg(membersDialog.group.name) : ""; color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideRight }
+            Text { textFormat: Text.PlainText; text: membersDialog.group ? I18n.t("Members of %1").arg(membersDialog.group.name) : ""; color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideRight }
             Text { text: I18n.t("Ticked users can see and connect to the ticked computers."); color: Theme.textMuted; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-            Text { visible: membersDialog.err !== ""; text: membersDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Text { textFormat: Text.PlainText; visible: membersDialog.err !== ""; text: membersDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 12
@@ -281,12 +283,13 @@ Item {
             Text { text: I18n.t("Delete group?"); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
             Text {
                 Layout.fillWidth: true
+                textFormat: Text.PlainText
                 text: deleteDialog.group ? I18n.t("The group %1 will be deleted. Its users lose access to its computers.").arg(deleteDialog.group.name) : ""
                 color: Theme.textMuted
                 font.pixelSize: 13
                 wrapMode: Text.WordWrap
             }
-            Text { visible: deleteDialog.err !== ""; text: deleteDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Text { textFormat: Text.PlainText; visible: deleteDialog.err !== ""; text: deleteDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 8

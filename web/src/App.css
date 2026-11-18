@@ -1248,13 +1248,25 @@ body {
   gap: 0.4rem;
   pointer-events: none;
   color: var(--text-secondary);
+  min-width: 11rem;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
   z-index: 90;
+}
+
+.stream-stats-overlay > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
 }
 
 .stat-value {
   color: var(--text-strong);
   font-weight: bold;
+  /* A long encoder or decoder name is cut, not wrapped. */
+  max-width: 17rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Connecting / Status Center Panel */
@@ -4070,3 +4082,266 @@ button, input, select, textarea { font-family: inherit; }
 }
 /* Readable on the light and on the dark surface. */
 .host-confirm-card .add-host-error { color: color-mix(in srgb, var(--danger) 78%, var(--text-strong)); font-size: 0.85rem; }
+
+/* The set-up of a computer being added (a pairing): what to do, the code to
+   type at the other computer, and that we are waiting. */
+.source-setup { display: flex; flex-direction: column; gap: 0.9rem; }
+.source-setup-message { margin: 0; color: var(--text-strong); font-size: 0.95rem; line-height: 1.5; overflow-wrap: anywhere; }
+.source-setup-code {
+  align-self: center;
+  padding: 0.5rem 1.4rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  color: var(--text-strong);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 2.6rem;
+  font-weight: 700;
+  letter-spacing: 0.35em;
+  /* The spacing after the last character is not part of the code. */
+  text-indent: 0.35em;
+  line-height: 1.2;
+  user-select: all;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+.source-setup-waiting { display: flex; align-items: center; gap: 0.6rem; color: var(--text-muted); font-size: 0.9rem; }
+.source-setup-spinner {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .source-setup-spinner { animation-duration: 3s; }
+}
+
+/* ---- One card for each computer: its ways to connect ---------------------- */
+/* The ways as chips, one picked; the dot says whether it can be connected to. */
+.method-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: -0.5rem; }
+.method-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 30px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.method-chip:hover { color: var(--text-strong); background: var(--surface-2); }
+.method-chip.selected {
+  border-color: rgb(var(--accent-rgb) / 0.55);
+  background: rgb(var(--accent-rgb) / 0.14);
+  color: var(--accent-fg);
+}
+.method-chip:focus-visible, .method-option:focus-visible, .option-card:focus-visible, .connect-more:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+.method-chip-label { overflow-wrap: anywhere; text-align: left; }
+.method-chip-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--status-offline); }
+.method-chip.online .method-chip-dot, .method-option.online .method-chip-dot { background: var(--status-online); }
+.method-chip.offline:not(.selected) { color: var(--text-subtle); }
+.method-through { overflow-wrap: anywhere; text-align: right; }
+
+/* Connect, and beside it the way to pick another way. */
+.connect-split { display: inline-flex; margin-right: auto; flex-shrink: 0; }
+.connect-split .host-card-connect { margin-right: 0; }
+.connect-split .host-card-connect:not(:last-child) { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.connect-more {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  flex-shrink: 0;
+}
+.connect-split .host-card-connect + .connect-more {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid rgb(255 255 255 / 0.28);
+}
+.connect-more[aria-expanded="true"] svg { transform: rotate(180deg); }
+.host-card.source-card .host-card-actions, .host-card .host-card-actions { margin-top: auto; }
+
+/* The ways listed in the card, each a button to connect that way. */
+.method-chooser {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+.method-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.method-option:hover:not(:disabled) { background: rgb(var(--accent-rgb) / 0.14); color: var(--text-strong); }
+.method-option:disabled { cursor: not-allowed; color: var(--text-subtle); }
+.method-option-text { display: flex; flex-direction: column; min-width: 0; }
+.method-option-name { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.method-option-sub { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.method-option:disabled .method-option-sub { color: var(--text-subtle); }
+
+/* Choices that are all in sight (the Type of "Add computer", a few
+   computers): cards to press, one picked. */
+.option-group-label {
+  display: block;
+  margin-bottom: 0.45rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+/* (Rows as tall as what is in them, also where the list scrolls.) */
+.option-cards { display: grid; grid-template-columns: 1fr; grid-auto-rows: max-content; gap: 8px; }
+.option-cards.compact { grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); }
+.option-cards.scroll { max-height: 190px; overflow-y: auto; padding: 3px; margin: -3px; }
+.option-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.option-cards.compact .option-card { align-items: center; padding: 8px 12px; }
+.option-card:hover { background: var(--surface-2); }
+.option-card.selected {
+  border-color: var(--accent-fg);
+  background: rgb(var(--accent-rgb) / 0.12);
+  box-shadow: inset 0 0 0 1px var(--accent-fg);
+}
+.option-card-mark {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-3);
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 700;
+}
+.option-card.selected .option-card-mark { background: var(--accent); color: var(--on-accent); }
+.option-card-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.option-card-name { color: var(--text-strong); font-size: 0.92rem; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+.option-card-note { color: var(--text-muted); font-size: 0.78rem; line-height: 1.4; overflow-wrap: anywhere; }
+/* Connect, its chooser and five small buttons fit one row of a card. */
+.host-card-actions:has(.connect-more) { gap: 6px; }
+.connect-split .host-card-connect:not(:last-child) { padding: 0 12px; }
+
+/* ---- "Add computer": the types side by side, a wider form ----------------- */
+.add-host-card { width: min(620px, 100%); }
+/* The types as tiles in a row (more rows when there are many): the logo, the short name. */
+.type-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 8px; }
+.type-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.type-tile:hover { background: var(--surface-2); }
+.type-tile.selected {
+  border-color: var(--accent-fg);
+  background: rgb(var(--accent-rgb) / 0.12);
+  box-shadow: inset 0 0 0 1px var(--accent-fg);
+}
+.type-tile:focus-visible { outline: none; box-shadow: var(--ring); }
+.type-tile-name {
+  max-width: 100%;
+  color: var(--text-strong);
+  font-size: 0.85rem;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A type's mark: its logo on a quiet tile (so that it reads on a light and
+   on a dark page), or its first letter. */
+.type-mark {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-3);
+  color: var(--text-strong);
+  font-size: 15px;
+  font-weight: 700;
+}
+.type-mark.logo { background: rgb(var(--ink-rgb) / 0.06); border: 1px solid var(--border); }
+.type-mark img { width: 24px; height: 24px; object-fit: contain; display: block; }
+.type-mark.small { width: 16px; height: 16px; border-radius: 4px; font-size: 10px; }
+.type-mark.small.logo { background: transparent; border: 0; }
+.type-mark.small img { width: 14px; height: 14px; }
+.method-option .type-mark { width: 26px; height: 26px; border-radius: 7px; font-size: 12px; }
+.method-option .type-mark img { width: 18px; height: 18px; }
+.type-note {
+  margin: 0.6rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.type-note strong { color: var(--text-strong); font-weight: 600; margin-right: 0.45em; }
+
+/* The fields: rows of six columns on a wide window, one field a row on a narrow one. */
+.form-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 0.85rem 0.75rem; align-items: start; }
+.form-grid > * { grid-column: span 6; min-width: 0; }
+.form-grid > .form-hint { margin-top: -0.45rem; }
+@media (min-width: 600px) {
+  .form-grid > .span-2 { grid-column: span 2; }
+  .form-grid > .span-3 { grid-column: span 3; }
+  .form-grid > .span-4 { grid-column: span 4; }
+}
+@media (max-width: 420px) {
+  .host-card-actions:has(.connect-more) { gap: 4px; }
+  .host-card-actions:has(.connect-more) .host-action-btn { width: 32px; }
+}

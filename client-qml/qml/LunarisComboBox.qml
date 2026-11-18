@@ -16,6 +16,7 @@ ComboBox {
         width: control.width
         height: 28
         contentItem: Text {
+            textFormat: Text.PlainText
             text: modelData
             color: control.pal.textStrong
             font.pixelSize: 11
@@ -53,6 +54,7 @@ ComboBox {
     contentItem: Text {
         leftPadding: 12
         rightPadding: control.indicator.width + 12
+        textFormat: Text.PlainText
         text: control.displayText
         font.pixelSize: 11
         font.bold: true

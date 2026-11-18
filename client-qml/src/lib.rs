@@ -6,6 +6,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use cxx_qt_lib::{QQmlApplicationEngine, QUrl};
 
 pub mod audio;
+pub mod av1_rtp;
 pub mod bridge;
 pub mod decoder;
 pub mod deeplink;
@@ -21,6 +22,7 @@ pub mod input;
 pub mod protocol;
 pub mod secure_fs;
 pub mod share;
+pub mod win_autostart;
 
 use bridge::{AppArgs, PendingDashboardEvent, APP_ARGS};
 

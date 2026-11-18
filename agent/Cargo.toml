@@ -68,6 +68,19 @@ socket2 = "0.6"
 # cursor shapes by an xxh3 hash (rustdesk/src/common.rs cursor_content_id).
 zstd = "0.14"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# connector/sunshine (GameStream client):
+# RSA-2048 key generation for the client identity (ring cannot generate RSA
+# keys); signing and verifying stay with ring.
+rsa = "0.10"
+# AES-128 single blocks for the pairing challenge (ECB without padding; ring
+# has no raw block interface), AES-128-GCM of video packets, the control
+# stream and RTSP, AES-128-CBC of audio packets.
+aes = "0.9.4"
+aes-gcm = "0.11.1"
+cbc = "0.2.1"
+# ENet, the transport of the GameStream control stream (pure Rust port of
+# ENet 1.3.18; Sunshine uses a fork with the same wire format).
+rusty_enet = "0.4.1"
 
 [build-dependencies]
 # build.rs: message.proto -> Rust; protox is a protobuf compiler in pure Rust,

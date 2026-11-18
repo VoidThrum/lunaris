@@ -91,8 +91,8 @@ ColumnLayout {
                     ColumnLayout {
                         Layout.fillWidth: true
                         spacing: 2
-                        Text { text: card.pad.name; color: Theme.textStrong; font.pixelSize: 14; font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideRight }
-                        Text { text: I18n.t("Controller %1").arg(card.pad.slot + 1) + " · " + card.lab.name; color: Theme.textMuted; font.pixelSize: 12 }
+                        Text { textFormat: Text.PlainText; text: card.pad.name; color: Theme.textStrong; font.pixelSize: 14; font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideRight }
+                        Text { textFormat: Text.PlainText; text: I18n.t("Controller %1").arg(card.pad.slot + 1) + " · " + card.lab.name; color: Theme.textMuted; font.pixelSize: 12 }
                     }
                     SecondaryButton {
                         text: I18n.t("Test vibration")

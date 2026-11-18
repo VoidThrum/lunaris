@@ -32,6 +32,13 @@
     <file>ApiClient.qml</file>
     <file>AddComputerDialog.qml</file>
     <file>TypeBadge.qml</file>
+    <file>Cards.js</file>
+    <file>OptionCard.qml</file>
+    <file>MethodChips.qml</file>
+    <file>TypeLogo.qml</file>
+    <file>TypeTile.qml</file>
+    <file>logos/rustdesk.svg</file>
+    <file>logos/sunshine.svg</file>
     <file>icon.png</file>
     <file>cursors/arrow.png</file>
     <file>cursors/cross.png</file>

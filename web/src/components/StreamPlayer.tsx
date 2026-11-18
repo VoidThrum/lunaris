@@ -8,6 +8,9 @@ import FileManager from './FileManager';
 import { TouchGestures, type GestureActions, type TouchPoint } from '../touchGestures';
 import { accessRefusal } from '../accessRequest';
 import { PictureReader, PointerInPictureDrag, SentPositions, buildTemplates, matchRegion, searchGroups, type Template } from '../pointerInPicture';
+import { hostPointerInPicture, saysPointerAlwaysInPicture, showsHostCursor, showsOwnCursor, streamCursorCss, type PointerView } from '../pointerShown';
+import { agentRoundTripMs, decodeStatText, decoderName, encodeStatText, pingStatText, shownPingMs, sourceLatencyMs } from '../streamStats';
+import { KEY_COMBOS, PressedKeys, applyKeyboardLock, combosFor, comboStrokes, keyboardLockFor, readSystemKeys, tapsUnderMeta, vkOfCode } from '../keyboard';
 
 /** Windows virtual-key codes for the phone keys bar and keyboard keys. */
 /** The keys bar above the phone keyboard, in order. The first eleven are the
@@ -153,6 +156,8 @@ interface StreamPlayerProps {
   /** Another computer this host shows through a connector (a source card):
    *  the session asks for it instead of the host's own screen. */
   sourceId?: string;
+  /** false: that source's connector has no files, so none are offered. */
+  sourceFiles?: boolean;
 }
 
 /**
@@ -192,29 +197,6 @@ const isTextEntryElement = (el: Element | null): boolean => {
   return ['text', 'search', 'email', 'password', 'number', 'url', 'tel'].includes(type);
 };
 
-const KEY_TO_VK: Record<string, number> = {
-  "Backspace": 8, "Tab": 9, "Enter": 13, "ShiftLeft": 16, "ShiftRight": 16,
-  "ControlLeft": 17, "ControlRight": 17, "AltLeft": 18, "AltRight": 18,
-  "Pause": 19, "CapsLock": 20, "Escape": 27, "Space": 32, "PageUp": 33,
-  "PageDown": 34, "End": 35, "Home": 36, "ArrowLeft": 37, "ArrowUp": 38,
-  "ArrowRight": 39, "ArrowDown": 40, "PrintScreen": 44, "Insert": 45,
-  "Delete": 46, "Digit0": 48, "Digit1": 49, "Digit2": 50, "Digit3": 51,
-  "Digit4": 52, "Digit5": 53, "Digit6": 54, "Digit7": 55, "Digit8": 56,
-  "Digit9": 57, "KeyA": 65, "KeyB": 66, "KeyC": 67, "KeyD": 68, "KeyE": 69,
-  "KeyF": 70, "KeyG": 71, "KeyH": 72, "KeyI": 73, "KeyJ": 74, "KeyK": 75,
-  "KeyL": 76, "KeyM": 77, "KeyN": 78, "KeyO": 79, "KeyP": 80, "KeyQ": 81,
-  "KeyR": 82, "KeyS": 83, "KeyT": 84, "KeyU": 85, "KeyV": 86, "KeyW": 87,
-  "KeyX": 88, "KeyY": 89, "KeyZ": 90, "MetaLeft": 91, "MetaRight": 92,
-  "Numpad0": 96, "Numpad1": 97, "Numpad2": 98, "Numpad3": 99, "Numpad4": 100,
-  "Numpad5": 101, "Numpad6": 102, "Numpad7": 103, "Numpad8": 104, "Numpad9": 105,
-  "NumpadMultiply": 106, "NumpadAdd": 107, "NumpadSubtract": 109, "NumpadDecimal": 110,
-  "NumpadDivide": 111, "F1": 112, "F2": 113, "F3": 114, "F4": 115, "F5": 116,
-  "F6": 117, "F7": 118, "F8": 119, "F9": 120, "F10": 121, "F11": 122, "F12": 123,
-  "NumLock": 144, "ScrollLock": 145, "Semicolon": 186, "Equal": 187, "Comma": 188,
-  "Minus": 189, "Period": 190, "Slash": 191, "Backquote": 192, "BracketLeft": 219,
-  "Backslash": 220, "BracketRight": 221, "Quote": 222
-};
-
 export const StreamPlayer: React.FC<StreamPlayerProps> = ({
   hostId,
   hostName,
@@ -222,8 +204,12 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
   serverCodecModeSupport,
   onBack,
   appId,
-  sourceId
+  sourceId,
+  sourceFiles
 }) => {
+  // The files of what is shown can be offered (a computer of another type
+  // only when its connector has files).
+  const filesOffered = sourceFiles !== false;
   const videoRef = useRef<HTMLVideoElement | HTMLCanvasElement>(null);
   const hiddenVideoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -268,6 +254,18 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
   // the pointers for `inWindowMoveSize` hide for `pointerDragRef.current.inPicture` too.
   const leftButtonHeldRef = useRef<boolean>(false);
   const pointerMaybeInPictureRef = useRef<boolean>(false);
+  // The host's pointer is part of its picture for the whole session
+  // (`pointer_in_picture: "always"`, pointerShown.ts): no pointer is shown
+  // over the picture. The ref for the handlers, the state for the CSS cursor.
+  const pointerAlwaysInPictureRef = useRef<boolean>(false);
+  const [pointerAlwaysInPicture, setPointerAlwaysInPicture] = useState<boolean>(false);
+  const notePointerAlwaysInPicture = (always: boolean): boolean => {
+    if (always === pointerAlwaysInPictureRef.current) return false;
+    pointerAlwaysInPictureRef.current = always;
+    setPointerAlwaysInPicture(always);
+    if (always) addLog("The computer's pointer is part of its picture: no pointer is shown over the picture.");
+    return true;
+  };
   const [pointerDragRef] = useState(() => ({ current: new PointerInPictureDrag() }));
   const [sentPositionsRef] = useState(() => ({ current: new SentPositions() }));
   /** The host cursor image last delivered, and its templates once a drag needed them. */
@@ -728,7 +726,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       if (el) el.volume = volume / 100;
     }
   });
-  const [isWebTransportConnected, setIsWebTransportConnected] = useState<boolean>(false);
+  const [, setIsWebTransportConnected] = useState<boolean>(false);
   const headerTimeoutRef = useRef<any | null>(null);
   const headerBarRef = useRef<HTMLDivElement | null>(null);
   // A <select> is as wide as its longest option, and Firefox's options are wide
@@ -760,6 +758,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     bitrate: number;
     ping: number;
     decodeLatency: number;
+    decoder: string;
     jitter: number;
     connectionType: string;
   }>({
@@ -771,9 +770,14 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     bitrate: 0,
     ping: 0,
     decodeLatency: 0,
+    decoder: '',
     jitter: 0,
     connectionType: 'P2P (Direct)'
   });
+  // The delay between the agent and the computer it shows through a
+  // connector, there and back (ms), as the agent last told it; 0 when it
+  // told none. Added to the ping shown; put back to 0 with each session.
+  const sourceLatencyRef = useRef<number>(0);
   const renderFpsRef = useRef<number>(0);
   const renderFrameCounterRef = useRef<{ frames: number; lastMs: number }>({
     frames: 0,
@@ -1011,6 +1015,14 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     addLog(`[System Diagnostics] useNativeClient is set to: ${useNativeClient}`);
   }, [useNativeClient]);
 
+  // The browser's Keyboard Lock (Chromium), decided in one place: every key
+  // in full screen when "System shortcuts in full screen" is on, Esc alone
+  // otherwise while in full screen or pointer lock (keyboard.ts).
+  const syncKeyboardLock = () => {
+    const pointerLocked = !!videoRef.current && document.pointerLockElement === videoRef.current;
+    applyKeyboardLock((navigator as any).keyboard, keyboardLockFor(!!document.fullscreenElement, pointerLocked, readSystemKeys()));
+  };
+
   // Pointer lock change listener
   useEffect(() => {
     const handlePointerLockChange = () => {
@@ -1022,13 +1034,12 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       // When unlocked on mobile trackpad: hide host cursor (SVG virtual cursor shown instead).
       // When unlocked on desktop: keep host cursor visible (browser cursor overlaps it).
 
+      // Lock the Escape key so the browser does not exit pointer lock
+      // immediately (our key handlers require a 3‑second hold instead),
+      // without taking back the keys locked for full screen.
+      syncKeyboardLock();
       // Prediction cursor: show on lock, hide on unlock
       if (locked) {
-        // Lock the Escape key so the browser does not exit pointer lock
-        // immediately.  Our key handlers require a 3‑second hold instead.
-        if ((navigator as any).keyboard && (navigator as any).keyboard.lock) {
-          (navigator as any).keyboard.lock(["Escape"]).catch(() => {});
-        }
         syncPointerLockCursor();
       } else {
         // Pointer unlocked — clear any in-progress ESC hold
@@ -1067,20 +1078,14 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       const isFull = !!document.fullscreenElement;
       setIsFullscreen(isFull);
       
-      // Implement browser Keyboard Lock when entering fullscreen.
-      // In Chromium-based browsers, this forces the Escape key to behave like client-qml
-      // (requiring the user to press and hold Escape for 2 seconds to exit).
-      if (isFull) {
-        if ((navigator as any).keyboard && (navigator as any).keyboard.lock) {
-          (navigator as any).keyboard.lock(["Escape"]).catch((err: any) => {
-            console.error("Failed to lock keyboard Escape:", err);
-          });
-        }
-      } else {
-        if ((navigator as any).keyboard && (navigator as any).keyboard.unlock) {
-          (navigator as any).keyboard.unlock();
-        }
-      }
+      // Browser Keyboard Lock when entering fullscreen (Chromium-based
+      // browsers): the key combinations the browser and the system keep
+      // (Alt+Tab, the Windows key, Ctrl+W...) come to the page and go to the
+      // remote computer; holding Escape leaves full screen, as in client-qml.
+      syncKeyboardLock();
+      // Keys held across the change are let go on the remote computer
+      // (moonlight-qt keyboard.cpp 104-111: "just in case key events get lost").
+      releaseAllKeys();
     };
     document.addEventListener('fullscreenchange', handleFullscreenChange);
     return () => {
@@ -1279,7 +1284,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
                 updateVirtualCursorDOMRef.current();
               }
               recordSentPointer(predictedX, predictedY);
-              if (!(hostCursorMouseDownRef.current && agentHostOs === "windows" && (hostCursorPosRef.current.inWindowMoveSize || pointerDragRef.current.inPicture))) {
+              if (!hostPointerInPicture(pointerView())) {
                 const hostCursor = hostCursorPosRef.current;
                 lastHostCursorLocalPredictionAtRef.current = performance.now();
                 updateHostCursorDOM(predictedX, predictedY, true, hostCursor.kind, null);
@@ -1759,7 +1764,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
   const sendKeyEvent = (code: string, shiftKey: boolean, ctrlKey: boolean, altKey: boolean, metaKey: boolean, isDown: boolean) => {
     const keyboardChannel = channelsRef.current["keyboard"];
     if (keyboardChannel && keyboardChannel.readyState === "open") {
-      const vk = KEY_TO_VK[code] || 0;
+      const vk = vkOfCode(code);
       if (vk === 0) return; // Unknown key
 
       let modifiers = 0;
@@ -1793,9 +1798,23 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
 
 
 
+  // The keys held on the remote computer, let go there when the page stops
+  // getting the keyboard (keyboard.ts PressedKeys).
+  const pressedKeysRef = useRef(new PressedKeys());
+  const releaseAllKeys = () => {
+    for (const [vk, isDown] of pressedKeysRef.current.releaseAll()) sendRawKeyEvent(vk, isDown, 0);
+  };
+
+  // "System shortcuts in full screen" may have been changed in the settings.
+  useEffect(() => {
+    if (!showSettingsModal) syncKeyboardLock();
+  }, [showSettingsModal]);
+
   // Global window-level keyboard listeners when streaming is active
   useEffect(() => {
     if (status !== "Streaming") return;
+
+    const isMac = /Mac|iPhone|iPad/.test(navigator.platform || '');
 
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
       // Only real text-entry fields keep the keyboard. Dropdowns/checkboxes
@@ -1840,7 +1859,14 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
 
       // Remote text the browser didn't let us copy earlier: a key press may.
       shareRef.current?.flushPendingCopy();
-      const sendDown = () => sendKeyEvent(e.code, e.shiftKey, e.ctrlKey, e.altKey, e.metaKey, true);
+      // macOS sends no release for a key let go under Command: tap it.
+      const tap = tapsUnderMeta(isMac, e.metaKey, e.code);
+      const vk = vkOfCode(e.code);
+      if (vk !== 0 && !tap) pressedKeysRef.current.note(vk, true);
+      const sendDown = () => {
+        sendKeyEvent(e.code, e.shiftKey, e.ctrlKey, e.altKey, e.metaKey, true);
+        if (tap) sendKeyEvent(e.code, e.shiftKey, e.ctrlKey, e.altKey, e.metaKey, false);
+      };
       // Ctrl/Cmd+V: let the browser fire `paste` (its text goes first).
       if (shareRef.current?.holdPasteKey(e, sendDown)) return;
       e.preventDefault();
@@ -1870,17 +1896,31 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       }
 
       e.preventDefault();
+      const upVk = vkOfCode(e.code);
+      if (upVk !== 0) pressedKeysRef.current.note(upVk, false);
       const sendUp = () => sendKeyEvent(e.code, e.shiftKey, e.ctrlKey, e.altKey, e.metaKey, false);
       if (shareRef.current?.queueAfterPaste(sendUp)) return;
       sendUp();
     };
 
+    // Another window or tab has the keyboard now (Alt+Tab, the Windows
+    // key, a click elsewhere): the releases will not come here.
+    const handleKeyboardLost = () => {
+      if (document.visibilityState === 'hidden' || !document.hasFocus()) releaseAllKeys();
+    };
+
     window.addEventListener('keydown', handleGlobalKeyDown);
     window.addEventListener('keyup', handleGlobalKeyUp);
+    window.addEventListener('blur', handleKeyboardLost);
+    document.addEventListener('visibilitychange', handleKeyboardLost);
 
     return () => {
       window.removeEventListener('keydown', handleGlobalKeyDown);
       window.removeEventListener('keyup', handleGlobalKeyUp);
+      window.removeEventListener('blur', handleKeyboardLost);
+      document.removeEventListener('visibilitychange', handleKeyboardLost);
+      // The settings or the file manager opened, or the stream ended.
+      releaseAllKeys();
     };
   }, [status, showSettingsModal, fileManager]);
 
@@ -1922,6 +1962,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         const statsReport = await pcRef.current.getStats();
         let currentRtt = 0;
         let videoDecodeLatency = 0;
+        let videoDecoder = '';
         let videoFps = 0;
         let videoDecodedFps = 0;
         let videoBitrate = 0;
@@ -1970,6 +2011,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
             if (report.jitter !== undefined) {
               videoJitter = Number(report.jitter) * 1000.0;
             }
+            // What decodes, as far as the browser tells.
+            videoDecoder = decoderName(report.decoderImplementation, report.powerEfficientDecoder);
 
             // Check for jitter buffer delay drift and auto-reset if it exceeds 60ms
             const jbDelay = report.jitterBufferDelay;
@@ -2032,10 +2075,19 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
           }
         });
 
+        // The pair in use, not whichever pair the loop above saw last.
+        const allReports: any[] = [];
+        statsReport.forEach((report) => allReports.push(report));
+        const measuredRtt = agentRoundTripMs(allReports);
+        if (measuredRtt !== null) currentRtt = measuredRtt;
+
         setStats(prev => ({
           ...prev,
-          ping: currentRtt,
+          // To the agent and back, plus from the agent to the computer it
+          // shows and back when it shows another.
+          ping: shownPingMs(currentRtt, sourceLatencyRef.current),
           decodeLatency: videoDecodeLatency,
+          decoder: videoDecoder || prev.decoder,
           fps: videoFps || prev.fps,
           decodedFps: videoDecodedFps || prev.decodedFps,
           renderFps: renderFpsRef.current || prev.renderFps,
@@ -2210,8 +2262,10 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         });
         
         // Wrap existing data channels to send via WebTransport
+        // Not the keyboard: a datagram may be lost or arrive out of order,
+        // and a lost release leaves the key held on the host. Keys stay on
+        // their reliable, ordered data channel.
         const WT_CHANNELS = {
-          keyboard: 7,
           mouse_absolute: 5,
           mouse_reliable: 4,
           mouse_relative: 6,
@@ -2315,6 +2369,11 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         })));
         return;
       }
+      const latency = sourceLatencyMs(message);
+      if (latency !== null) {
+        sourceLatencyRef.current = latency;
+        return;
+      }
       if (message?.type !== 'host_cursor') return;
 
       const x = Number(message.x);
@@ -2328,6 +2387,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       // A host that cannot know whether its pointer is in its picture: the
       // picture is looked at while the left button is held (pointerInPicture.ts).
       if (image) hostCursorImagePayloadRef.current = image;
+      const alwaysChanged = notePointerAlwaysInPicture(saysPointerAlwaysInPicture(message));
       const maybeInPicture = message.pointer_maybe_in_picture === true;
       if (maybeInPicture !== pointerMaybeInPictureRef.current) {
         pointerMaybeInPictureRef.current = maybeInPicture;
@@ -2341,7 +2401,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       // Always keep the reference position current so that future syncs
       // (e.g. pointer-lock entry) use the real host cursor position.
       hostCursorPosRef.current = { x, y, visible, kind, inWindowMoveSize };
-      if (localPredictionFresh && visible) {
+      if (localPredictionFresh && visible && !alwaysChanged) {
         // Prediction is active — skip DOM host-cursor update to avoid jitter.
         // The hostCursorPosRef is already current (set above).
       } else {
@@ -2370,6 +2430,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     // the selected candidate pair then tells which agent address works.
     
     // Create RTCPeerConnection
+    // A new session: what the last one's source said of its delay is not this one's.
+    sourceLatencyRef.current = 0;
     const pc = new RTCPeerConnection({
       iceServers: iceServers && iceServers.length > 0 ? iceServers.map(s => ({
         urls: s.urls,
@@ -2420,8 +2482,8 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         addLog('Data Channel gamepad ready (controllers).');
         return;
       }
+      // Not the keyboard (see where the WebTransport session is opened).
       const WT_CHANNELS = {
-        keyboard: 7,
         mouse_absolute: 5,
         mouse_reliable: 4,
         mouse_relative: 6,
@@ -2448,6 +2510,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
           hasNativeCursorImageRef.current = false;
           hostCursorImagePayloadRef.current = null;
           pointerTemplatesRef.current = null;
+          notePointerAlwaysInPicture(false);
           if (pointerMaybeInPictureRef.current) {
             pointerMaybeInPictureRef.current = false;
             syncPointerInPictureDrag();
@@ -2886,6 +2949,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       pcRef.current.close();
       pcRef.current = null;
     }
+    sourceLatencyRef.current = 0;
 
     // Clear video src and stop canvas loop
     if (videoRef.current && videoRef.current instanceof HTMLVideoElement) {
@@ -2898,6 +2962,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       pointerMaybeInPictureRef.current = false;
       syncPointerInPictureDrag();
     }
+    notePointerAlwaysInPicture(false);
     stopPointerCheckLoop();
     pointerPictureUnreadableRef.current = false;
     stopCanvasRender();
@@ -3117,6 +3182,24 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     }
   };
 
+  // What decides which pointers are shown (pointerShown.ts), as it is now.
+  const pointerView = (over: Partial<PointerView> = {}): PointerView => ({
+    streaming: status === 'Streaming',
+    hostOs: agentHostOs,
+    alwaysInPicture: pointerAlwaysInPictureRef.current,
+    buttonHeld: hostCursorMouseDownRef.current,
+    inWindowMoveSize: hostCursorPosRef.current.inWindowMoveSize,
+    foundInPicture: pointerDragRef.current.inPicture,
+    hostCursorVisible: hostCursorPosRef.current.visible,
+    hardwareMouse: isHardwareMouseActiveRef.current,
+    trackpad: touchModeRef.current === 'trackpad',
+    hideLocalCursor,
+    pointerLocked: isPointerLockedRef.current,
+    hostCssCursor: hostCssCursorRef.current,
+    hasNativeCursorImage: hasNativeCursorImageRef.current,
+    ...over,
+  });
+
   const updateHostCursorDOM = (
     x: number,
     y: number,
@@ -3144,14 +3227,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       return;
     }
 
-    if (
-      !cursorEl
-      || !video
-      || !wrapper
-      || !visible
-      || isHardwareMouseActiveRef.current
-      || (hostCursorMouseDownRef.current && agentHostOs === "windows" && (inWindowMoveSize || pointerDragRef.current.inPicture))
-    ) {
+    if (!cursorEl || !video || !wrapper || !showsHostCursor(pointerView())) {
       if (cursorEl) cursorEl.style.display = 'none';
       return;
     }
@@ -3258,26 +3334,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     if (!cursorEl || !video || !wrapper) return;
 
     const hostCursor = hostCursorPosRef.current;
-    if (agentHostOs === "windows" && hostCursorMouseDownRef.current && (hostCursor.inWindowMoveSize || pointerDragRef.current.inPicture)) {
-      cursorEl.style.display = 'none';
-      return;
-    }
-
-    const shouldUseWindowsPrediction = agentHostOs === "windows" && hasNativeCursorImageRef.current;
-    const shouldShowTrackpad = touchModeRef.current === 'trackpad'
-      && status === 'Streaming'
-      && !isHardwareMouseActiveRef.current;
-    // While the OS draws the host-shaped CSS cursor (unlocked pointer, non-
-    // Windows host) the JavaScript-driven DOM cursor is not needed.
-    const osDrawsHostCursor = hostCssCursorRef.current !== null
-      && agentHostOs !== "windows"
-      && !isPointerLockedRef.current;
-    const shouldShowHardwarePrediction = status === 'Streaming'
-      && isHardwareMouseActiveRef.current
-      && (hideLocalCursor || shouldUseWindowsPrediction)
-      && !osDrawsHostCursor;
-
-    if (!shouldShowTrackpad && !shouldShowHardwarePrediction) {
+    if (!showsOwnCursor(pointerView())) {
       cursorEl.style.display = 'none';
       return;
     }
@@ -4034,14 +4091,13 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
   const isStreaming = status === "Streaming";
   // Hardware-drawn host cursor when possible (smooth as a native pointer);
   // otherwise hide the OS cursor and draw the DOM cursor as before.
-  const useOsHostCursor = isStreaming
-    && hideLocalCursor
-    && agentHostOs !== "windows"
-    && !isPointerLocked
-    && hostCssCursor !== null;
-  const streamCursorStyle = useOsHostCursor
-    ? hostCssCursor!
-    : isStreaming && (hideLocalCursor || agentHostOs === "windows") ? "none" : "default";
+  // A host whose pointer is always part of its picture: no pointer at all.
+  const streamCursorStyle = streamCursorCss(pointerView({
+    streaming: isStreaming,
+    alwaysInPicture: pointerAlwaysInPicture,
+    pointerLocked: isPointerLocked,
+    hostCssCursor,
+  }));
 
   if (selectedAppId === null) {
     return (
@@ -4216,11 +4272,12 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       className={`stream-container is-live ${isKeyboardActive ? 'keyboard-open' : ''}`}
       style={keyboardArea ? { top: keyboardArea.top, height: keyboardArea.height } : undefined}
       ref={containerRef}
-      onDragOver={(e) => { if (e.dataTransfer.types.includes('Files')) { e.preventDefault(); setIsDraggingFiles(true); } }}
+      onDragOver={(e) => { if (filesOffered && e.dataTransfer.types.includes('Files')) { e.preventDefault(); setIsDraggingFiles(true); } }}
       onDragLeave={(e) => { if (e.currentTarget === e.target) setIsDraggingFiles(false); }}
       onDrop={(e) => {
         if (!e.dataTransfer.files.length) return;
         e.preventDefault();
+        if (!filesOffered) return;
         setIsDraggingFiles(false);
         if (!fileTransfer) { showShareToast(t('File transfer is turned off in Settings')); return; }
         setFileManager({ uploads: Array.from(e.dataTransfer.files) });
@@ -4414,6 +4471,25 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
           ))}
         </select>
 
+        {/* Key combinations the browser or this computer takes before the
+            page sees them (Alt+Tab, Ctrl+W...): pressed on the remote computer. */}
+        <select
+          value=""
+          onChange={(e) => {
+            const combo = KEY_COMBOS.find((c) => c.id === e.target.value);
+            if (combo) for (const [vk, isDown] of comboStrokes(combo.keys)) sendRawKeyEvent(vk, isDown, 0);
+            e.currentTarget.blur();
+          }}
+          className="stream-select"
+          title={t('Send a key combination')}
+          aria-label={t('Send a key combination')}
+        >
+          <option value="">{t('Send keys')}</option>
+          {combosFor(agentHostOs).map((combo) => (
+            <option key={combo.id} value={combo.id}>{combo.id === 'win' ? t('Windows key (Super)') : combo.label}</option>
+          ))}
+        </select>
+
         {/* Separator */}
         <div className="stream-menu-separator"></div>
 
@@ -4552,6 +4628,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
 
         {/* Send files to the remote computer */}
         <button
+          style={filesOffered ? undefined : { display: 'none' }}
           onClick={() => fileTransfer ? setFileManager({}) : showShareToast(t('File transfer is turned off in Settings'))}
           className="stream-action-btn"
           title={t('Files on the remote computer (or drop files on the stream)')}
@@ -5117,25 +5194,18 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         {/* Stats overlay */}
         {isStreaming && showStats && (
           <div className="stream-stats-overlay">
-            <div>Ping (RTT): <span className="stat-value">{stats.ping.toFixed(1)} ms</span></div>
-            <div>Jitter: <span className="stat-value">{stats.jitter.toFixed(1)} ms</span></div>
-            <div>Decode Latency: <span className="stat-value">{stats.decodeLatency.toFixed(1)} ms</span></div>
-            <div>WebRTC FPS: <span className="stat-value">{stats.fps}</span></div>
-            <div>Decoded FPS: <span className="stat-value">{stats.decodedFps}</span></div>
-            <div>Render FPS: <span className="stat-value">{stats.renderFps}</span></div>
-            <div>Bitrate: <span className="stat-value">{stats.bitrate} Kbps</span></div>
-            <div>Codec: <span className="stat-value">{activeCodec === 'auto' ? `Auto (${resolvedActiveCodec.toUpperCase()})` : activeCodec.toUpperCase()}</span></div>
-            <div>Encoder: <span className="stat-value">{activeEncoderStatus.encoder} ({activeEncoderStatus.hwType})</span></div>
-            <div>GPU: <span className="stat-value">{activeEncoderStatus.gpuInfo || agentGpuInfo || 'Unknown'}</span></div>
-            <div>Host OS: <span className="stat-value">{agentHostOs}</span></div>
-            <div>Display: <span className="stat-value">{activeEncoderStatus.displayName || activeEncoderStatus.displayId || activeDisplay || 'Default'}</span></div>
-            <div>Requested Encoder: <span className="stat-value">{activeEncoderStatus.requestedEncoder}</span></div>
-            <div>Input Protocol: <span className="stat-value" style={{ color: isWebTransportConnected ? '#4ade80' : '#38bdf8', fontWeight: 'bold' }}>
-              {isWebTransportConnected ? "WebTransport (QUIC)" : "WebRTC (SCTP)"}
+            <div>Ping <span className="stat-value">{pingStatText(stats.ping)}</span></div>
+            <div>FPS <span className="stat-value">{stats.decodedFps || stats.fps}</span></div>
+            <div>Bitrate <span className="stat-value">{(stats.bitrate / 1000).toFixed(1)} Mbps</span></div>
+            <div>Codec <span className="stat-value">{resolvedActiveCodec.toUpperCase()}</span></div>
+            <div>Encode <span className="stat-value">{encodeStatText(activeEncoderStatus.encoder, activeEncoderStatus.hwType, activeEncoderStatus.gpuInfo)}</span></div>
+            <div>Decode <span className="stat-value">{decodeStatText(stats.decoder, stats.decodeLatency)}</span></div>
+            <div>Network <span className="stat-value" style={{ color: stats.connectionType === 'P2P (Direct)' ? '#4ade80' : '#fb923c' }}>
+              {stats.connectionType === 'P2P (Direct)' ? 'Direct' : stats.connectionType}
             </span></div>
-            <div>Network Path: <span className="stat-value" style={{ color: stats.connectionType === 'P2P (Direct)' ? '#4ade80' : '#fb923c', fontWeight: 'bold' }}>
-              {stats.connectionType}
-            </span></div>
+            {stats.jitter >= 30 && (
+              <div>Jitter <span className="stat-value" style={{ color: '#fb923c' }}>{stats.jitter.toFixed(0)} ms</span></div>
+            )}
           </div>
         )}
 

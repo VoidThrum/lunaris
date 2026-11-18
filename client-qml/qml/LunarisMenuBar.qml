@@ -17,6 +17,11 @@ Item {
     signal statsToggled()
     // "Send file" button (main.qml opens the file dialog).
     signal sendFilesRequested()
+    // "Send keys": a key combination this computer keeps for itself, to be
+    // pressed on the remote computer (Qt key codes, in the order pressed).
+    signal sendKeysRequested(var keys)
+    // The remote computer's system when it says so ("windows", "linux", ...).
+    property string hostOs: "unknown"
     signal cursorHideToggled()
     signal settingsChanged(string res, int fps, string codec, int bitrate, int queueLimit, bool disableCuda, string renderBackend, string inputProtocol)
     signal exitTriggered()
@@ -211,6 +216,9 @@ Item {
 
             // Back Button
             Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
                 id: backButton
                 width: 28
                 height: 28
@@ -346,6 +354,9 @@ Item {
 
             // Lock Cursor Button
             Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
                 id: lockButton
                 width: 28
                 height: 28
@@ -410,6 +421,9 @@ Item {
 
             // Local Cursor (Eye) Button
             Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
                 id: eyeButton
                 width: 28
                 height: 28
@@ -473,6 +487,9 @@ Item {
 
             // Show Stats Button
             Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
                 id: statsButton
                 width: 28
                 height: 28
@@ -517,6 +534,9 @@ Item {
 
             // Files of the remote computer (file manager, own connection)
             Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
                 id: sendFileButton
                 width: 28
                 height: 28
@@ -537,8 +557,64 @@ Item {
                 }
             }
 
+            // Key combinations that this computer or the app takes before
+            // they can be sent (when the system's shortcuts are not given
+            // to the window, see main.qml systemKeysKind).
+            Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
+                id: sendKeysButton
+                objectName: "sendKeysButton"
+                width: 28
+                height: 28
+                padding: 0
+                anchors.verticalCenter: parent.verticalCenter
+                LunarisToolTip { text: I18n.t("Send a key combination") }
+                Accessible.name: I18n.t("Send a key combination")
+                background: Rectangle {
+                    anchors.fill: parent
+                    color: sendKeysButton.hovered || sendKeysMenu.visible ? Theme.live.ink(0.12) : "transparent"
+                    radius: 14
+                }
+                contentItem: Item {
+                    Icon { anchors.centerIn: parent; name: "keyboard"; size: 16; color: Theme.live.text }
+                }
+                onClicked: {
+                    autoHideTimer.stop();
+                    sendKeysMenu.popup(sendKeysButton, 0, sendKeysButton.height + 6);
+                }
+                ThemedMenu {
+                    id: sendKeysMenu
+                    objectName: "sendKeysMenu"
+                    function send(keys) {
+                        menuContainer.sendKeysRequested(keys);
+                    }
+                    onClosed: if (!menuContainer.isPinned) autoHideTimer.restart()
+                    MenuItem { text: "Alt+Tab"; onTriggered: sendKeysMenu.send([Qt.Key_Alt, Qt.Key_Tab]) }
+                    MenuItem { text: I18n.t("Windows key (Super)"); onTriggered: sendKeysMenu.send([Qt.Key_Meta]) }
+                    MenuItem { text: "Alt+F4"; onTriggered: sendKeysMenu.send([Qt.Key_Alt, Qt.Key_F4]) }
+                    MenuItem { text: "Ctrl+Shift+Esc"; onTriggered: sendKeysMenu.send([Qt.Key_Control, Qt.Key_Shift, Qt.Key_Escape]) }
+                    MenuItem { text: "Print Screen"; onTriggered: sendKeysMenu.send([Qt.Key_Print]) }
+                    // A Windows computer takes Ctrl+Alt+Del only from its own
+                    // keyboard (the secure attention sequence); the Lunaris
+                    // agent cannot press it there, so it is not offered.
+                    MenuItem {
+                        objectName: "sendCtrlAltDel"
+                        readonly property bool offered: menuContainer.hostOs.toLowerCase() !== "windows"
+                        visible: offered
+                        height: offered ? implicitHeight : 0
+                        text: "Ctrl+Alt+Del"
+                        onTriggered: sendKeysMenu.send([Qt.Key_Control, Qt.Key_Alt, Qt.Key_Delete])
+                    }
+                }
+            }
+
             // Pin Menu Button
             Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
                 id: pinButton
                 width: 28
                 height: 28
@@ -595,6 +671,9 @@ Item {
 
             // Minimize Button
             Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
                 id: minimizeButton
                 width: 28
                 height: 28
@@ -630,6 +709,9 @@ Item {
 
             // Restore Down / Maximize Button
             Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
                 id: restoreButton
                 width: 28
                 height: 28
@@ -687,6 +769,9 @@ Item {
 
             // Collapse Button
             Button {
+                // Keys belong to the remote computer: a clicked button must not
+                // keep the focus, or the next Space or Enter presses it again.
+                focusPolicy: Qt.NoFocus
                 id: collapseButton
                 width: 28
                 height: 28

@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Shapes
+import "Cards.js" as Cards
 
 Rectangle {
     id: dashboardRoot
@@ -95,8 +96,85 @@ Rectangle {
         }
         return types;
     }
-    // The grid: the Lunaris computers, then the computers shown through them.
-    readonly property var cards: hostsList.concat(sourcesList.map(function (s) { return Object.assign({ isSource: true }, s); }))
+    // The grid: one card for each computer (Cards.js). The Lunaris
+    // computers, each with the sources that are that computer, then the
+    // other sources, those of one group on one card. A card has its ways
+    // to connect: [{ key, label, online, host | source }].
+    readonly property var cards: Cards.buildCards(hostsList, sourcesList, function (s) {
+        return Cards.typeShortName(s.connector, I18n.t(String(s.connector_name || s.connector || "")));
+    }, "Lunaris")
+    // The way used last for a card: { "<card key>": "<method key>" }. The
+    // owner (Home) keeps it between runs: it sets this when it starts and
+    // saves it on `cardMethodChosen`.
+    property var cardMethods: ({})
+    signal cardMethodChosen(string card, string method)
+    function chooseMethod(card, methodKey) {
+        if (dashboardRoot.cardMethods[card.key] === methodKey) return;
+        dashboardRoot.cardMethods = Cards.remembered(dashboardRoot.cardMethods, card.key, methodKey);
+        dashboardRoot.cardMethodChosen(card.key, methodKey);
+    }
+    // The way a card connects with now.
+    function methodOf(card) { return Cards.currentMethod(card.methods, dashboardRoot.cardMethods[card.key]); }
+    // What the pages take for a way to connect: the Lunaris computer as it
+    // is listed, or the source with `isSource`.
+    function methodItem(method) {
+        return method.source ? Object.assign({ isSource: true }, method.source) : method.host;
+    }
+    function cardByKey(key) {
+        for (var i = 0; i < cards.length; i++) if (cards[i].key === key) return cards[i];
+        return null;
+    }
+    // Connects with one way of a card, and remembers it for the card.
+    function connectMethod(card, method) {
+        if (!method || !method.online) return;
+        chooseMethod(card, method.key);
+        if (method.source) connectSource(method.source);
+        else connectHost(method.host);
+    }
+    // Whether a way to connect can be added to a card: it has a group or
+    // can be given one (a computer that is only an address yet cannot).
+    function takesMethods(card) {
+        return card.host ? card.group !== "" : true;
+    }
+    // "Edit" of a source: the cards it can be said to be the same computer
+    // as, and the one it is on now ("" when it is a card of its own).
+    function sameOptionsFor(source) {
+        var options = [];
+        var now = "";
+        var key = Cards.sourceKey(source);
+        for (var i = 0; i < cards.length; i++) {
+            var card = cards[i];
+            var mine = false;
+            for (var k = 0; k < card.methods.length; k++) if (card.methods[k].key === key) mine = true;
+            if (mine && card.methods.length === 1) continue;
+            if (!takesMethods(card)) continue;
+            if (mine) now = card.key;
+            options.push({ value: card.key, label: card.title, group: card.group });
+        }
+        return { options: options, now: now };
+    }
+    function editSource(source) {
+        var same = sameOptionsFor(source);
+        addHostDialog.openEdit(Object.assign({ isSource: true }, source), ({}), same.options, same.now);
+    }
+    // The group that was said with a form (AddComputerDialog), as the
+    // server takes it. "@<card key>" is a card that has no group yet (one
+    // source of its own): it is given a new one first. then(group, error).
+    function withGroup(said, then) {
+        if (String(said).charAt(0) !== "@") { then(said, ""); return; }
+        var card = cardByKey(String(said).slice(1));
+        if (!card || card.methods.length !== 1 || !card.methods[0].source) {
+            then("*", I18n.t("That computer is not there any more"));
+            return;
+        }
+        var first = card.methods[0].source;
+        var group = Cards.newGroup();
+        sourcesApi.call("PUT", "/api/hosts/" + encodeURIComponent(first.host_id) + "/sources/" + encodeURIComponent(first.id),
+            { name: first.name, values: ({}), group: group }, function (ok, data, err, status, text) {
+                if (ok) then(group, "");
+                else then("*", dashboardRoot.apiError(err, status, text, data));
+            });
+    }
     // The displays the sources listed in their sessions, by the computer
     // they are reached through: { "<host id>": { "<source id>": [...] } }.
     property var seenSourceDisplays: ({})
@@ -557,6 +635,7 @@ Rectangle {
 
                     // Error text
                     Text {
+                        textFormat: Text.PlainText
                         text: dashboardRoot.authError
                         color: "#ef4444"
                         font.pixelSize: 11
@@ -769,6 +848,7 @@ Rectangle {
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: 1
                         Text {
+                            textFormat: Text.PlainText
                             text: dashboardRoot.username
                             font.pixelSize: 13
                             font.weight: Font.DemiBold
@@ -776,6 +856,7 @@ Rectangle {
                             anchors.right: parent.right
                         }
                         Text {
+                            textFormat: Text.PlainText
                             text: dashboardRoot.serverUrl
                             font.pixelSize: 11
                             color: Theme.textSubtle
@@ -947,15 +1028,20 @@ Rectangle {
                         width: 290
                         height: 180
 
-                        property bool isHostHovered: cardMouseArea.containsMouse || webBtn.hovered || gearBtn.hovered || editBtn.hovered || deleteBtn.hovered || connectBtn.hovered
-                        // A computer of another type, shown through a Lunaris
-                        // computer: online when that computer is.
-                        readonly property bool isSource: !!modelData.isSource
-                        readonly property string status: isSource ? (modelData.online ? "Online" : "Offline") : modelData.status
-                        function connect() {
-                            if (isSource) dashboardRoot.connectSource(modelData);
-                            else dashboardRoot.connectHost(modelData);
-                        }
+                        objectName: "serverCard"
+                        property bool isHostHovered: cardMouseArea.containsMouse || webBtn.hovered || gearBtn.hovered || editBtn.hovered || deleteBtn.hovered || connectBtn.hovered || chooseBtn.hovered || addMethodBtn.hovered
+                        // The computer (Cards.js) and the way to connect that
+                        // is chosen for it: everything on the card acts on it.
+                        readonly property var cardData: modelData
+                        readonly property bool multi: cardData.methods.length > 1
+                        readonly property var method: dashboardRoot.methodOf(cardData)
+                        // That way as the pages take it: the Lunaris computer,
+                        // or a source (a computer of another type, shown
+                        // through a Lunaris computer: online when that is).
+                        readonly property var item: dashboardRoot.methodItem(method)
+                        readonly property bool isSource: !!method.source
+                        readonly property string status: isSource ? (item.online ? "Online" : "Offline") : item.status
+                        function connect() { dashboardRoot.connectMethod(cardData, method); }
 
                         // Static background click handler to avoid hover-translation flicker
                         MouseArea {
@@ -993,7 +1079,9 @@ Rectangle {
                                     spacing: 4
 
                                     Text {
-                                        text: modelData.name
+                                        objectName: "cardTitle"
+                                        textFormat: Text.PlainText
+                                        text: hostDelegate.cardData.title
                                         font.pixelSize: 18
                                         font.bold: true
                                         color: Theme.textStrong
@@ -1001,30 +1089,48 @@ Rectangle {
                                         width: parent.width - (typeBadge.visible ? typeBadge.width + 8 : 0)
                                     }
                                     Text {
-                                        visible: !hostDelegate.isSource
-                                        text: hostDelegate.isSource ? "" : "ID: " + String(modelData.id).substring(0, 8) + "..."
+                                        visible: !hostDelegate.isSource && !hostDelegate.multi
+                                        textFormat: Text.PlainText
+                                        text: hostDelegate.isSource ? "" : "ID: " + String(hostDelegate.item.id).substring(0, 8) + "..."
                                         font.pixelSize: 11
                                         font.family: "monospace"
                                         color: Theme.textSubtle
                                     }
                                     // Which Lunaris computer shows it
                                     Text {
-                                        visible: hostDelegate.isSource
+                                        visible: hostDelegate.isSource && !hostDelegate.multi
                                         width: parent.width
-                                        text: hostDelegate.isSource ? I18n.t("via %1").arg(modelData.host_name) : ""
+                                        textFormat: Text.PlainText
+                                        text: hostDelegate.isSource ? I18n.t("via %1").arg(hostDelegate.item.host_name) : ""
                                         font.pixelSize: 11
                                         color: Theme.textSubtle
                                         elide: Text.ElideRight
+                                    }
+                                    // The ways to connect, when there is more
+                                    // than one: a click chooses the one the
+                                    // card acts on (one row; all of them are
+                                    // in the list beside Connect).
+                                    MethodChips {
+                                        objectName: "cardChips"
+                                        visible: hostDelegate.multi
+                                        width: parent.width
+                                        height: 20
+                                        clip: true
+                                        oneRow: true
+                                        z: 10
+                                        methods: hostDelegate.multi ? hostDelegate.cardData.methods : []
+                                        current: hostDelegate.method.key
+                                        onChosen: (key) => dashboardRoot.chooseMethod(hostDelegate.cardData, key)
                                     }
                                 }
 
                                 TypeBadge {
                                     id: typeBadge
-                                    visible: hostDelegate.isSource && shortName !== ""
+                                    visible: hostDelegate.isSource && !hostDelegate.multi && shortName !== ""
                                     anchors.right: parent.right
                                     anchors.top: parent.top
                                     anchors.topMargin: 3
-                                    typeName: hostDelegate.isSource ? String(modelData.connector_name || modelData.connector || "") : ""
+                                    typeName: hostDelegate.isSource ? String(hostDelegate.item.connector_name || hostDelegate.item.connector || "") : ""
                                     maxWidth: 120
                                 }
 
@@ -1049,16 +1155,33 @@ Rectangle {
                                         width: parent.width
                                         Text { text: I18n.t("IP Address"); font.pixelSize: 11; color: Theme.textSubtle; width: 80 }
                                         Text {
-                                            text: modelData.address ? String(modelData.address).replace(/:8091$/, "")
-                                                : (modelData.ip_address || I18n.t("Connected via Agent"))
+                                            textFormat: Text.PlainText
+                                            text: hostDelegate.item.address ? String(hostDelegate.item.address).replace(/:8091$/, "")
+                                                : (hostDelegate.item.ip_address || I18n.t("Connected via Agent"))
                                             font.pixelSize: 11; font.bold: true; font.family: "monospace"; color: Theme.text
                                         }
                                     }
 
-                                    Text {
-                                        visible: !!modelData.link_error
+                                    // (In a card with several ways the one chosen
+                                    // is a source: through which computer.)
+                                    Row {
+                                        visible: hostDelegate.isSource && hostDelegate.multi
                                         width: parent.width
-                                        text: modelData.link_error ? I18n.t(modelData.link_error) : ""
+                                        Text {
+                                            width: parent.width
+                                            textFormat: Text.PlainText
+                                            text: hostDelegate.isSource ? I18n.t("via %1").arg(hostDelegate.item.host_name) : ""
+                                            font.pixelSize: 11
+                                            color: Theme.textSubtle
+                                            elide: Text.ElideRight
+                                        }
+                                    }
+
+                                    Text {
+                                        visible: !hostDelegate.isSource && !!hostDelegate.item.link_error
+                                        width: parent.width
+                                        textFormat: Text.PlainText
+                                        text: !hostDelegate.isSource && hostDelegate.item.link_error ? I18n.t(hostDelegate.item.link_error) : ""
                                         font.pixelSize: 11
                                         color: Theme.danger
                                         elide: Text.ElideRight
@@ -1107,12 +1230,39 @@ Rectangle {
                                     }
                                 }
 
+                                // The other ways to connect, and adding one:
+                                // a list that opens beside Connect.
+                                Button {
+                                    id: chooseBtn
+                                    objectName: "cardChooseButton"
+                                    visible: hostDelegate.multi
+                                    anchors.left: connectBtn.visible ? connectBtn.right : parent.left
+                                    anchors.leftMargin: connectBtn.visible ? 1 : 0
+                                    anchors.bottom: parent.bottom
+                                    z: 10
+                                    hoverEnabled: true
+                                    ToolTip.visible: hovered
+                                    ToolTip.delay: 400
+                                    ToolTip.text: I18n.t("Choose how to connect")
+                                    Accessible.name: I18n.t("Choose how to connect")
+                                    onClicked: methodMenu.openFor(hostDelegate.cardData, chooseBtn)
+                                    background: Rectangle {
+                                        implicitWidth: 24; implicitHeight: 32; radius: Theme.radiusSm
+                                        color: chooseBtn.hovered ? Theme.accentHover : Theme.accent
+                                    }
+                                    contentItem: Item {
+                                        implicitWidth: 12; implicitHeight: 16
+                                        Icon { anchors.centerIn: parent; name: "chevronDown"; size: 14; color: Theme.textOnAccent }
+                                    }
+                                }
+
                                 // Card actions footer (bottom right, sits on top of visual card)
                                 Row {
                                     id: cardFooter
                                     anchors.right: parent.right
                                     anchors.bottom: parent.bottom
-                                    spacing: 8
+                                    // (One more button for administrators: a little closer.)
+                                    spacing: addMethodBtn.visible ? 6 : 8
                                     z: 10
 
                                     // Remote control in the browser (web console, signed in)
@@ -1124,7 +1274,7 @@ Rectangle {
                                         ToolTip.delay: 400
                                         ToolTip.text: I18n.t("Open in the browser")
                                         Accessible.name: "Open in the browser"
-                                        onClicked: dashboardRoot.openHostInBrowser(modelData)
+                                        onClicked: dashboardRoot.openHostInBrowser(hostDelegate.item)
                                         background: Rectangle {
                                             implicitWidth: 32; implicitHeight: 32; radius: 6
                                             color: webBtn.hovered ? Theme.accentA(0.1) : "transparent"
@@ -1141,7 +1291,9 @@ Rectangle {
                                     Button {
                                         id: filesBtn
                                         objectName: "cardFilesButton"
-                                        visible: hostDelegate.status === "Online" || hostDelegate.status === "Busy"
+                                        // Not for a computer of another type whose connector says it has no files.
+                                        visible: (hostDelegate.status === "Online" || hostDelegate.status === "Busy")
+                                            && !(hostDelegate.isSource && hostDelegate.item.capabilities && hostDelegate.item.capabilities.files === false)
                                         hoverEnabled: true
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
@@ -1149,8 +1301,8 @@ Rectangle {
                                         Accessible.name: "Files"
                                         // A source: its files, through the computer it is reached through.
                                         onClicked: hostDelegate.isSource
-                                            ? fileManager.openFor(dashboardRoot.serverUrl, dashboardRoot.token, modelData.host_id, modelData.name, modelData.id)
-                                            : fileManager.openFor(dashboardRoot.serverUrl, dashboardRoot.token, modelData.id, modelData.name)
+                                            ? fileManager.openFor(dashboardRoot.serverUrl, dashboardRoot.token, hostDelegate.item.host_id, hostDelegate.item.name, hostDelegate.item.id)
+                                            : fileManager.openFor(dashboardRoot.serverUrl, dashboardRoot.token, hostDelegate.item.id, hostDelegate.item.name)
                                         background: Rectangle {
                                             implicitWidth: 32; implicitHeight: 32; radius: 6
                                             color: filesBtn.hovered ? Theme.accentA(0.1) : "transparent"
@@ -1171,7 +1323,7 @@ Rectangle {
                                         ToolTip.delay: 400
                                         ToolTip.text: I18n.t("Stream settings")
                                         Accessible.name: "Stream settings"
-                                        onClicked: dashboardRoot.openStreamSettings(modelData)
+                                        onClicked: dashboardRoot.openStreamSettings(hostDelegate.item)
                                         background: Rectangle {
                                             implicitWidth: 32; implicitHeight: 32; radius: 6
                                             color: gearBtn.hovered ? Theme.accentA(0.1) : "transparent"
@@ -1193,7 +1345,7 @@ Rectangle {
                                         ToolTip.delay: 400
                                         ToolTip.text: I18n.t("Edit")
                                         Accessible.name: "Edit"
-                                        onClicked: addHostDialog.openEdit(modelData, ({}))
+                                        onClicked: dashboardRoot.editSource(hostDelegate.method.source)
                                         background: Rectangle {
                                             implicitWidth: 32; implicitHeight: 32; radius: 6
                                             color: editBtn.hovered ? Theme.accentA(0.1) : "transparent"
@@ -1206,6 +1358,31 @@ Rectangle {
                                         }
                                     }
 
+                                    // One more way to connect to this computer
+                                    // (administrators). A card with several
+                                    // has it in the list beside Connect.
+                                    Button {
+                                        id: addMethodBtn
+                                        objectName: "cardAddMethodButton"
+                                        visible: dashboardRoot.isAdmin && !hostDelegate.multi && dashboardRoot.takesMethods(hostDelegate.cardData)
+                                        hoverEnabled: true
+                                        ToolTip.visible: hovered
+                                        ToolTip.delay: 400
+                                        ToolTip.text: I18n.t("Add a connection method")
+                                        Accessible.name: I18n.t("Add a connection method")
+                                        onClicked: addHostDialog.openMethod(hostDelegate.cardData)
+                                        background: Rectangle {
+                                            implicitWidth: 32; implicitHeight: 32; radius: 6
+                                            color: addMethodBtn.hovered ? Theme.accentA(0.1) : "transparent"
+                                            border.color: addMethodBtn.hovered ? Theme.accentFg : Theme.border
+                                            border.width: 1
+                                        }
+                                        contentItem: Item {
+                                            implicitWidth: 16; implicitHeight: 16
+                                            Icon { anchors.centerIn: parent; name: "plus"; size: 17; color: addMethodBtn.hovered ? Theme.accentFg : Theme.text }
+                                        }
+                                    }
+
                                     Button {
                                         id: deleteBtn
                                         visible: !hostDelegate.isSource || dashboardRoot.isAdmin
@@ -1215,8 +1392,8 @@ Rectangle {
                                         ToolTip.text: I18n.t("Remove")
                                         Accessible.name: "Remove"
                                         onClicked: {
-                                            if (hostDelegate.isSource) { removeSourceDialog.openFor(modelData); return; }
-                                            dashboardRoot.pendingDeleteHost = modelData;
+                                            if (hostDelegate.isSource) { removeSourceDialog.openFor(hostDelegate.item, hostDelegate.cardData, hostDelegate.method); return; }
+                                            dashboardRoot.pendingDeleteHost = hostDelegate.item;
                                         }
                                         background: Rectangle {
                                             implicitWidth: 32; implicitHeight: 32; radius: 6
@@ -1311,7 +1488,7 @@ Rectangle {
                         spacing: 6
                         Text { text: I18n.t("Device Directory"); font.pixelSize: 12; color: Theme.textSubtle }
                         Text { text: "/"; font.pixelSize: 12; color: Theme.textSubtle }
-                        Text { text: dashboardRoot.selectedHost.name; font.pixelSize: 12; font.bold: true; color: Theme.accentFg }
+                        Text { textFormat: Text.PlainText; text: dashboardRoot.selectedHost.name; font.pixelSize: 12; font.bold: true; color: Theme.accentFg }
                     }
                 }
             }
@@ -1465,6 +1642,7 @@ Rectangle {
                             // App Title Text (Aligned near the bottom)
                             Text {
                                 id: titleText
+                                textFormat: Text.PlainText
                                 text: modelData.title
                                 font.pixelSize: 14
                                 font.weight: Font.DemiBold
@@ -1620,6 +1798,7 @@ Rectangle {
                     color: Theme.text
                     font.pixelSize: 13
                     lineHeight: 1.25
+                    textFormat: Text.PlainText
                     text: dashboardRoot.pendingDeleteHost
                         ? "Delete host '" + dashboardRoot.pendingDeleteHost.name + "' from this server? Active sessions for this host will be stopped."
                         : "Delete this host?"
@@ -1707,24 +1886,142 @@ Rectangle {
             dashboardRoot.refreshSources();
             openAdd();
         }
-        function done(ok, data, err, status, text) {
-            addHostDialog.busy = false;
-            if (!ok) { addHostDialog.error = dashboardRoot.apiError(err, status, text, data); return; }
+        // One more way to connect to the computer of a card.
+        function openMethod(card) {
+            dashboardRoot.refreshSources();
+            openAddMethod(card);
+        }
+        // The Lunaris computer a type with a set-up is being added through.
+        property string addingThrough: ""
+        property bool setupAsking: false
+        property int setupMisses: 0
+        function added() {
             addHostDialog.close();
             bridge.fetchHosts();
             addHostRefresh.restart();
+        }
+        function done(ok, data, err, status, text) {
+            addHostDialog.busy = false;
+            if (!ok) { addHostDialog.error = dashboardRoot.apiError(err, status, text, data); return; }
+            // 202: its type has a set-up (a pairing) that waits for the
+            // person; the dialog shows what the connector wants shown.
+            if (status === 202 && data && data.setup) {
+                addHostDialog.setupAsking = false;
+                addHostDialog.setupMisses = 0;
+                addHostDialog.setupShow(data.setup, addHostDialog.addingThrough, data.message, data.code);
+                return;
+            }
+            addHostDialog.added();
+        }
+        function setupPath(setup, hostId) {
+            return "/api/hosts/" + encodeURIComponent(hostId) + "/sources/setup/" + encodeURIComponent(setup);
         }
         onLunarisSubmitted: (address, password, name) => {
             addHostDialog.busy = true;
             addHostApi.call("POST", "/api/hosts/address", { address: address, password: password || null }, addHostDialog.done);
         }
-        onSourceSubmitted: (connectorId, hostId, sourceId, name, values) => {
+        onSourceSubmitted: (connectorId, hostId, sourceId, name, values, group) => {
             addHostDialog.busy = true;
-            var path = "/api/hosts/" + encodeURIComponent(hostId) + "/sources";
-            if (sourceId === "")
-                addHostApi.call("POST", path, { name: name, connector: connectorId, values: values }, addHostDialog.done);
-            else
-                addHostApi.call("PUT", path + "/" + encodeURIComponent(sourceId), { name: name, values: values }, addHostDialog.done);
+            addHostDialog.addingThrough = hostId;
+            // Which computer it is, when the form said ("*": nothing said,
+            // and nothing is sent, as before).
+            dashboardRoot.withGroup(group === undefined ? "*" : group, function (said, error) {
+                if (error !== "") { addHostDialog.busy = false; addHostDialog.error = error; return; }
+                var path = "/api/hosts/" + encodeURIComponent(hostId) + "/sources";
+                var form = sourceId === "" ? { name: name, connector: connectorId, values: values } : { name: name, values: values };
+                if (said !== "*") form.group = said;
+                if (sourceId === "")
+                    addHostApi.call("POST", path, form, addHostDialog.done);
+                else
+                    addHostApi.call("PUT", path + "/" + encodeURIComponent(sourceId), form, addHostDialog.done);
+            });
+        }
+        // Once a second while the set-up waits: done closes the dialog (the
+        // new card is listed), failed shows why.
+        onSetupAsked: (setup, hostId) => {
+            if (addHostDialog.setupAsking) return;
+            addHostDialog.setupAsking = true;
+            addHostApi.call("GET", addHostDialog.setupPath(setup, hostId), null, function (ok, data, err, status, text) {
+                addHostDialog.setupAsking = false;
+                // An answer about a set-up that is not shown any more.
+                if (addHostDialog.setupId !== setup || !addHostDialog.setupWaiting) return;
+                if (!ok) {
+                    if (status === 404) addHostDialog.setupFailed(dashboardRoot.apiError(err, status, text, data));
+                    // Not at the first hiccup: the computer may be back in a moment.
+                    else if (++addHostDialog.setupMisses >= 5) addHostDialog.setupFailed(dashboardRoot.apiError(err, status, text, data));
+                    return;
+                }
+                addHostDialog.setupMisses = 0;
+                if (data && data.state === "done") {
+                    addHostDialog.setupFinished();
+                    addHostDialog.added();
+                } else if (data && data.state === "failed") {
+                    addHostDialog.setupFailed(I18n.tError(String(data.error || "")));
+                } else if (data && data.state === "pending") {
+                    addHostDialog.setupUpdate(data.message, data.code);
+                }
+            });
+        }
+        // Closed while it waited: stopped on that computer.
+        onSetupCancelled: (setup, hostId) => addHostApi.call("DELETE", addHostDialog.setupPath(setup, hostId), null, function () {})
+    }
+
+    // The ways to connect to a card's computer, to connect with one at once
+    // (it is then the one the card remembers), and adding one. One list
+    // for all the cards: the cards are made anew whenever the list comes.
+    ThemedMenu {
+        id: methodMenu
+        objectName: "methodMenu"
+        property var card: null
+        function openFor(card, button) {
+            methodMenu.card = card;
+            popup(button, 0, button.height + 2);
+        }
+        width: 250
+        // (Put in by hand, so that they come before what follows them.)
+        Instantiator {
+            model: methodMenu.card ? methodMenu.card.methods : []
+            onObjectAdded: (index, object) => methodMenu.insertItem(index, object)
+            onObjectRemoved: (index, object) => methodMenu.removeItem(object)
+            delegate: MenuItem {
+                id: methodEntry
+                required property var modelData
+                objectName: "methodItem"
+                property string methodKey: modelData.key
+                enabled: modelData.online
+                text: I18n.t("Connect with %1").arg(modelData.label)
+                leftPadding: 36
+                TypeLogo {
+                    x: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    typeId: Cards.methodType(methodEntry.modelData)
+                    name: String(methodEntry.modelData.label)
+                    size: 18
+                    opacity: methodEntry.enabled ? 1 : 0.5
+                }
+                contentItem: Text {
+                    textFormat: Text.PlainText
+                    text: methodEntry.text
+                    color: methodEntry.enabled ? Theme.text : Theme.textSubtle
+                    font.pixelSize: 13
+                    elide: Text.ElideRight
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onTriggered: {
+                    var card = dashboardRoot.cardByKey(methodMenu.card.key) || methodMenu.card;
+                    for (var i = 0; i < card.methods.length; i++)
+                        if (card.methods[i].key === modelData.key) { dashboardRoot.connectMethod(card, card.methods[i]); return; }
+                }
+            }
+        }
+        MenuSeparator { visible: addMethodItem.visible; height: visible ? implicitHeight : 0 }
+        MenuItem {
+            id: addMethodItem
+            objectName: "methodAddItem"
+            visible: dashboardRoot.isAdmin && methodMenu.card !== null && dashboardRoot.takesMethods(methodMenu.card)
+            height: visible ? implicitHeight : 0
+            text: I18n.t("Add a connection method…")
+            onTriggered: addHostDialog.openMethod(dashboardRoot.cardByKey(methodMenu.card.key) || methodMenu.card)
         }
     }
 
@@ -1734,10 +2031,16 @@ Rectangle {
         objectName: "removeSourceDialog"
         width: 440
         property var source: null
+        // In a card with other ways to connect: the card's name and this
+        // way's ("" when the card is this source and no more).
+        property string cardTitle: ""
+        property string methodLabel: ""
         property bool busy: false
         property string error: ""
-        function openFor(source) {
+        function openFor(source, card, method) {
             removeSourceDialog.source = source;
+            removeSourceDialog.cardTitle = card && card.methods.length > 1 ? String(card.title) : "";
+            removeSourceDialog.methodLabel = method ? String(method.label) : "";
             error = "";
             busy = false;
             open();
@@ -1758,10 +2061,13 @@ Rectangle {
             spacing: 12
             Text { text: I18n.t("Remove computer"); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
             Text {
+                objectName: "removeSourceText"
                 Layout.fillWidth: true
-                text: removeSourceDialog.source
-                    ? I18n.t("Remove \"%1\"? It is removed from %2, which will no longer show it.").arg(removeSourceDialog.source.name).arg(removeSourceDialog.source.host_name)
-                    : ""
+                textFormat: Text.PlainText
+                text: !removeSourceDialog.source ? ""
+                    : removeSourceDialog.cardTitle !== ""
+                        ? I18n.t("Remove %1 from %2? The other ways to connect stay.").arg(removeSourceDialog.methodLabel).arg(removeSourceDialog.cardTitle)
+                        : I18n.t("Remove \"%1\"? It is removed from %2, which will no longer show it.").arg(removeSourceDialog.source.name).arg(removeSourceDialog.source.host_name)
                 color: Theme.text
                 font.pixelSize: 13
                 wrapMode: Text.WordWrap
@@ -1769,6 +2075,7 @@ Rectangle {
             Text {
                 visible: removeSourceDialog.error !== ""
                 Layout.fillWidth: true
+                textFormat: Text.PlainText
                 text: removeSourceDialog.error
                 color: Theme.danger
                 font.pixelSize: 12

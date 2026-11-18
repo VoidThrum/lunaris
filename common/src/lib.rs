@@ -219,6 +219,46 @@ pub struct SourceInfoMsg {
     /// The connector's id ("rustdesk", ...), for an icon or a label.
     #[serde(default)]
     pub connector: String,
+    /// Which computer it is, when it is one that is listed in other ways
+    /// too ([`valid_source_group`]): sources with the same group are one
+    /// computer, and `host:<id>` is the Lunaris computer with that id. An
+    /// opaque word: nothing of where the computer is. Left out when it has
+    /// none, and by peers from before groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// The longest group of a source, in characters.
+pub const MAX_SOURCE_GROUP: usize = 64;
+/// How the group of a source that is a Lunaris computer begins; the rest is
+/// that computer's id.
+pub const SOURCE_GROUP_HOST: &str = "host:";
+
+/// Whether `group` can be the group of a source: 1 to 64 of the letters
+/// a-z and A-Z, the digits and `. _ : -`. It comes from other computers
+/// and from forms, and is stored and shown to clients as it is.
+pub fn valid_source_group(group: &str) -> bool {
+    !group.is_empty()
+        && group.len() <= MAX_SOURCE_GROUP
+        && group.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+/// What a connector can do, for the clients to offer only that (a Files
+/// button only where there are files).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConnectorCapabilitiesMsg {
+    #[serde(default)]
+    pub audio: bool,
+    #[serde(default)]
+    pub input: bool,
+    #[serde(default)]
+    pub clipboard: bool,
+    #[serde(default)]
+    pub cursor: bool,
+    #[serde(default)]
+    pub files: bool,
+    #[serde(default)]
+    pub setup: bool,
 }
 
 /// A kind of computer a host can show through a connector, and what it
@@ -229,18 +269,39 @@ pub struct ConnectorInfoMsg {
     pub name: String,
     #[serde(default)]
     pub fields: Vec<ConnectorFieldMsg>,
+    /// One or two plain sentences shown under the Type choice of "Add
+    /// computer" (empty: nothing). Peers from before it leave it out.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// What it can do. Left out by agents from before this: then it is not
+    /// known, and a client offers what it offered before (files included).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ConnectorCapabilitiesMsg>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ConnectorFieldMsg {
     pub key: String,
     pub label: String,
-    /// "text", "port" or "secret".
+    /// "text", "port", "secret" or "choice" (one of `options`; a client
+    /// from before choices shows it as text, and its value is typed).
     pub kind: String,
     #[serde(default)]
     pub default: String,
     #[serde(default)]
     pub required: bool,
+    /// What a "choice" is chosen from. Left out when there is nothing to
+    /// choose from, and by peers from before choices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<FieldOptionMsg>,
+}
+
+/// One thing a "choice" field can be: the value kept for it, and what the
+/// person reads.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FieldOptionMsg {
+    pub value: String,
+    pub label: String,
 }
 
 /// What a server asks an agent to do with its sources. The fields of a
@@ -249,10 +310,53 @@ pub struct ConnectorFieldMsg {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SourceChange {
-    Add { name: String, connector: String, values: std::collections::BTreeMap<String, String> },
-    /// A field left out or empty keeps its value.
-    Update { id: String, name: String, values: std::collections::BTreeMap<String, String> },
+    /// `group`: the computer it is ([`SourceInfoMsg::group`]). Left out:
+    /// the agent groups it with a source it has at the same address, if
+    /// there is one; empty: with none.
+    Add {
+        name: String,
+        connector: String,
+        values: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+    },
+    /// A field left out or empty keeps its value. `group` left out keeps
+    /// the group too; empty takes the source out of its group.
+    Update {
+        id: String,
+        name: String,
+        values: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+    },
     Remove { id: String },
+    /// Where the set-up that an `Add` started is: answered like `Add`
+    /// (`setup` while it waits, `id` when the source is added, `error` when
+    /// it failed). Only for agents that know set-ups (an older one cannot
+    /// have started one).
+    SetupState { setup: String },
+    /// Stops that set-up.
+    SetupCancel { setup: String },
+}
+
+/// What to show the person while the set-up of a source being added waits
+/// for them (a PIN to type at the other computer).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SetupInfo {
+    /// The set-up's id, to ask about it and to cancel it.
+    pub setup: String,
+    /// In the connector's words.
+    pub message: String,
+    /// A code to show large (a PIN), when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+// The code is for the person's eyes: it is never printed.
+impl std::fmt::Debug for SetupInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SetupInfo {{ setup: {:?}, code: {} }}", self.setup, if self.code.is_some() { "(hidden)" } else { "none" })
+    }
 }
 
 // The values include a password: they are never printed.
@@ -262,6 +366,8 @@ impl std::fmt::Debug for SourceChange {
             SourceChange::Add { connector, values, .. } => write!(f, "Add {{ connector: {:?}, fields: {:?} }}", connector, values.keys().collect::<Vec<_>>()),
             SourceChange::Update { id, values, .. } => write!(f, "Update {{ id: {:?}, fields: {:?} }}", id, values.keys().collect::<Vec<_>>()),
             SourceChange::Remove { id } => write!(f, "Remove {{ id: {:?} }}", id),
+            SourceChange::SetupState { setup } => write!(f, "SetupState {{ setup: {:?} }}", setup),
+            SourceChange::SetupCancel { setup } => write!(f, "SetupCancel {{ setup: {:?} }}", setup),
         }
     }
 }
@@ -474,6 +580,11 @@ pub enum AgentMessage {
         /// Why not, in words for the person, when it did not.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// The source's set-up waits for the person: what to show them.
+        /// Servers from before set-ups do not read it (they then say the
+        /// computer did not say whether it worked).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<SetupInfo>,
     },
 }
 
@@ -507,4 +618,34 @@ pub enum ClientMessage {
 #[serde(tag = "event", content = "data")]
 pub enum ServerToClientMessage {
     Signaling(SignalingMessage),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_group_of_a_source_is_a_short_plain_word() {
+        for good in ["g-1a2b3c4d5e6f", "host:0b7c1f0e-3d7a-4c57-9a0e-6f0f4c1d2e3f", "a", "Den_PC.2", &"x".repeat(MAX_SOURCE_GROUP)] {
+            assert!(valid_source_group(good), "{}", good);
+        }
+        for bad in ["", " ", "a b", "<b>", "a\"b", "a'b", "a;b", "a/b", "a\nb", "nhóm", "a%b", &"x".repeat(MAX_SOURCE_GROUP + 1)] {
+            assert!(!valid_source_group(bad), "{:?}", bad);
+        }
+    }
+
+    // (How these messages look on the wire is tested where JSON is at hand:
+    // server/src/sources.rs.)
+    #[test]
+    fn a_set_up_is_never_printed_with_its_code() {
+        let info = SetupInfo { setup: "s1".into(), message: "Enter this PIN".into(), code: Some("4711".into()) };
+        let answer = AgentMessage::SourceChanged { request_id: "r".into(), id: None, error: None, setup: Some(info.clone()) };
+        let ask = ServerToAgentMessage::ChangeSource { request_id: "r".into(), change: SourceChange::SetupState { setup: "s1".into() }, requester: None };
+        let cancel = SourceChange::SetupCancel { setup: "s1".into() };
+        let printed = format!("{:?} {:?} {:?} {:?}", info, answer, ask, cancel);
+        assert!(!printed.contains("4711") && !printed.contains("Enter this PIN"), "{}", printed);
+        // Which set-up it is about can be read in a log.
+        assert!(printed.contains("SetupState { setup: \"s1\" }") && printed.contains("SetupCancel { setup: \"s1\" }"), "{}", printed);
+        assert!(format!("{:?}", SetupInfo { code: None, ..info }).contains("code: none"));
+    }
 }

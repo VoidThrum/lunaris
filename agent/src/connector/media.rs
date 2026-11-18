@@ -53,6 +53,27 @@ pub fn pointer_maybe_in_picture() -> bool {
     POINTER_MAYBE_IN_PICTURE.load(Ordering::Relaxed)
 }
 
+/// Whether the source's pointer is part of its picture for the whole
+/// session (see `Event::CursorAlwaysEmbedded`).
+static POINTER_ALWAYS_IN_PICTURE: AtomicBool = AtomicBool::new(false);
+
+/// `pointer_in_picture` of the cursor messages: `Some("always")` while a
+/// source is shown whose pointer is always part of its picture (the viewer
+/// then shows no pointer over the picture), else `None` (the field is null).
+pub fn pointer_in_picture() -> Option<&'static str> {
+    POINTER_ALWAYS_IN_PICTURE.load(Ordering::Relaxed).then_some("always")
+}
+
+/// `Event::CursorAlwaysEmbedded`: noted for the cursor messages of this
+/// session. Nothing is known of the pointer but that it is in the picture,
+/// so the cursor of the message that carries this is not visible: a viewer
+/// from before `pointer_in_picture` then draws no pointer at a place nobody
+/// told (it still draws its own where the person's mouse is).
+fn note_pointer_always_in_picture(cursor: &mut lunaris_media::types::CursorState) {
+    POINTER_ALWAYS_IN_PICTURE.store(true, Ordering::Relaxed);
+    cursor.visible = false;
+}
+
 /// Whether a source is being shown now (the session's picture is another
 /// computer's).
 static SOURCE_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -105,6 +126,7 @@ impl Drop for Counters {
     fn drop(&mut self) {
         SOURCE_ACTIVE.store(false, Ordering::Relaxed);
         POINTER_MAYBE_IN_PICTURE.store(false, Ordering::Relaxed);
+        POINTER_ALWAYS_IN_PICTURE.store(false, Ordering::Relaxed);
         *SOURCE_OS.lock().unwrap() = None;
         info!("Connector session: {}; input: {} events, {} commands", self.summary(self.capture_times_used), self.input_events, self.input_commands);
     }
@@ -258,10 +280,18 @@ pub struct Source {
 /// agent session is fixed when it is offered to the viewer, and which codec
 /// a computer sends is only known when it sends: so this comes first.
 /// Every failure is a [`SourceError`] with words for the viewer.
-pub async fn open(target: &Target, requested_codec: &str, decodes: Option<&[String]>, fps: u32) -> Result<Source, SourceError> {
+pub async fn open(
+    target: &Target,
+    requested_codec: &str,
+    decodes: Option<&[String]>,
+    fps: u32,
+    // The size (pixels) and the bitrate (kbit/s) the viewer asked for; 0 = no wish.
+    size: (u32, u32),
+    bitrate_kbps: u32,
+) -> Result<Source, SourceError> {
     let fail = |e: anyhow::Error| SourceError(e.to_string());
     let connector = super::find(&target.connector, &connectors_dir()).map_err(fail)?;
-    let viewer = Viewer { codecs: viewer_codecs(requested_codec, decodes), fps };
+    let viewer = Viewer { codecs: viewer_codecs(requested_codec, decodes), fps, width: size.0, height: size.1, bitrate_kbps };
     if viewer.codecs.is_empty() {
         return Err(SourceError("This viewer decodes no video the computer could send".into()));
     }
@@ -553,6 +583,54 @@ fn displays_message(displays: &[DisplayInfo], current: usize) -> String {
     .to_string()
 }
 
+/// The message that tells the viewer the delay between this agent and the
+/// computer shown, there and back, on the general data channel:
+/// `{"type":"source_latency","ms":12.3}`, in tenths of a millisecond (a
+/// JSON number, `0.4` for 400 microseconds). The viewer adds it to its own
+/// round trip to the agent and shows the sum as the ping. Lunaris's own
+/// message; viewers from before it skip it (both look at `type` on that
+/// channel and take only `source_displays` and `host_cursor`).
+fn latency_message(tenths: u32) -> String {
+    serde_json::json!({ "type": "source_latency", "ms": tenths as f64 / 10.0 }).to_string()
+}
+
+/// At most this often is the viewer told a new delay.
+const LATENCY_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What the connector said of the delay to its computer (`Event::Latency`)
+/// and what the viewer was told of it: told once the channel is open, then
+/// when it changed, at most once in `LATENCY_MESSAGE_INTERVAL`.
+#[derive(Default)]
+struct LatencyOut {
+    /// In tenths of a millisecond: what the viewer shows at most.
+    known: Option<u32>,
+    sent: Option<(u32, Instant)>,
+}
+
+impl LatencyOut {
+    fn note(&mut self, ms: f32) {
+        if ms.is_finite() && ms >= 0.0 {
+            self.known = Some((ms as f64 * 10.0).round().min(u32::MAX as f64) as u32);
+        }
+    }
+
+    /// The delay to tell at `now`, if there is one to tell.
+    fn due(&self, now: Instant) -> Option<u32> {
+        let known = self.known?;
+        match self.sent {
+            None => Some(known),
+            Some((sent, at)) => (sent != known && now.duration_since(at) >= LATENCY_MESSAGE_INTERVAL).then_some(known),
+        }
+    }
+
+    /// The message for `now` (the channel is open and takes it).
+    fn message(&mut self, now: Instant) -> Option<String> {
+        let ms = self.due(now)?;
+        self.sent = Some((ms, now));
+        Some(latency_message(ms))
+    }
+}
+
 /// Runs the source for one agent session: until the connector's session
 /// ends, the agent's session stops it, or the packager is gone. When the
 /// source ends by itself the viewer is told and the session closed.
@@ -576,6 +654,20 @@ pub async fn run(source: Source, link: ViewerLink) {
         display,
     } = link;
     let mut timeline = Timeline::new(Instant::now());
+    // Said at once, whatever the connector tells later: a connector that
+    // never names the computer's system (`Event::Platform`, which says this
+    // again with the system) would leave the viewers showing the GPU of this
+    // computer, which encodes nothing here.
+    let _ = signaling.send(common::AgentMessage::Signaling(common::SignalingMessage::EncoderStatus {
+        target_id: client_id.clone(),
+        encoder: "remote".into(),
+        hw_type: "connector".into(),
+        gpu_info: Some("Unknown (encoded on the remote computer)".into()),
+        requested_encoder: None,
+        host_os: None,
+        display_id: None,
+        display_name: None,
+    }));
     let mut queued: VecDeque<Event> = pending.into_iter().chain(first).collect();
     let mut last_key_request: Option<Instant> = None;
     // A key frame was asked for at this time and has not come yet.
@@ -600,6 +692,8 @@ pub async fn run(source: Source, link: ViewerLink) {
     };
     // The source's displays, to tell the viewer once its channel is open.
     let mut displays_unsent: Option<String> = None;
+    // The delay to the computer, for the viewer's ping.
+    let mut latency = LatencyOut::default();
     let mut channel_poll = tokio::time::interval(Duration::from_millis(250));
     // (viewer input events, commands made of them): kinds only, never which key.
     let (mut input_events, mut input_commands) = (0u64, 0u64);
@@ -632,9 +726,12 @@ pub async fn run(source: Source, link: ViewerLink) {
                     let _ = commands.try_send(Command::RequestKeyFrame);
                     continue;
                 }
-                _ = channel_poll.tick(), if displays_unsent.is_some() => {
+                _ = channel_poll.tick(), if displays_unsent.is_some() || latency.due(Instant::now()).is_some() => {
                     if matches!(general.ready_state().await, Ok(webrtc::data_channel::RTCDataChannelState::Open)) {
                         if let Some(message) = displays_unsent.take() {
+                            let _ = general.send_text(&message).await;
+                        }
+                        if let Some(message) = latency.message(Instant::now()) {
                             let _ = general.send_text(&message).await;
                         }
                     }
@@ -647,6 +744,7 @@ pub async fn run(source: Source, link: ViewerLink) {
                             counters.input_events = input_events;
                             for command in mapper.commands(packet) {
                                 input_commands += 1;
+                                counters.input_commands = input_commands;
                                 // Input is never dropped silently behind a slow
                                 // source: it waits its turn.
                                 if commands.send(command).await.is_err() {
@@ -786,12 +884,17 @@ pub async fn run(source: Source, link: ViewerLink) {
                 displays_unsent = Some(displays_message(&displays, current));
             }
             Event::CursorShape { width, height, hot_x, hot_y, rgba } => {
+                // A pointer that is all light (Windows' text cursor as a
+                // host sends it) would vanish over a white text field.
+                let (width, height, hot_x, hot_y, rgba_data) =
+                    super::cursor_contrast::with_dark_outline(width, height, hot_x, hot_y, &rgba)
+                        .unwrap_or_else(|| (width, height, hot_x, hot_y, rgba.to_vec()));
                 cursor.image = Some(lunaris_media::types::CursorImage {
                     width,
                     height,
                     hotspot_x: hot_x,
                     hotspot_y: hot_y,
-                    rgba_data: rgba.to_vec(),
+                    rgba_data,
                 });
                 let _ = media_events.try_send(MediaEvent::CursorUpdate(cursor.clone()));
                 // The picture goes once; positions repeat without it.
@@ -841,12 +944,24 @@ pub async fn run(source: Source, link: ViewerLink) {
             // Not known, only likely: the viewer is told so in the same
             // message (`pointer_maybe_in_picture`, bridge.rs) and decides by
             // looking at the picture.
+            // Goes to the viewer when the channel takes it (`channel_poll`).
+            Event::Latency { ms } => latency.note(ms),
             Event::CursorMaybeEmbedded { maybe } => {
                 POINTER_MAYBE_IN_PICTURE.store(maybe, Ordering::Relaxed);
                 let _ = media_events.try_send(MediaEvent::CursorUpdate(cursor.clone()));
             }
             Event::CursorEmbedded { embedded } => {
                 cursor.in_window_move_size = embedded;
+                let _ = media_events.try_send(MediaEvent::CursorUpdate(cursor.clone()));
+            }
+            // In the picture for the whole session, whatever the computer
+            // is and whether or not a button is held: its own field of the
+            // cursor message (`pointer_in_picture`, bridge.rs), not the
+            // window-move one, which viewers honour for a Windows computer
+            // while a button is held only.
+            Event::CursorAlwaysEmbedded => {
+                info!("Connector: the pointer is part of the picture for the whole session");
+                note_pointer_always_in_picture(&mut cursor);
                 let _ = media_events.try_send(MediaEvent::CursorUpdate(cursor.clone()));
             }
             Event::Closed { reason } => break (reason, true, "ended"),
@@ -870,6 +985,40 @@ pub async fn run(source: Source, link: ViewerLink) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_delay_to_the_computer_is_told_at_once_then_on_change_once_a_second() {
+        let parsed: serde_json::Value = serde_json::from_str(&latency_message(123)).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "type": "source_latency", "ms": 12.3 }));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&latency_message(4)).unwrap()["ms"], 0.4);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&latency_message(120)).unwrap()["ms"], 12.0);
+
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut out = LatencyOut::default();
+        // A connector that never says it: nothing is ever sent.
+        assert_eq!(out.message(at(0)), None);
+        out.note(12.0);
+        // The first goes as soon as the channel takes it.
+        assert_eq!(out.message(at(100)), Some(latency_message(120)));
+        // The same again (to the tenth of a millisecond): nothing, however long after.
+        out.note(12.04);
+        assert_eq!(out.message(at(300)), None);
+        // A change within the second waits for it to pass, and the newest goes.
+        out.note(20.0);
+        assert_eq!(out.due(at(600)), None);
+        out.note(0.37);
+        assert_eq!(out.due(at(1_050)), None);
+        assert_eq!(out.message(at(1_100)), Some(latency_message(4)));
+        // Back to what it was a while ago is a change too.
+        out.note(12.0);
+        assert_eq!(out.message(at(2_200)), Some(latency_message(120)));
+        assert_eq!(out.message(at(9_000)), None);
+        // What is not a delay is not taken.
+        out.note(f32::NAN);
+        out.note(-1.0);
+        assert_eq!(out.message(at(20_000)), None);
+    }
 
     #[test]
     fn capture_times_are_used_while_they_follow_the_clock() {
@@ -899,8 +1048,39 @@ mod tests {
         assert_eq!(none.rtp(None, at(50)), 50 * 90);
     }
 
+    /// A session's end (its `Counters` going) resets what the cursor
+    /// messages say of the source: tests that look at that take this.
+    static SOURCE_FLAGS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_pointer_always_in_the_picture_is_said_until_the_session_ends() {
+        let _flags = SOURCE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pointer_in_picture(), None);
+        let mut cursor = lunaris_media::types::CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+            kind: lunaris_media::types::CursorKind::Arrow,
+            image: None,
+            in_window_move_size: false,
+        };
+        {
+            let _session = Counters::default();
+            note_pointer_always_in_picture(&mut cursor);
+            assert_eq!(pointer_in_picture(), Some("always"));
+            // Its own flag: neither the window-move one nor "maybe".
+            assert!(!cursor.in_window_move_size);
+            assert!(!pointer_maybe_in_picture());
+            // Nothing is known of where the pointer is.
+            assert!(!cursor.visible);
+        }
+        // The next session (another source, or this computer itself) starts without it.
+        assert_eq!(pointer_in_picture(), None);
+    }
+
     #[tokio::test]
     async fn the_first_pictures_are_kept_until_the_viewer_is_connected() {
+        let _flags = SOURCE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
         let frame = |n: u8| bytes::Bytes::from(vec![n; 10]);
         let (video, mut packager) = mpsc::channel::<VideoFramePayload>(16);
         let mut counters = Counters::default();

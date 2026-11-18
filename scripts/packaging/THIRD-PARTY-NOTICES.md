@@ -46,6 +46,22 @@ The remote-cursor images of the web and desktop clients are the Bibata
 Modern Classic cursors (GPL-3.0, https://github.com/ful1e5/Bibata_Cursor);
 see `assets/cursors/README.md`.
 
+## Logos of other programs
+
+The web and desktop clients show the logo of the program a computer of
+another type runs, beside that type's name ("Add computer", the ways to
+connect on a computer's card), only to say which kind of computer is meant.
+The files are copied unchanged from those programs' sources:
+
+| File | Origin | Licence |
+|------|--------|---------|
+| `web/src/assets/logos/rustdesk.svg`, `client-qml/qml/logos/rustdesk.svg` | RustDesk (https://github.com/rustdesk/rustdesk), `res/logo.svg`, Copyright (c) Purslane Tech Pte. Ltd. and contributors | AGPL-3.0 |
+| `web/src/assets/logos/sunshine.svg`, `client-qml/qml/logos/sunshine.svg` | Sunshine (https://github.com/LizardByte/Sunshine), `sunshine.svg`, Copyright (c) LizardByte and contributors | GPL-3.0 |
+
+"RustDesk" and "Sunshine" and their logos are trademarks of their respective
+owners. Lunaris is not affiliated with or endorsed by them; the names and
+logos are used only to identify the kind of computer being connected to.
+
 ## RustDesk protocol definitions and ported code
 
 The agent's RustDesk-compatible listener (`agent/src/rustdesk.rs` and
@@ -77,6 +93,29 @@ under the GNU Affero General Public License v3.0 (AGPL-3.0):
 
 GPL-3.0 section 13 permits combining the two; the AGPL-3.0 continues to apply
 to that part.
+
+## Sunshine / GameStream connector (ported code)
+
+`agent/src/connector/sunshine/` is the client's side of the GameStream
+protocol, so that a computer running Sunshine can be shown and controlled.
+Lunaris does not contain or install Sunshine. The code is ported to Rust from
+the projects below; each ported piece names its file and function in a
+comment.
+
+| Source | Licence | What was ported |
+|--------|---------|-----------------|
+| moonlight-common-c (https://github.com/moonlight-stream/moonlight-common-c), Copyright (c) Moonlight Game Streaming Project | GPL-3.0 | RTSP exchange and SDP (`RtspConnection.c`, `SdpGenerator.c`), control stream (`ControlStream.c`), input packets (`InputStream.c`, `Input.h`), video and audio receiving (`RtpVideoQueue.c`, `VideoDepacketizer.c`, `VideoStream.c`, `RtpAudioQueue.c`, `AudioStream.c`), order of connection stages (`Connection.c`) |
+| moonlight-embedded, libgamestream (https://github.com/moonlight-stream/moonlight-embedded), Copyright (c) Iwan Timmer and contributors | GPL-3.0-or-later | pairing, serverinfo, application list, launch/resume/quit, client certificate (`client.c`, `http.c`, `mkcert.c`, `xml.c`) |
+| moonlight-qt (https://github.com/moonlight-stream/moonlight-qt), Copyright (c) Moonlight Game Streaming Project | GPL-3.0 | checks and time-outs of pairing and requests (`app/backend/nvpairingmanager.cpp`, `nvhttp.cpp`) |
+| nanors (https://github.com/sleepybishop/nanors), Copyright (c) 2021 Joseph Calderon | MIT | Reed-Solomon erasure code of the video and audio streams (`rs.c`) |
+| Sunshine (https://github.com/LizardByte/Sunshine), Copyright (c) LizardByte and contributors, and its library libvirtualhid | GPL-3.0 | read as the host's side of the protocol (what the host expects and sends; key tables); the host used in the connector's tests is written from `nvhttp.cpp`, `rtsp.cpp`, `stream.cpp`, `crypto.cpp`, `input.cpp` and is not part of any package |
+
+Libraries the connector links into the agent (all packages):
+
+| Component | Licence | Source |
+|-----------|---------|--------|
+| rusty_enet (Rust port of ENet, Copyright (c) Lee Salzman and contributors) | MIT | https://github.com/jabuwu/rusty_enet |
+| rsa, aes, aes-gcm, cbc (RustCrypto) | MIT OR Apache-2.0 | https://github.com/RustCrypto |
 
 ## Other ported code
 

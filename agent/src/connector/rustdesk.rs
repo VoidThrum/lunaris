@@ -52,6 +52,7 @@ impl Connector for RustdeskConnector {
             kind: kind.into(),
             default: default.into(),
             required,
+            options: Vec::new(),
         };
         Description {
             id: "rustdesk".into(),
@@ -68,7 +69,9 @@ impl Connector for RustdeskConnector {
                 clipboard: true,
                 cursor: true,
                 files: true,
+                setup: false,
             },
+            note: String::new(),
         }
     }
 
@@ -278,6 +281,11 @@ fn displays_event(info: &PeerInfo) -> Event {
     }
 }
 
+/// How long a session waits for the first picture before it asks for one,
+/// and how often it asks again.
+const FIRST_PICTURE_WAIT: Duration = Duration::from_millis(1000);
+const FIRST_PICTURE_RETRY: Duration = Duration::from_millis(2000);
+
 fn misc(union: misc::Union) -> Message {
     Message { union: Some(message::Union::Misc(Misc { union: Some(union) })) }
 }
@@ -380,6 +388,73 @@ struct Remote {
     probes_logged: bool,
     host_delay_ms: u32,
     host_bitrate_kbps: u32,
+    /// Whether a delay probe of the host was seen in this session, and the
+    /// delay last told to the viewer (`latency_event`).
+    probe_seen: bool,
+    /// In tenths of a millisecond.
+    latency_told: Option<u32>,
+    /// How often the delay told came from the kernel's figure for the
+    /// connection, and how often from the host's (for the log).
+    latency_from_tcp: u32,
+    latency_from_host: u32,
+    tcp_rtt_us: Option<u32>,
+}
+
+/// The kernel's round trip time of a TCP connection, in microseconds.
+///
+/// Linux: `getsockopt(TCP_INFO)`, `tcp_info.tcpi_rtt` (tcp(7); kernel
+/// include/uapi/linux/tcp.h `struct tcp_info`, filled by net/ipv4/tcp.c
+/// `tcp_get_info`: `info->tcpi_rtt = tp->srtt_us >> 3`): the smoothed time
+/// between a segment this side sent and its acknowledgement (RFC 6298).
+/// It is measured below the application, so neither the time a message
+/// waits behind pictures in the host's send queue nor the time the two
+/// programs take is in it. Elsewhere `None` (Windows has `SIO_TCP_INFO`;
+/// it is not read here, and the host's figure is used there).
+#[cfg(target_os = "linux")]
+fn tcp_round_trip_us(stream: &TcpStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_INFO, (&mut info as *mut libc::tcp_info).cast(), &mut len)
+    };
+    (result == 0 && info.tcpi_rtt > 0).then_some(info.tcpi_rtt)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tcp_round_trip_us(_stream: &TcpStream) -> Option<u32> {
+    None
+}
+
+/// Where a delay to the computer came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DelaySource {
+    Tcp,
+    Host,
+}
+
+/// The round trip to the computer, in milliseconds, of the two figures
+/// there are for it: the host's (`host_ms`: `TestDelay.last_delay`, see
+/// `Remote::latency_event`; `None` while it has measured nothing) and the
+/// kernel's for the connection (`tcp_us`: `tcp_round_trip_us`).
+///
+/// Lunaris's own rule. Each figure can be too high for a reason of its own:
+/// the host's holds the time its probe waited behind pictures in the same
+/// stream and the time this program took to answer; the kernel's holds the
+/// time the host's system kept an acknowledgement back when it had nothing
+/// to send with it (delayed ACK). Neither is too low for long, except that
+/// the host's is cut to whole milliseconds (`as_millis`). So the kernel's is
+/// taken, finer and free of queueing, unless it is above what the host can
+/// have measured (its figure plus the millisecond that was cut off): then
+/// the kernel's is the inflated one and the host's is told.
+fn target_round_trip_ms(host_ms: Option<u32>, tcp_us: Option<u32>) -> Option<(f32, DelaySource)> {
+    let tcp_ms = tcp_us.map(|us| us as f32 / 1000.0);
+    match (host_ms, tcp_ms) {
+        (Some(host), Some(tcp)) if tcp > host as f32 + 1.0 => Some((host as f32, DelaySource::Host)),
+        (_, Some(tcp)) => Some((tcp, DelaySource::Tcp)),
+        (Some(host), None) => Some((host as f32, DelaySource::Host)),
+        (None, None) => None,
+    }
 }
 
 /// However the session ends, its numbers are written.
@@ -464,7 +539,61 @@ impl Remote {
             probes_logged: false,
             host_delay_ms: 0,
             host_bitrate_kbps: 0,
+            probe_seen: false,
+            latency_told: None,
+            latency_from_tcp: 0,
+            latency_from_host: 0,
+            tcp_rtt_us: None,
         }
+    }
+
+    /// `Event::Latency` for a delay probe of the host carrying `last_delay`,
+    /// when there is something new to tell.
+    ///
+    /// What `last_delay` is, from the RustDesk source:
+    /// - src/server/connection.rs, `Connection::start`, the
+    ///   `test_delay_timer.tick()` branch (every `TEST_DELAY_TIMEOUT` = 1 s,
+    ///   when no probe is unanswered): the host notes
+    ///   `conn.last_test_delay = Some(Instant::now())` and sends
+    ///   `TestDelay { last_delay: conn.network_delay, target_bitrate, .. }`.
+    /// - src/client.rs `handle_test_delay` (called from
+    ///   src/client/io_loop.rs): the client sends the probe back as it came.
+    /// - src/server/connection.rs, `Connection::on_message`, the `TestDelay`
+    ///   branch with `!t.from_client`:
+    ///   `new_delay = tm.elapsed().as_millis() as u32` (`tm` = the noted
+    ///   `last_test_delay`), `self.network_delay = new_delay`.
+    /// - protos/message.proto of hbb_common (libs/base/protos in the
+    ///   checkout read): `message TestDelay { .. uint32 last_delay = 3; .. }`.
+    ///
+    /// So it is a round trip (host -> client -> host), in milliseconds,
+    /// measured by the host with its own clock, of the probe *before* this
+    /// one (a second old), and it holds the time the probe waited behind
+    /// pictures in the same stream and the time this connector took to send
+    /// it back. It is told as it is: already there and back, not doubled.
+    ///
+    /// `network_delay` starts at 0 (connection.rs `Connection::start`,
+    /// `network_delay: 0`), so the first probe carries a 0 that measured
+    /// nothing. Lunaris's own choice: the first probe seen in a session does
+    /// not count as a figure of the host (a later 0 is a measurement of
+    /// under a millisecond and does).
+    ///
+    /// `tcp_us`: the kernel's figure for the connection at this moment
+    /// (`tcp_round_trip_us`); which of the two is told: `target_round_trip_ms`.
+    /// Told in tenths of a millisecond, when that changed.
+    fn latency_event(&mut self, last_delay: u32, tcp_us: Option<u32>) -> Option<Event> {
+        let host_ms = std::mem::replace(&mut self.probe_seen, true).then_some(last_delay);
+        self.tcp_rtt_us = tcp_us;
+        let (ms, source) = target_round_trip_ms(host_ms, tcp_us)?;
+        match source {
+            DelaySource::Tcp => self.latency_from_tcp += 1,
+            DelaySource::Host => self.latency_from_host += 1,
+        }
+        let tenths = (ms * 10.0).round() as u32;
+        if self.latency_told == Some(tenths) {
+            return None;
+        }
+        self.latency_told = Some(tenths);
+        Some(Event::Latency { ms: tenths as f32 / 10.0 })
     }
 
     /// Where the display shown is on the host's desktop, and its size.
@@ -777,12 +906,15 @@ impl Remote {
         }
         answers.sort_unstable();
         info!(
-            "RustDesk connector: {} delay probes answered, each within median {} us, max {} us of being read; the computer last measured a delay of {} ms and aimed at {} kbit/s",
+            "RustDesk connector: {} delay probes answered, each within median {} us, max {} us of being read; the computer last measured a delay of {} ms and aimed at {} kbit/s; the connection's own round trip was last {:?} us; the delay told the viewer came {} times from the connection, {} times from the computer",
             answers.len(),
             answers[answers.len() / 2],
             answers[answers.len() - 1],
             self.host_delay_ms,
-            self.host_bitrate_kbps
+            self.host_bitrate_kbps,
+            self.tcp_rtt_us,
+            self.latency_from_tcp,
+            self.latency_from_host
         );
     }
 
@@ -814,8 +946,23 @@ async fn run(
     let mut channels: u8 = 2;
     // Test only (see connector/media.rs): answer the host's delay probes late.
     let test_reply_delay = std::env::var(super::media::TEST_DELAY_REPLY_ENV).ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_millis);
+    // No picture yet: ask for one. A host whose video service is still
+    // running from an earlier connection (video_service.rs: a new subscriber
+    // is served from `handle_one_frame`, that is, with the next captured
+    // frame) sends nothing while its screen is still; the "Refresh" of
+    // RustDesk's own client (ui_session_interface.rs `refresh_video`) makes
+    // it start over and send a key frame. This safety net is Lunaris's own:
+    // RustDesk's client leaves that to the person at the "waiting for image"
+    // dialog.
+    let mut first_picture = tokio::time::interval_at(tokio::time::Instant::now() + FIRST_PICTURE_WAIT, FIRST_PICTURE_RETRY);
     loop {
         tokio::select! {
+            _ = first_picture.tick(), if remote.codec.is_none() => {
+                info!("RustDesk connector: no picture yet, asking the computer for one");
+                if conn.send(&refresh_message(&remote.version, remote.display)).await.is_err() {
+                    return "The connection to the computer broke".into();
+                }
+            }
             msg = conn.next() => {
                 let msg = match msg {
                     Ok(Some(msg)) => msg,
@@ -876,12 +1023,15 @@ async fn run(
                             if let Some(wait) = test_reply_delay {
                                 tokio::time::sleep(wait).await;
                             }
-                            remote.host_delay_ms = delay.last_delay;
+                            let last_delay = delay.last_delay;
+                            remote.host_delay_ms = last_delay;
                             remote.host_bitrate_kbps = delay.target_bitrate;
                             if conn.send(&Message { union: Some(message::Union::TestDelay(delay)) }).await.is_err() {
                                 return "The connection to the computer broke".into();
                             }
                             remote.probe_answers_us.push(read_at.elapsed().as_micros().min(u32::MAX as u128) as u32);
+                            // After the answer went: the viewer's ping (see `latency_event`).
+                            other = remote.latency_event(last_delay, tcp_round_trip_us(&conn.stream));
                         }
                     }
                     Some(message::Union::Misc(Misc { union: Some(misc::Union::CloseReason(reason)) })) => {
@@ -1002,6 +1152,54 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The host's delay probes become the delay the viewer adds to its ping.
+    #[test]
+    fn the_delay_the_host_measured_is_told_as_a_round_trip_when_it_changes() {
+        // Without the kernel's figure (not Linux): the host's, as it is.
+        let mut r = remote("Windows");
+        // The first probe carries the host's starting 0: no measurement.
+        assert_eq!(r.latency_event(0, None), None);
+        // From the second on it is the round trip of the probe before.
+        assert_eq!(r.latency_event(23, None), Some(Event::Latency { ms: 23.0 }));
+        assert_eq!(r.latency_event(23, None), None, "the same again says nothing");
+        assert_eq!(r.latency_event(31, None), Some(Event::Latency { ms: 31.0 }));
+        // Under a millisecond is a measurement too.
+        assert_eq!(r.latency_event(0, None), Some(Event::Latency { ms: 0.0 }));
+        // A host whose first probe already measured something: still skipped once.
+        let mut r = remote("Linux");
+        assert_eq!(r.latency_event(40, None), None);
+        assert_eq!(r.latency_event(40, None), Some(Event::Latency { ms: 40.0 }));
+        assert_eq!((r.latency_from_tcp, r.latency_from_host), (0, 1));
+    }
+
+    #[test]
+    fn the_connections_own_round_trip_is_told_when_it_is_the_better_figure() {
+        use DelaySource::{Host, Tcp};
+        // Only one of the two.
+        assert_eq!(target_round_trip_ms(None, None), None);
+        assert_eq!(target_round_trip_ms(Some(7), None), Some((7.0, Host)));
+        assert_eq!(target_round_trip_ms(None, Some(350)), Some((0.35, Tcp)));
+        // Both, and they agree: the finer one (the host cuts 0.35 ms to 0, 12.8 to 12).
+        assert_eq!(target_round_trip_ms(Some(0), Some(350)), Some((0.35, Tcp)));
+        assert_eq!(target_round_trip_ms(Some(12), Some(12_800)), Some((12.8, Tcp)));
+        // The host's probe waited behind pictures: the connection's.
+        assert_eq!(target_round_trip_ms(Some(85), Some(12_800)), Some((12.8, Tcp)));
+        // The acknowledgements were kept back at the host (40 ms and more):
+        // more than the host can have measured, so the host's.
+        assert_eq!(target_round_trip_ms(Some(12), Some(52_000)), Some((12.0, Host)));
+        assert_eq!(target_round_trip_ms(Some(12), Some(13_001)), Some((12.0, Host)));
+        assert_eq!(target_round_trip_ms(Some(12), Some(13_000)), Some((13.0, Tcp)));
+
+        // In a session: the connection's figure from the first probe on,
+        // in tenths of a millisecond, told when it changed.
+        let mut r = remote("Windows");
+        assert_eq!(r.latency_event(0, Some(420)), Some(Event::Latency { ms: 0.4 }));
+        assert_eq!(r.latency_event(0, Some(440)), None, "still 0.4 ms");
+        assert_eq!(r.latency_event(0, Some(460)), Some(Event::Latency { ms: 0.5 }));
+        assert_eq!(r.latency_event(3, Some(47_000)), Some(Event::Latency { ms: 3.0 }));
+        assert_eq!((r.latency_from_tcp, r.latency_from_host), (3, 1));
     }
 
     #[test]

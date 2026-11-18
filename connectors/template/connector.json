@@ -2,12 +2,14 @@
   "id": "template",
   "name": "Test pattern (template connector)",
   "command": "connector-template",
+  "note": "Shows a recorded test pattern. Nothing has to be installed on another computer.",
   "args": [],
   "fields": [
     { "key": "file", "label": "IVF file (VP8, VP9 or AV1); empty: pattern.ivf", "kind": "text" },
     { "key": "fps", "label": "Frames a second", "kind": "text", "default": "30" },
     { "key": "then_file", "label": "A second IVF file to change to (optional)", "kind": "text" },
-    { "key": "then_after", "label": "... after this many seconds", "kind": "text" }
+    { "key": "then_after", "label": "... after this many seconds", "kind": "text" },
+    { "key": "pair", "label": "Demo pairing when added: 1 (optional)", "kind": "text" }
   ],
-  "capabilities": { "video": ["vp8", "vp9", "av1"], "audio": true, "input": true, "clipboard": true, "cursor": true }
+  "capabilities": { "video": ["vp8", "vp9", "av1"], "audio": true, "input": true, "clipboard": true, "cursor": true, "setup": true }
 }

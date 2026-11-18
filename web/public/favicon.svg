@@ -1,19 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<!-- The Lunaris icon: master artwork. scripts/brand/generate-icons.sh makes
+     every icon file from it. The drawing's tile is 968 wide at (28, 28) of a
+     1024 canvas; the viewBox is that tile, so the icon fills its frame. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="28 28 968 968" role="img" aria-label="Lunaris">
   <title>Lunaris</title>
-  <defs>
-    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#3b82f6"/>
-      <stop offset="1" stop-color="#1d4ed8"/>
-    </linearGradient>
-    <mask id="crescent">
-      <rect width="512" height="512" fill="#000"/>
-      <circle cx="244" cy="272" r="150" fill="#fff"/>
-      <circle cx="330" cy="190" r="128" fill="#000"/>
-    </mask>
-  </defs>
-  <rect width="512" height="512" rx="116" fill="url(#tile)"/>
-  <rect width="512" height="512" fill="#fff" mask="url(#crescent)"/>
-  <!-- pointer resting in the crescent's bite: remote control -->
-  <path d="M322 136 L322 262 L352 233 L373 281 L396 271 L375 224 L417 221 Z"
-        fill="#fff" stroke-linejoin="round"/>
+<defs>
+ <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#092b83"/><stop offset=".55" stop-color="#061c61"/><stop offset="1" stop-color="#030d36"/></linearGradient>
+ <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#00449f"/><stop offset=".53" stop-color="#0754d6"/><stop offset="1" stop-color="#3028f7"/></linearGradient>
+ <linearGradient id="frame" x1="0" y1="0" x2=".8" y2="1"><stop stop-color="#fff"/><stop offset=".65" stop-color="#e7efff"/><stop offset="1" stop-color="#9abaff"/></linearGradient>
+ <linearGradient id="link" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#02d9f9"/><stop offset="1" stop-color="#00aaff"/></linearGradient>
+ <linearGradient id="node" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#9b35ff"/><stop offset="1" stop-color="#5b16f1"/></linearGradient>
+ <clipPath id="round"><rect x="28" y="28" width="968" height="968" rx="210"/></clipPath>
+</defs>
+<g clip-path="url(#round)"><rect x="28" y="28" width="968" height="968" fill="url(#bg)"/>
+<!-- connection arc -->
+<path d="M440 405 C500 272 682 280 740 390 C814 538 705 659 590 640" fill="none" stroke="url(#link)" stroke-width="39" stroke-linecap="round"/>
+<!-- rear display -->
+<rect x="533" y="242" width="403" height="288" rx="62" fill="url(#frame)"/>
+<rect x="569" y="279" width="331" height="213" rx="29" fill="url(#screen)"/>
+<path d="M895 281 L615 491 H868 Q900 491 900 458 V311 Q900 291 895 281" fill="#3575ff" opacity=".3"/>
+<path d="M710 530 v35 h83 q22 0 22 18 t-22 18 H672" fill="url(#frame)"/>
+<!-- front display -->
+<rect x="168" y="424" width="432" height="284" rx="62" fill="url(#frame)"/>
+<rect x="204" y="461" width="360" height="209" rx="29" fill="url(#screen)"/>
+<path d="M561 464 L250 670 H535 Q564 670 564 640 V493 Q564 473 561 464" fill="#367aff" opacity=".3"/>
+<path d="M345 708 v35 h85 v-35" fill="url(#frame)"/>
+<rect x="286" y="740" width="205" height="36" rx="18" fill="url(#frame)"/>
+<!-- connection hub -->
+<circle cx="572" cy="478" r="65" fill="url(#frame)"/>
+<circle cx="572" cy="478" r="36" fill="url(#node)"/>
+</g>
 </svg>

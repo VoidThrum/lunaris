@@ -142,8 +142,8 @@ Rectangle {
                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
                 anchors.margins: 20
                 spacing: 12
-                Text { text: ask.title; color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold; Layout.fillWidth: true; wrapMode: Text.WordWrap }
-                Text { visible: ask.message !== ""; text: ask.message; color: Theme.textMuted; font.pixelSize: 13; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                Text { textFormat: Text.PlainText; text: ask.title; color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                Text { textFormat: Text.PlainText; visible: ask.message !== ""; text: ask.message; color: Theme.textMuted; font.pixelSize: 13; Layout.fillWidth: true; wrapMode: Text.WordWrap }
                 InputField { id: nameField; visible: ask.withName; Layout.fillWidth: true; onAccepted: ask.finish(true) }
                 RowLayout {
                     Layout.alignment: Qt.AlignRight
@@ -172,10 +172,11 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 radius: 10; height: 22; width: hostText.implicitWidth + 16
                 color: Theme.surface2; border.color: Theme.border
-                Text { id: hostText; anchors.centerIn: parent; text: fm.st.host || ""; color: Theme.textMuted; font.pixelSize: 12 }
+                Text { textFormat: Text.PlainText; id: hostText; anchors.centerIn: parent; text: fm.st.host || ""; color: Theme.textMuted; font.pixelSize: 12 }
             }
             Text {
                 anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
                 text: fm.st.status ? I18n.t(fm.st.status) : ""
                 color: Theme.textMuted; font.pixelSize: 13
             }
@@ -226,7 +227,7 @@ Rectangle {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 6
-                Text { text: pane.title; color: Theme.textStrong; font.pixelSize: 14; font.weight: Font.DemiBold }
+                Text { textFormat: Text.PlainText; text: pane.title; color: Theme.textStrong; font.pixelSize: 14; font.weight: Font.DemiBold }
                 Item { Layout.fillWidth: true }
                 ThemedCombo {
                     implicitWidth: 150; implicitHeight: 32
@@ -252,7 +253,7 @@ Rectangle {
                 }
             }
             RowLayout { id: toolRow; Layout.fillWidth: true; spacing: 6 }
-            Text { visible: pane.error !== ""; text: pane.error; color: Theme.danger; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+            Text { textFormat: Text.PlainText; visible: pane.error !== ""; text: pane.error; color: Theme.danger; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap }
             Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
@@ -278,7 +279,7 @@ Rectangle {
                             anchors.leftMargin: 10; anchors.rightMargin: 10
                             spacing: 8
                             Icon { name: modelData.dir ? "folder" : "file"; size: 15; color: modelData.dir ? "#e3b341" : Theme.textMuted }
-                            Text { text: modelData.name; color: Theme.textStrong; opacity: modelData.hidden ? 0.6 : 1; font.pixelSize: 13; elide: Text.ElideMiddle; Layout.fillWidth: true }
+                            Text { textFormat: Text.PlainText; text: modelData.name; color: Theme.textStrong; opacity: modelData.hidden ? 0.6 : 1; font.pixelSize: 13; elide: Text.ElideMiddle; Layout.fillWidth: true }
                             Text { text: modelData.dir ? "" : fm.human(modelData.size); color: Theme.textMuted; font.pixelSize: 12; Layout.preferredWidth: 70; horizontalAlignment: Text.AlignRight }
                             Text { visible: pane.width > 420; text: fm.when(modelData.mtime); color: Theme.textMuted; font.pixelSize: 12; Layout.preferredWidth: 130; elide: Text.ElideRight }
                         }
@@ -296,6 +297,7 @@ Rectangle {
                         visible: list.count === 0
                         horizontalAlignment: Text.AlignHCenter
                         wrapMode: Text.WordWrap
+                        textFormat: Text.PlainText
                         text: pane.emptyText
                         color: Theme.textMuted
                         font.pixelSize: 13
@@ -422,7 +424,7 @@ Rectangle {
                 height: 26
                 spacing: 10
                 Text { text: modelData.up ? "↑" : "↓"; color: Theme.textMuted; font.pixelSize: 13 }
-                Text { text: modelData.name; color: Theme.textStrong; font.pixelSize: 12; elide: Text.ElideMiddle; Layout.preferredWidth: jobList.width * 0.32 }
+                Text { textFormat: Text.PlainText; text: modelData.name; color: Theme.textStrong; font.pixelSize: 12; elide: Text.ElideMiddle; Layout.preferredWidth: jobList.width * 0.32 }
                 Rectangle {
                     Layout.fillWidth: true
                     height: 6; radius: 3
@@ -438,6 +440,7 @@ Rectangle {
                     elide: Text.ElideRight
                     font.pixelSize: 12
                     color: modelData.state === "failed" ? Theme.danger : Theme.textMuted
+                    textFormat: Text.PlainText
                     text: {
                         var s = modelData.state;
                         if (s === "running") return fm.human(modelData.done) + " / " + fm.human(modelData.size) + (modelData.speed > 0 ? "  " + fm.human(modelData.speed) + "/s" : "");

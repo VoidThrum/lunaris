@@ -138,6 +138,22 @@ ApplicationWindow {
     // hides nothing.
     property bool pointerMaybeInPicture: false
     property bool pointerFoundInPicture: false
+    // The host's pointer is part of its picture for the whole session (the
+    // host's `pointer_in_picture` is "always": a computer shown through a
+    // connector that always draws its pointer into what it sends, such as a
+    // Sunshine host). No pointer is shown over the picture then, neither the
+    // host-shaped one nor this computer's: the only pointer is the one in
+    // the picture. The web client decides the same way (web/src/pointerShown.ts).
+    property bool pointerAlwaysInPicture: false
+    onIsStreamModeChanged: {
+        if (isStreamMode) {
+            systemKeysKind = bridge.systemKeysSupport();
+        } else {
+            pointerAlwaysInPicture = false;
+            systemKeysPaused = false;
+            systemKeysHintShown = false;
+        }
+    }
     property string agentHostOs: "unknown"
     property int localCursorX: streamWidth / 2
     property int localCursorY: streamHeight / 2
@@ -152,6 +168,57 @@ ApplicationWindow {
     property int nativeCursorHeight: 32
     property int nativeCursorHotspotX: 0
     property int nativeCursorHotspotY: 0
+
+    // ---- The stats overlay's "Encode" and "Decode" rows ----
+
+    // A GPU's name as the host describes it, short: "RTX 2060" of
+    // "NVIDIA GeForce RTX 2060 (vendor=0x10de, device=0x1f08)". "" when the
+    // host named none ("Unknown ...").
+    function shortGpuName(info) {
+        var s = String(info || "").trim();
+        if (s === "" || /^unknown/i.test(s)) return "";
+        // "(vendor=0x.., device=0x..)", "(amdgpu, vendor=.., device=..)"
+        s = s.replace(/\s*\([^()]*vendor=[^()]*\)\s*$/i, "");
+        s = s.replace(/\((R|TM)\)/gi, "").replace(/\s+/g, " ").trim();
+        var model = s.replace(/^(NVIDIA|AMD|ATI|Intel)( Corporation)?\s+/i, "")
+                     .replace(/^(GeForce|Radeon)\s+/i, "");
+        // "AMD GPU": nothing but the maker is known, so the maker stays.
+        return (model === "" || /^GPU$/i.test(model)) ? s : model;
+    }
+
+    // What encodes the picture: "h264_nvenc · RTX 2060"; of a session that
+    // shows another computer through a connector (the agent then says
+    // encoder "remote", type "connector": the picture is encoded there, by
+    // what nobody tells) "Remote PC".
+    function encodeStatText(encoder, hwType, gpuInfo) {
+        var name = String(encoder || "");
+        var type = String(hwType || "");
+        if (type.toLowerCase() === "connector" || name.toLowerCase() === "remote")
+            return I18n.t("Remote PC");
+        if (name === "" || name === "Unknown") return "-";
+        // A software encoder runs on the processor, whatever GPU the host has.
+        if (type.toLowerCase() === "software") return name + " · CPU";
+        var gpu = window.shortGpuName(gpuInfo);
+        return gpu !== "" ? name + " · " + gpu : name;
+    }
+
+    // The ping: tenths of a millisecond while it is under ten, whole
+    // milliseconds from there ("0.4 ms", "9.6 ms", "12 ms").
+    function pingStatText(ms) {
+        var value = Number(ms);
+        return (value < 9.95 ? value.toFixed(1) : value.toFixed(0)) + " ms";
+    }
+
+    // What decodes it and how long a picture takes: "VAAPI · 5.4 ms",
+    // "Software (dav1d) · 6.0 ms". FFmpeg's CUDA device is NVIDIA's decoder
+    // (NVDEC). Before the first picture only the time.
+    function decodeStatText(backend, ms) {
+        var time = Number(ms).toFixed(1) + " ms";
+        var name = String(backend || "");
+        if (name === "" || name === "Unknown") return time;
+        if (name === "CUDA") name = "NVDEC";
+        return name + " · " + time;
+    }
 
     function normalizeCursorKind(kind) {
         var allowed = {
@@ -264,13 +331,15 @@ ApplicationWindow {
         window.localCursorVisible = true;
     }
 
-    // The host draws its own pointer into the picture: the host says so
-    // (a Windows host while a window is moved), or the client found it there
-    // during this drag.
+    // The host draws its own pointer into the picture: for the whole
+    // session (pointerAlwaysInPicture), or while a button is held because
+    // the host says so (a Windows host while a window is moved) or the
+    // client found it there during this drag.
     function shouldHidePredictedCursor() {
-        return window.hostCursorMouseDown
-            && ((window.agentHostOs === "windows" && window.hostCursorInWindowMoveSize)
-                || window.pointerFoundInPicture);
+        return window.pointerAlwaysInPicture
+            || (window.hostCursorMouseDown
+                && ((window.agentHostOs === "windows" && window.hostCursorInWindowMoveSize)
+                    || window.pointerFoundInPicture));
     }
 
     // Hold ESC to unlock cursor properties
@@ -331,14 +400,102 @@ ApplicationWindow {
             rootContainer.forceActiveFocus();
             window.showLockBanner = true;
             bannerTimer.restart();
-            keyboardGrabTimer.restart();
+            // Locking the pointer is asking for the keyboard again.
+            window.systemKeysPaused = false;
         } else {
             bridge.setPointerLocked(false);
             window.showLockBanner = false;
             bannerTimer.stop();
-            keyboardGrabTimer.stop();
-            bridge.setKeyboardGrab(false);
         }
+    }
+
+    // ---- The keyboard of the stream ----
+    // The stream view gets the keys while the window is the active one and
+    // the view has the focus. When that ends (another window is activated,
+    // a dialog takes the focus, the stream ends), the keys still held on
+    // the remote computer are let go there: their releases will not come
+    // here (moonlight-qt input.cpp notifyFocusLost 273-285: "certain keys
+    // used in shortcuts that cause focus loss (such as Alt+Tab) may get
+    // stuck down").
+    property bool windowActive: window.active
+    property bool streamViewFocused: rootContainer.activeFocus
+    readonly property bool streamHasKeyboard: window.isStreamMode && window.windowActive && window.streamViewFocused
+    onStreamHasKeyboardChanged: if (!streamHasKeyboard) bridge.releaseAllKeys()
+    onWindowActiveChanged: if (!windowActive) systemKeysPaused = false
+
+    // System shortcuts (Alt+Tab, the Super key, ...) go to the remote
+    // computer when ViewPrefs.systemKeys says so: the window system is asked
+    // for them (bridge.setKeyboardGrab). "fullscreen" and "off" are
+    // moonlight-qt's modes (streamingpreferences.h CaptureSysKeysMode);
+    // "always" is how RustDesk works. Ctrl+Alt+Esc gives them back to this
+    // computer until the picture is clicked again.
+    //
+    // How depends on the window system (systemKeysKind, from the bridge):
+    // - "grab" (X11) and "grab-maybe" (XWayland): a keyboard grab, held only
+    //   while the stream view has the keyboard, and in "always" only while
+    //   the pointer is over the picture - RustDesk takes the keyboard
+    //   between enterView and leaveView the same way
+    //   (flutter/lib/desktop/pages/remote_page.dart 850-906).
+    // - "compositor" (Wayland): the request stays for as long as the stream
+    //   is shown; the compositor applies it while the window has the
+    //   keyboard and not otherwise (the protocol's active/inactive). It is
+    //   not tied to the window being active or to the pointer here: GNOME
+    //   asks the user in a dialog that takes both away from the window, and
+    //   taking the request back at that moment would close the dialog.
+    // - "window" (Windows, macOS): no system shortcut can be taken; Qt's
+    //   own grab while the pointer is locked, as before.
+    property string systemKeysKind: "no"
+    property bool systemKeysPaused: false
+    property bool pointerOverStream: streamMouseArea.containsMouse
+    property bool systemKeysGrabbed: false
+    property bool systemKeysHintShown: false
+    function wantsSystemKeys(kind, mode, shown, hasKeyboard, paused, pointerLocked, fullScreen, pointerOver) {
+        if (kind === "window") return hasKeyboard && pointerLocked;
+        if (kind === "no" || paused || mode === "off") return false;
+        if (kind === "compositor") return shown && (mode === "always" || fullScreen);
+        if (!hasKeyboard) return false;
+        if (mode === "fullscreen") return fullScreen;
+        return pointerLocked || fullScreen || pointerOver;
+    }
+    readonly property bool systemKeysWanted: wantsSystemKeys(systemKeysKind, ViewPrefs.systemKeys,
+        isStreamMode && visible, streamHasKeyboard, systemKeysPaused,
+        isPointerLocked, window.visibility === Window.FullScreen, pointerOverStream)
+    onSystemKeysWantedChanged: {
+        if (systemKeysWanted) {
+            // Shortly after: a mouse press still being handled holds the
+            // grab, and a window just shown has no surface yet.
+            keyboardGrabTimer.restart();
+        } else {
+            keyboardGrabTimer.stop();
+            applySystemKeys();
+        }
+    }
+    function applySystemKeys() {
+        if (systemKeysGrabbed === systemKeysWanted) return;
+        systemKeysGrabbed = systemKeysWanted;
+        bridge.setKeyboardGrab(systemKeysGrabbed);
+        if (systemKeysGrabbed && !systemKeysHintShown && systemKeysKind !== "window") {
+            systemKeysHintShown = true;
+            window.showToast(I18n.t("System shortcuts go to the remote computer. Ctrl+Alt+Esc gives them back to this computer."));
+        }
+    }
+    function pauseSystemKeys() {
+        if (!window.isStreamMode) return;
+        var had = systemKeysGrabbed;
+        systemKeysPaused = true;
+        if (had && systemKeysKind !== "window") window.showToast(I18n.t("System shortcuts are with this computer again. Click the picture to send them to the remote computer."));
+    }
+    // Presses a key combination on the remote computer: the keys go down in
+    // the order given and up in the opposite one (Qt key codes).
+    function sendKeyCombo(keys) {
+        var i;
+        for (i = 0; i < keys.length; i++) bridge.sendKeyEvent(keys[i], 0, true);
+        for (i = keys.length - 1; i >= 0; i--) bridge.sendKeyEvent(keys[i], 0, false);
+    }
+    function showToast(text) {
+        shareToast.text = text;
+        shareToast.opacity = 1;
+        shareToastTimer.restart();
     }
 
     Item {
@@ -362,7 +519,7 @@ ApplicationWindow {
                 return;
             }
 
-            bridge.sendKeyEvent(event.key, event.modifiers, true);
+            bridge.sendKeyEventAt(event.key, event.modifiers, event.nativeScanCode, true, event.isAutoRepeat);
             event.accepted = true;
         }
 
@@ -390,7 +547,7 @@ ApplicationWindow {
                 }
             }
 
-            bridge.sendKeyEvent(event.key, event.modifiers, false);
+            bridge.sendKeyEventAt(event.key, event.modifiers, event.nativeScanCode, false, event.isAutoRepeat);
             event.accepted = true;
         }
 
@@ -433,6 +590,10 @@ ApplicationWindow {
                 window.localCursorVisible = true
                 window.localCursorInitialized = true
             }
+        }
+
+        onPointerAlwaysInPictureUpdated: (always) => {
+            window.pointerAlwaysInPicture = always
         }
 
         onPointerInPictureUpdated: (maybe, found) => {
@@ -597,6 +758,7 @@ ApplicationWindow {
         running: false
         repeat: false
         onTriggered: {
+            window.pauseSystemKeys();
             window.isPointerLocked = false;
             window.wasUnlockedByHold = true;
             window.isEscHeld = false;
@@ -632,11 +794,7 @@ ApplicationWindow {
         interval: 150
         running: false
         repeat: false
-        onTriggered: {
-            if (window.isPointerLocked) {
-                bridge.setKeyboardGrab(true);
-            }
-        }
+        onTriggered: window.applySystemKeys()
     }
 
     // Streaming Player View Container
@@ -710,11 +868,15 @@ ApplicationWindow {
         // are captured and correctly mapped to the remote desktop.
         MouseArea {
             id: streamMouseArea
+            objectName: "streamMouseArea"
             anchors.fill: parent
             hoverEnabled: true
             acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
             // While HostCursor drives this item's cursor, keep the binding
             // constant so it never overwrites the pixmap cursor.
+            // (HostCursor sets a blank cursor while `hidden`; with "show
+            // local cursor" the binding itself is blank while the host's
+            // pointer is in the picture.)
             cursorShape: window.useHostHardwareCursor ? Qt.ArrowCursor
                 : (window.isPointerLocked || window.hideLocalCursor || window.shouldHidePredictedCursor()) ? Qt.BlankCursor : window.qtCursorShape(window.hostCursorKind)
 
@@ -733,6 +895,8 @@ ApplicationWindow {
 
             onPressed: (mouse) => {
                 rootContainer.forceActiveFocus();
+                // A click in the picture sends the system shortcuts again.
+                window.systemKeysPaused = false;
                 window.hostCursorMouseDown = true;
                 if (!window.isPointerLocked) {
                     var mapped = streamView.mapToItem(videoContainer, mouse.x, mouse.y);
@@ -767,6 +931,7 @@ ApplicationWindow {
         }
 
         HostCursor {
+            objectName: "hostCursor"
             target: streamMouseArea
             active: window.useHostHardwareCursor
             hidden: !window.localCursorVisible || window.shouldHidePredictedCursor()
@@ -779,6 +944,7 @@ ApplicationWindow {
 
         Image {
             id: hostCursorOverlay
+            objectName: "hostCursorOverlay"
             source: window.hasMatchingNativeCursor(window.hostCursorKind) ? window.nativeCursorSource : window.cursorSourceForKind(window.hostCursorKind)
             width: window.hasMatchingNativeCursor(window.hostCursorKind) ? window.nativeCursorWidth : 32
             height: window.hasMatchingNativeCursor(window.hostCursorKind) ? window.nativeCursorHeight : 32
@@ -801,6 +967,7 @@ ApplicationWindow {
     Shortcut {
         sequences: ["Ctrl+Alt+Escape", "Ctrl+Alt+Esc"]
         onActivated: {
+            window.pauseSystemKeys();
             window.isPointerLocked = false;
             menuBar.open();
         }
@@ -808,189 +975,88 @@ ApplicationWindow {
 
 
 
-    // Diagnostics Stats Overlay (Glassmorphism look)
+    // Stats overlay: what tells how the session is doing, and a line for
+    // each thing that is wrong (shown only then).
     Rectangle {
         id: statsOverlay
+        objectName: "statsOverlay"
         visible: window.showStats
         anchors.right: parent.right
         anchors.top: parent.top
-        
+
         // Push down smoothly when menu is active to avoid overlap
         anchors.topMargin: menuBar.active ? 72 : 16
         Behavior on anchors.topMargin {
             NumberAnimation { duration: 250; easing.type: Easing.OutCubic }
         }
-        
+
         anchors.rightMargin: 16
-        width: 280
-        height: 416
-        radius: 16
+        // Wide enough for "h264_nvenc · RTX 2060" beside its label.
+        width: 260
+        height: statsColumn.implicitHeight + 24
+        radius: 12
         color: Theme.live.surfaceA(0.6)
         border.color: Theme.live.ink(0.08)
         border.width: 1
 
+        readonly property color good: "#4ade80"
+        readonly property color warn: "#fb923c"
+        readonly property bool direct: window.connectionType === "P2P (Direct)"
+        // Rows: [label, value, colour ("" = normal), shown]
+        // Ping: to the agent and back, plus from the agent to the computer
+        // it shows and back when it shows another (the bridge adds them).
+        readonly property var rows: [
+            [I18n.t("Ping"), window.pingStatText(window.pingMs), "", true],
+            ["FPS", window.fps.toFixed(0), "", true],
+            [I18n.t("Bitrate"), (window.bitrateKbps / 1000).toFixed(1) + " Mbps", "", true],
+            ["Codec", window.activeCodec.toUpperCase(), "", true],
+            [I18n.t("Encode"), window.encodeStatText(window.activeEncoderName, window.activeEncoderHw, window.agentGpuInfo), "", true],
+            [I18n.t("Decode"), window.decodeStatText(window.activeDecodeBackend, window.decodeLatencyMs), "", true],
+            [I18n.t("Network"), statsOverlay.direct ? I18n.t("Direct") : window.connectionType, statsOverlay.direct ? statsOverlay.good : statsOverlay.warn, true],
+            [I18n.t("Packets lost"), String(window.packetsLost), statsOverlay.warn, window.packetsLost > 0],
+            [I18n.t("Late frames"), String(window.queueLagEvents), statsOverlay.warn, window.queueLagEvents > 0],
+            [I18n.t("Drawn by"), window.activePresentBackend, statsOverlay.warn, window.activePresentBackend.indexOf("CPU") !== -1],
+            [I18n.t("Fallback"), window.decodeFallbackReason, statsOverlay.warn, window.decodeFallbackReason !== "None" && window.decodeFallbackReason !== ""]
+        ]
+
         Column {
-            anchors.fill: parent
-            anchors.margins: 14
-            spacing: 8
+            id: statsColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 12
+            spacing: 6
 
-            Text {
-                text: "DIAGNOSTICS"
-                font.pixelSize: 10
-                font.bold: true
-                font.letterSpacing: 1.5
-                color: Theme.live.textMuted
-            }
-
-            Rectangle {
-                height: 1
-                color: Theme.live.ink(0.08)
-                anchors.left: parent.left
-                anchors.right: parent.right
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Ping (RTT)"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.pingMs.toFixed(1) + " ms"; color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Decode Latency"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.decodeLatencyMs.toFixed(1) + " ms"; color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "FPS"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.fps.toFixed(0); color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Bitrate"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.bitrateKbps.toFixed(0) + " Kbps"; color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Requested Codec"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.requestedCodec.toUpperCase(); color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Negotiated Codec"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.activeCodec.toUpperCase(); color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Decode"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.activeDecodeBackend; color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right; elide: Text.ElideLeft; width: 165; horizontalAlignment: Text.AlignRight }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Present"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.activePresentBackend; color: window.activePresentBackend.indexOf("CPU") === -1 ? "#4ade80" : "#fb923c"; font.pixelSize: 11; font.bold: true; anchors.right: parent.right; elide: Text.ElideLeft; width: 165; horizontalAlignment: Text.AlignRight }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "GPU Decode"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.gpuDecodeEnabled ? "Enabled" : "Disabled"; color: window.gpuDecodeEnabled ? "#4ade80" : "#fb923c"; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Fallback"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.decodeFallbackReason; color: window.decodeFallbackReason === "None" ? "#4ade80" : "#fb923c"; font.pixelSize: 11; font.bold: true; anchors.right: parent.right; elide: Text.ElideLeft; width: 165; horizontalAlignment: Text.AlignRight }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Encoder"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.activeEncoderName + " (" + window.activeEncoderHw + ")"; color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right; elide: Text.ElideLeft; width: 150; horizontalAlignment: Text.AlignRight }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "GPU"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.agentGpuInfo; color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right; elide: Text.ElideLeft; width: 170; horizontalAlignment: Text.AlignRight }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Host OS"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.agentHostOs; color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Requested Encoder"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.requestedEncoder; color: Theme.live.textStrong; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Input Protocol"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.activeInputProtocol.toUpperCase(); color: window.activeInputProtocol === "webtransport" ? "#4ade80" : Theme.live.accentFg; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Packet Loss"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.packetLossEvents + " events / " + window.packetsLost + " pkts"; color: window.packetLossEvents > 0 ? "#fb923c" : "#4ade80"; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Queue Lag"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.queueLagEvents + " events / max " + window.maxQueueLag; color: window.queueLagEvents > 0 ? "#fb923c" : "#4ade80"; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
-            }
-
-            Item {
-                height: 16
-                anchors.left: parent.left
-                anchors.right: parent.right
-                Text { text: "Network Path"; color: Theme.live.textMuted; font.pixelSize: 11; font.bold: true; anchors.left: parent.left }
-                Text { text: window.connectionType; color: window.connectionType === "P2P (Direct)" ? "#4ade80" : "#fb923c"; font.pixelSize: 11; font.bold: true; anchors.right: parent.right }
+            Repeater {
+                model: statsOverlay.rows.length
+                Item {
+                    readonly property var row: statsOverlay.rows[index]
+                    visible: row[3]
+                    height: visible ? 15 : 0
+                    anchors.left: parent ? parent.left : undefined
+                    anchors.right: parent ? parent.right : undefined
+                    Text {
+                        id: statLabel
+                        textFormat: Text.PlainText
+                        text: row[0]
+                        color: Theme.live.textMuted
+                        font.pixelSize: 11
+                        anchors.left: parent.left
+                    }
+                    Text {
+                        textFormat: Text.PlainText
+                        text: row[1]
+                        color: row[2] !== "" ? row[2] : Theme.live.textStrong
+                        font.pixelSize: 11
+                        font.bold: true
+                        anchors.right: parent.right
+                        width: parent.width - statLabel.width - 10
+                        horizontalAlignment: Text.AlignRight
+                        // What is too long loses its middle: the
+                        // encoder's name and the end of the GPU's stay.
+                        elide: Text.ElideMiddle
+                    }
+                }
             }
         }
     }
@@ -1061,7 +1127,13 @@ ApplicationWindow {
         isPointerLocked: window.isPointerLocked
         showStats: window.showStats
         hideLocalCursor: window.hideLocalCursor
-        
+        hostOs: window.agentHostOs
+
+        onSendKeysRequested: (keys) => {
+            window.sendKeyCombo(keys);
+            rootContainer.forceActiveFocus();
+        }
+
         onSendFilesRequested: {
             if (!ViewPrefs.fileTransfer) {
                 shareToast.text = I18n.t("File transfer is turned off in Settings");
@@ -1203,6 +1275,7 @@ ApplicationWindow {
         Behavior on opacity { NumberAnimation { duration: 200 } }
         Text {
             id: shareToastText
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             width: parent.width - 32
             horizontalAlignment: Text.AlignHCenter
@@ -1311,6 +1384,7 @@ ApplicationWindow {
             spacing: 12
             
             Text {
+                textFormat: Text.PlainText
                 text: "A new version of Lunaris Client (" + window.latestVersion + ") is available!"
                 color: Theme.live.textStrong
                 font.pixelSize: 13
@@ -1405,6 +1479,7 @@ ApplicationWindow {
         function onClipboardSyncChanged() { window.applySharing(); }
         function onFileTransferChanged() { window.applySharing(); }
         function onGamepadChanged() { window.applySharing(); }
+        function onSystemKeysChanged() { bridge.saveStore("view_prefs", ViewPrefs.toJson()); }
     }
     function applySharing() {
         bridge.setShareOptions(ViewPrefs.clipboardSync, ViewPrefs.fileTransfer);
@@ -1521,6 +1596,8 @@ ApplicationWindow {
                     }
                     Text {
                         Layout.fillWidth: true
+                        // (Who asks is what the other side says of itself.)
+                        textFormat: Text.PlainText
                         text: approvalDialog.question ? approvalDialog.question.requester : ""
                         color: Theme.text
                         font.pixelSize: 13
@@ -1597,6 +1674,7 @@ ApplicationWindow {
             }
             Text {
                 Layout.fillWidth: true
+                textFormat: Text.PlainText
                 text: I18n.t("A link wants to connect this app to %1. Only continue if you opened this link yourself.").arg(linkDialog.server)
                 color: Theme.text
                 font.pixelSize: 13
@@ -1604,6 +1682,7 @@ ApplicationWindow {
             }
             Text {
                 Layout.fillWidth: true
+                textFormat: Text.PlainText
                 text: I18n.t("Computer: %1").arg(linkDialog.computer)
                 color: Theme.textMuted
                 font.pixelSize: 12

@@ -167,6 +167,32 @@ jobs:
           name: linux-packages-${{ matrix.format }}
           path: dist/*
 
+  # The .deb is built on Ubuntu 24.04 and has to install and start on the later
+  # releases too, where packages are named differently (libqt6gui6t64 there is
+  # libqt6gui6 on Ubuntu 26.04 and Debian 13) and Qt is newer. Each release
+  # installs the built packages in a bare container and starts both apps.
+  test-linux-packages:
+    name: Install .deb on ${{ matrix.image }}
+    needs: build-linux-packages
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['ubuntu:24.04', 'ubuntu:26.04', 'debian:13']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-packages-deb
+          path: dist
+
+      - name: Install and start
+        run: bash scripts/packaging/linux/smoke-deb.sh dist
+
   # The agent and the client AppImages, built together in one Ubuntu 22.04
   # container (Qt 6.8 + a trimmed static FFmpeg, see Containerfile.appimage):
   # runs on glibc >= 2.35, no distro FFmpeg or Qt is bundled. build-appimages.sh
@@ -473,7 +499,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build-server-linux, build-server-docker, build-linux-packages, build-agent-appimage, build-windows]
+    needs: [build-server-linux, build-server-docker, build-linux-packages, test-linux-packages, build-agent-appimage, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:

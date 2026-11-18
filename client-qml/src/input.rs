@@ -91,36 +91,160 @@ pub struct InputSenders {
     pub stream_height: u32,
 }
 
-pub fn handle_key_event(key: i32, modifiers_mask: i32, is_down: bool, senders: &InputSenders) {
-    let vk = map_qt_key_to_vk(key, modifiers_mask);
-    if vk > 0 {
-        let mut modifiers = 0u8;
-        // Qt modifiers mapping:
-        // ShiftModifier = 0x02000000
-        // ControlModifier = 0x04000000
-        // AltModifier = 0x08000000
-        // MetaModifier = 0x10000000
-        if (modifiers_mask & 0x02000000) != 0 {
-            modifiers |= 1;
+/// The key at a physical position, from Qt's `nativeScanCode`. On Linux
+/// (xcb and Wayland) that is the kernel's key code plus 8, so the position
+/// is known whatever layout this computer has, which is what the web client
+/// sends from `KeyboardEvent.code`. The table is the agent's own
+/// (`connector/keys.rs`, turned round by `connector/sunshine/keymap.rs`):
+/// Shift, Control and Alt come with their side, the keypad's Enter is Return.
+/// 0 when the position is not known (other systems: Qt's code is used then).
+///
+/// The three volume keys are left to this computer: a Windows host presses
+/// keys by `MapVirtualKeyW(vk)` without the extended flag for them
+/// (lunaris-media `keyboard_key`, `vk_is_extended`), which are the scan
+/// codes of other keys.
+pub fn map_native_scan_to_vk(native_scan_code: u32) -> u16 {
+    #[cfg(target_os = "linux")]
+    {
+        if native_scan_code < 9 {
+            return 0;
         }
-        if (modifiers_mask & 0x04000000) != 0 {
-            modifiers |= 2;
+        match agent::connector::sunshine::keymap::vk_of_position(native_scan_code - 8) {
+            Some(0xAD..=0xAF) | None => 0,
+            Some(vk) => vk as u16,
         }
-        if (modifiers_mask & 0x08000000) != 0 {
-            modifiers |= 4;
-        }
-        if (modifiers_mask & 0x10000000) != 0 {
-            modifiers |= 8;
-        }
-
-        let mut buf = vec![0u8; 5];
-        buf[0] = 0; // Type 0: Key Event
-        buf[1] = if is_down { 1 } else { 0 };
-        buf[2] = modifiers;
-        buf[3] = (vk >> 8) as u8;
-        buf[4] = (vk & 0xFF) as u8;
-        let _ = senders.keyboard.send(Bytes::from(buf));
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = native_scan_code;
+        0
+    }
+}
+
+/// Alt, with or without a side (VK_MENU, VK_LMENU, VK_RMENU).
+fn is_alt(vk: u16) -> bool {
+    matches!(vk, 0x12 | 0xA4 | 0xA5)
+}
+
+/// The keys this viewer has pressed on the remote computer and not let go.
+/// They are let go there when the viewer stops getting the keyboard (another
+/// window is activated, the menu opens, the stream ends), because the
+/// releases then never arrive here: moonlight-qt does the same with
+/// `m_KeysDown` and `raiseAllKeys()` (app/streaming/input/keyboard.cpp
+/// 521-537, called from input.cpp notifyFocusLost 273-285).
+#[derive(Default)]
+pub struct PressedKeys {
+    down: Vec<u16>,
+}
+
+impl PressedKeys {
+    /// Notes a key event; false when it is not to be sent.
+    ///
+    /// A release that is part of the key repeating is not sent: Qt reports a
+    /// held key as release and press pairs, which would let the key go on
+    /// the remote computer many times a second. The repeated presses are
+    /// sent, as the web client sends its repeated `keydown`.
+    pub fn note(&mut self, vk: u16, is_down: bool, is_auto_repeat: bool) -> bool {
+        if is_down {
+            if !self.down.contains(&vk) {
+                self.down.push(vk);
+            }
+            true
+        } else if is_auto_repeat {
+            false
+        } else {
+            self.down.retain(|k| *k != vk);
+            true
+        }
+    }
+
+    /// The events that let every pressed key go, last pressed first, as
+    /// (virtual key, is_down). After Alt, one more press and release of it:
+    /// RustDesk does so (src/keyboard.rs release_remote_keys_for_events,
+    /// 791-807: "the controlled side may hold the alt state, if local window
+    /// is switched by [Alt + Tab]") - a lone Alt opens the window's menu on
+    /// Windows, the second one closes it.
+    pub fn release_all(&mut self) -> Vec<(u16, bool)> {
+        let mut events = Vec::new();
+        for vk in std::mem::take(&mut self.down).into_iter().rev() {
+            events.push((vk, false));
+            if is_alt(vk) {
+                events.push((vk, true));
+                events.push((vk, false));
+            }
+        }
+        events
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.down.is_empty()
+    }
+}
+
+static PRESSED_KEYS: std::sync::Mutex<PressedKeys> = std::sync::Mutex::new(PressedKeys { down: Vec::new() });
+
+/// The modifier bits of a key packet from Qt's modifiers
+/// (ShiftModifier 0x02000000, ControlModifier 0x04000000, AltModifier
+/// 0x08000000, MetaModifier 0x10000000).
+fn packet_modifiers(modifiers_mask: i32) -> u8 {
+    let mut modifiers = 0u8;
+    if (modifiers_mask & 0x02000000) != 0 {
+        modifiers |= 1;
+    }
+    if (modifiers_mask & 0x04000000) != 0 {
+        modifiers |= 2;
+    }
+    if (modifiers_mask & 0x08000000) != 0 {
+        modifiers |= 4;
+    }
+    if (modifiers_mask & 0x10000000) != 0 {
+        modifiers |= 8;
+    }
+    modifiers
+}
+
+/// Type 0 key packet: [0, down, modifiers, vk (u16 big-endian)].
+fn key_packet(vk: u16, is_down: bool, modifiers: u8) -> Bytes {
+    Bytes::from(vec![0u8, if is_down { 1 } else { 0 }, modifiers, (vk >> 8) as u8, (vk & 0xFF) as u8])
+}
+
+pub fn handle_key_event(key: i32, modifiers_mask: i32, is_down: bool, senders: &InputSenders) {
+    handle_key_event_at(key, modifiers_mask, 0, is_down, false, senders);
+}
+
+/// A key event of the stream view. `native_scan_code` names the key's
+/// position when the window system gives it ([`map_native_scan_to_vk`]);
+/// Qt's key code is used otherwise.
+pub fn handle_key_event_at(
+    key: i32,
+    modifiers_mask: i32,
+    native_scan_code: u32,
+    is_down: bool,
+    is_auto_repeat: bool,
+    senders: &InputSenders,
+) {
+    let mut vk = map_native_scan_to_vk(native_scan_code);
+    if vk == 0 {
+        vk = map_qt_key_to_vk(key, modifiers_mask);
+    }
+    if vk > 0 {
+        if !PRESSED_KEYS.lock().unwrap().note(vk, is_down, is_auto_repeat) {
+            return;
+        }
+        let _ = senders.keyboard.send(key_packet(vk, is_down, packet_modifiers(modifiers_mask)));
+    }
+}
+
+/// Lets go, on the remote computer, of every key this viewer holds there.
+pub fn release_all_keys(senders: &InputSenders) {
+    for (vk, is_down) in PRESSED_KEYS.lock().unwrap().release_all() {
+        let _ = senders.keyboard.send(key_packet(vk, is_down, 0));
+    }
+}
+
+/// The stream ended: nothing is held any more (there is nowhere to send to).
+pub fn forget_pressed_keys() {
+    PRESSED_KEYS.lock().unwrap().release_all();
 }
 
 pub fn get_client_timestamp() -> u32 {
@@ -215,7 +339,62 @@ pub fn handle_mouse_wheel(angle_x: i32, angle_y: i32, senders: &InputSenders) {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_qt_key_to_vk, take_wheel_notches};
+    use super::{map_native_scan_to_vk, map_qt_key_to_vk, take_wheel_notches, PressedKeys};
+
+    #[test]
+    fn held_keys_are_let_go_when_the_keyboard_is_lost() {
+        let mut keys = PressedKeys::default();
+        assert!(keys.note(0xA2, true, false)); // Ctrl
+        assert!(keys.note(0x43, true, false)); // C
+        assert!(keys.note(0x43, false, false));
+        assert!(keys.note(0x5B, true, false)); // Win
+        assert_eq!(keys.release_all(), vec![(0x5B, false), (0xA2, false)]);
+        assert!(keys.is_empty());
+        assert!(keys.release_all().is_empty());
+    }
+
+    /// Alt+Tab taken by this computer: Alt was sent, its release never comes.
+    #[test]
+    fn alt_is_let_go_and_tapped_once_more() {
+        let mut keys = PressedKeys::default();
+        keys.note(0xA4, true, false);
+        assert_eq!(keys.release_all(), vec![(0xA4, false), (0xA4, true), (0xA4, false)]);
+    }
+
+    #[test]
+    fn a_repeating_key_stays_down() {
+        let mut keys = PressedKeys::default();
+        assert!(keys.note(0x57, true, false));
+        // Qt: release and press pairs while the key is held.
+        assert!(!keys.note(0x57, false, true));
+        assert!(keys.note(0x57, true, true));
+        assert!(!keys.is_empty());
+        assert!(keys.note(0x57, false, false));
+        assert!(keys.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn positions_from_the_native_scan_code() {
+        // The kernel's key code plus 8.
+        assert_eq!(map_native_scan_to_vk(30 + 8), 0x41); // KEY_A
+        assert_eq!(map_native_scan_to_vk(16 + 8), 0x51); // KEY_Q, whatever the layout types there
+        assert_eq!(map_native_scan_to_vk(42 + 8), 0xA0); // left Shift
+        assert_eq!(map_native_scan_to_vk(54 + 8), 0xA1); // right Shift
+        assert_eq!(map_native_scan_to_vk(97 + 8), 0xA3); // right Ctrl
+        assert_eq!(map_native_scan_to_vk(100 + 8), 0xA5); // right Alt (AltGr)
+        assert_eq!(map_native_scan_to_vk(125 + 8), 0x5B); // Super
+        assert_eq!(map_native_scan_to_vk(127 + 8), 0x5D); // menu key
+        assert_eq!(map_native_scan_to_vk(99 + 8), 0x2C); // Print Screen
+        assert_eq!(map_native_scan_to_vk(96 + 8), 0x0D); // keypad Enter
+        assert_eq!(map_native_scan_to_vk(86 + 8), 0xE2); // the key beside left Shift (ISO)
+        assert_eq!(map_native_scan_to_vk(15 + 8), 0x09); // Tab
+        // Not sent: the volume keys, and no position at all.
+        assert_eq!(map_native_scan_to_vk(115 + 8), 0);
+        assert_eq!(map_native_scan_to_vk(0), 0);
+        assert_eq!(map_native_scan_to_vk(8), 0);
+        assert_eq!(map_native_scan_to_vk(5000), 0);
+    }
 
     #[test]
     fn touchpad_deltas_add_up_to_notches() {

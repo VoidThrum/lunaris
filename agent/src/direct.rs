@@ -828,6 +828,8 @@ async fn serve_link(ws: Ws, config: Arc<DirectConfig>, conn: Conn) {
     });
     // The other computers this one shows, and the kinds it can show.
     let _ = tx.send(crate::connector::sources::announcement(conn.trusted));
+    // Again when a set-up (a pairing) has added one, whoever still asks about it.
+    let _announcing = crate::connector::sources::announce_changes(tx.clone(), conn.trusted);
     let conn = Arc::new(conn);
     // Client connections (on that server) the person here accepted, per kind.
     let accepted: Arc<Mutex<HashMap<String, Kinds>>> = Arc::default();
@@ -850,20 +852,14 @@ async fn serve_link(ws: Ws, config: Arc<DirectConfig>, conn: Conn) {
             Ok(ServerToAgentMessage::ChangeSource { request_id, change, requester }) => {
                 // Only a server that proved the password may change the
                 // sources; one whose connections are accepted here one by
-                // one may not.
-                let result = if conn.trusted {
-                    info!("Sources: {:?} asked for by {} through server link {}", change, requester.as_deref().unwrap_or("someone"), link_id);
-                    crate::connector::sources::apply(&change)
-                } else {
-                    Err(crate::connector::sources::NOT_MANAGEABLE.to_string())
-                };
-                let (id, error) = match result {
-                    Ok(id) => (Some(id), None),
-                    Err(error) => (None, Some(error)),
-                };
-                // The new list first: the server has it when the answer is out.
-                let _ = tx.send(crate::connector::sources::announcement(conn.trusted));
-                let _ = tx.send(AgentMessage::SourceChanged { request_id, id, error });
+                // one may not. Adding can wait a few seconds for a set-up's
+                // first step, so not on this loop.
+                let (tx, trusted, via) = (tx.clone(), conn.trusted, format!("server link {}", link_id));
+                tokio::task::spawn_blocking(move || {
+                    for message in crate::connector::sources::reply(request_id, &change, requester.as_deref(), &via, trusted) {
+                        let _ = tx.send(message);
+                    }
+                });
                 continue;
             }
             Err(e) => {

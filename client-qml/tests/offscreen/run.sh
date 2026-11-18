@@ -14,6 +14,8 @@ export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent
 "$runner" -input "$here/tst_computers.qml"
 "$runner" -import "$here/stubs" -input "$here/tst_source_session.qml"
 "$runner" -import "$here/stubs" -input "$here/tst_pointer_in_picture.qml"
+"$runner" -import "$here/stubs" -input "$here/tst_keyboard.qml"
+"$runner" -import "$here/stubs" -input "$here/tst_stats_overlay.qml"
 if [ -n "$1" ]; then
     mkdir -p "$1"
     mv "$here"/out/*.png "$1"/

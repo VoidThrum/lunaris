@@ -28,3 +28,7 @@ AdminGroups 1.0 AdminGroups.qml
 AdminTurnServers 1.0 AdminTurnServers.qml
 AddComputerDialog 1.0 AddComputerDialog.qml
 TypeBadge 1.0 TypeBadge.qml
+OptionCard 1.0 OptionCard.qml
+MethodChips 1.0 MethodChips.qml
+TypeLogo 1.0 TypeLogo.qml
+TypeTile 1.0 TypeTile.qml

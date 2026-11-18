@@ -56,7 +56,7 @@ cp target/release/connector-template connectors/template/connector.json \
     { "key": "file", "label": "IVF file", "kind": "text" },
     { "key": "fps", "label": "Frames a second", "kind": "text", "default": "30" }
   ],
-  "capabilities": { "video": ["vp8", "vp9", "av1"], "audio": true, "input": true, "clipboard": true, "cursor": true }
+  "capabilities": { "video": ["vp8", "vp9", "av1"], "audio": true, "input": true, "clipboard": true, "cursor": true, "setup": true }
 }
 ```
 
@@ -64,11 +64,15 @@ cp target/release/connector-template connectors/template/connector.json \
 |---|---|
 | `id` | The same as the folder's name. Targets name the connector by it. |
 | `name` | What a person sees. |
+| `note` | Optional: one or two plain sentences shown under the Type choice of "Add computer", for what the person must know before adding one ("X must already be installed and running on that computer."). In English. |
 | `command` | The program: a file **inside the connector's folder** (a path that leads out of it is refused). |
 | `args` | Arguments for it, optional. |
-| `fields` | What a target is described by. `kind` is `text`, `port` or `secret`; `default` and `required` are optional. A `secret` is never shown or written to a log. |
+| `fields` | What a target is described by. `kind` is `text`, `port`, `secret` or `choice`; `default` and `required` are optional. A `secret` is never shown or written to a log. |
+| (a `choice` field) | Has `"options": [{"value": "picture", "label": "In the picture"}, ...]`: the person presses one of them instead of typing, and its `value` is what you get in `target`. A client from before choices shows a text box in its place, so take the same words typed by hand, and say what is wrong with any other in your error. The agent does not check the value against the options. |
+| (a field's `key`) | Not `id`, `name`, `connector` or `group`: those are the agent's own words for a target, and a field called so is left out of the form's values. A field with the key `host` or `address` is taken for where the computer is: when a computer is added at an address that another of the agent's computers (of any kind) has, the two are shown as one computer with a way to connect for each (the agent gives them a common `group`, an opaque word; the address itself still never leaves the agent). |
 | `capabilities.video` | The codecs the connector can deliver: `h264`, `h265`, `vp8`, `vp9`, `av1`. |
 | `capabilities.audio`, `input`, `clipboard`, `cursor` | What else it does. |
+| `capabilities.setup` | Adding a computer has a set-up of its own, such as a pairing (see "Set-up" below). Left out or `false`: the connector is never started for one. |
 | `capabilities.files` | The computer's files can be browsed and copied (see "Files" below). Left out or `false`: the connector is never started for files, and the viewer is told "This kind of computer has no file transfer". |
 
 A target is the connector's id and a value for each field:
@@ -113,7 +117,7 @@ agent can add messages without breaking a connector.
 |---|---|---|---|
 | 1 | agent → connector | `{"type":"hello","version":1}` | |
 | 2 | connector → agent | `{"type":"hello","version":1}` | Within 10 s. The agent goes on only when the versions are the same. |
-| 3 | agent → connector | `{"type":"connect","target":{...},"viewer":{"codecs":["vp8","h264"],"fps":60}}` | `target` is the connector's id and the values of its fields. `viewer.codecs` is what the viewer can decode, the preferred first. |
+| 3 | agent → connector | `{"type":"connect","target":{...},"viewer":{"codecs":["vp8","h264"],"fps":60}}` | `target` is the connector's id and the values of its fields (and what its set-up returned, if it has one). `viewer.codecs` is what the viewer can decode, the preferred first. `viewer.width`, `viewer.height` (pixels) and `viewer.bitrate_kbps` may be there too: the size and the bitrate the viewer asked for, 0 or absent = no wish (for a computer that sends in the size and at the rate a client names; ignore them otherwise). |
 
 After `connect` the connector logs in to the computer and sends events. If
 it cannot (wrong password, not reachable, no codec in common), it sends
@@ -127,9 +131,11 @@ it cannot (wrong password, not reachable, no codec in common), it sends
 | `{"type":"audio","channels":2}` | one Opus packet | 48 kHz. |
 | `{"type":"cursor_shape","width":16,"height":16,"hot_x":0,"hot_y":0}` | `width * height * 4` bytes, RGBA | |
 | `{"type":"cursor_position","x":10,"y":20,"visible":true}` | – | In pixels of the display shown. |
-| `{"type":"cursor_embedded","embedded":true}` | – | The pointer is part of the picture now (`true`), so the viewer must not draw its own; or no longer (`false`). |
+| `{"type":"cursor_embedded","embedded":true}` | – | The pointer is part of the picture now (`true`), so the viewer must not draw its own; or no longer (`false`). For a moment such as a window being moved: viewers honour it for a `windows` computer (`platform`) while a mouse button is held. A pointer that is in the picture all the time: `cursor_always_embedded`. |
 | `{"type":"cursor_maybe_embedded","maybe":true}` | – | The pointer *may* be part of the picture now (the connector cannot know, only that it is a moment in which it would be, such as a window being moved). The viewer keeps its own pointer, looks for the computer's in the picture and hides its own only when it finds it. `false`: the moment is over. Use `cursor_embedded` when you know. |
+| `{"type":"cursor_always_embedded"}` | – | The pointer is part of the picture for the whole session and you send no `cursor_shape` or `cursor_position` (the other computer always draws its pointer into what it sends). Once, at the start. The viewer then shows no pointer at all over the picture, neither one it draws nor its own system's: the only pointer is the one in the picture. Unlike `cursor_embedded` it holds whatever the kind of computer and whether or not a button is held. An agent from before this message logs "a message that is not understood" and goes on; its viewers keep their own pointer. |
 | `{"type":"platform","os":"windows"}` | – | What kind of computer it is: `windows`, `linux`, `macos`, `android`. Once, at the start. |
+| `{"type":"latency","ms":12}` | – | The delay between your connector and the other computer, there and back (a round trip), in milliseconds, as your protocol measures it; if it only knows one way, send twice that. A JSON number, whole (`12`) or with a fraction (`0.4`) when you know it that finely; not negative. When it is known and again when it changes, about once a second at most. The viewer adds it to its own round trip to the agent and shows the sum as "Ping". Optional: never sent = the viewer shows only its round trip to the agent. An agent from before this message logs "a message that is not understood" and goes on. |
 | `{"type":"clipboard"}` | the text, UTF-8 | The other computer's clipboard changed. Text of at most 1 MiB; the agent does not pass on the same text twice in a row, nor text it has just sent itself. |
 | `{"type":"clipboard_error"}` | the reason, UTF-8 | The clipboard cannot be shared (the other computer does not allow it, the text is too large). Shown to the viewer; say it once, not for every attempt. |
 | `{"type":"displays","displays":[{"name":"1","width":1920,"height":1080}],"current":0}` | – | At the start, and when the list, a size or the display shown changes. |
@@ -196,6 +202,42 @@ This template has no files: its manifest does not say `files`, so the agent
 never asks; if it is sent `open_files` all the same it answers `closed`
 with "This kind of computer has no file transfer".
 
+## Set-up (pairing)
+
+Some computers must be paired with once before they can be shown: the
+connector makes a PIN, the person types it at the other computer, and the
+connector gets a certificate or a key to keep. A connector that says
+`"setup": true` in its capabilities is asked to do this once, when a
+computer of its kind is added (never for a connector that does not say so,
+and never again for the same computer). It is a run of its own: the agent
+starts the program, says `hello` as above, and then sends `setup` in the
+place of `connect`:
+
+| # | Direction | Header | |
+|---|---|---|---|
+| 3 | agent → connector | `{"type":"setup","target":{...}}` | The target as the person filled it in. |
+| 4 | connector → agent | `{"type":"setup_step","message":"Enter this PIN at the other computer.","code":"1234"}` | Zero or more times: something to show the person now. `message` is shown as it is (write it in plain English); `code` is optional and shown large. Each step replaces the one before. |
+| 5 | connector → agent | `{"type":"setup_done","values":{"client_key":"...","server_cert":"..."}}` | The end: the computer is added. `values` (text by name; may be empty or left out) is kept with the target in the agent's config file and is part of `target` in every later `connect` and `open_files`. It is never shown to anyone, never sent to a server or a viewer, and stays when the person edits the computer. The names `id`, `name`, `connector` and `group` are not kept. A value under the name of one of the form's fields replaces what was typed. |
+| 5 | connector → agent | `{"type":"closed","reason":"Wrong PIN"}` | The end: nothing is added, and the person is shown the reason. |
+
+The person sees the first step when it comes within 3 seconds of adding
+(otherwise "Getting ready..." until it comes). A set-up that is not over
+after 5 minutes is given up on ("Pairing was not completed in time"), and
+so is one whose window the person closes: the agent stops the program, so
+do not rely on a goodbye. A target that needs no set-up answers
+`setup_done` at once.
+
+**Never write the code, a key or a certificate to standard error.**
+
+This template has a pretend one, to try the screens with: add a computer
+with the field "Demo pairing" set to `1`. It shows the PIN `0000` and waits
+until a file named `paired` exists in the connector's folder (`touch
+~/.config/lunaris-agent/connectors/template/paired`), then returns two
+values; a file named `refused` makes it fail with "The other computer
+refused the pairing". With the environment variable
+`LUNARIS_TEMPLATE_PAIR_SECONDS=5` in the agent's environment it succeeds by
+itself after that many seconds. Remove the file again before the next try.
+
 ## What this template does with them
 
 - `video`: the frames of the IVF file named by the target's `file`
@@ -211,6 +253,8 @@ with "This kind of computer has no file transfer".
 - `clipboard` and `pointer_move` are echoed back as `clipboard` and
   `cursor_position`, to show they arrived. The other commands are written
   to standard error by kind (never which key or what text).
+
+- `setup`: the pretend pairing described under "Set-up" above.
 
 `agent/tests/connector_template.rs` runs the program through the agent's
 adapter (`agent/src/connector/process.rs`) and checks each of these. This

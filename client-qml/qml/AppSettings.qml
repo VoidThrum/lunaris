@@ -309,6 +309,7 @@ Rectangle {
                 }
                 Text {
                     visible: homeView && homeView.hostError !== ""
+                    textFormat: Text.PlainText
                     text: homeView ? homeView.hostError : ""
                     color: Theme.danger
                     font.pixelSize: 12
@@ -421,7 +422,7 @@ Rectangle {
                         }
                     }
                 }
-                Text { visible: settings.portError !== ""; text: settings.portError; color: Theme.danger; font.pixelSize: 12 }
+                Text { textFormat: Text.PlainText; visible: settings.portError !== ""; text: settings.portError; color: Theme.danger; font.pixelSize: 12 }
             }
 
             Card {
@@ -484,7 +485,7 @@ Rectangle {
                         }
                     }
                 }
-                Text { visible: rustdeskCard.error !== ""; text: rustdeskCard.error; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                Text { textFormat: Text.PlainText; visible: rustdeskCard.error !== ""; text: rustdeskCard.error; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             }
 
             LocalServerCard {

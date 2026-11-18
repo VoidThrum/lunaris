@@ -166,7 +166,7 @@ Section "Install"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "DisplayIcon" '"$INSTDIR\client-desktop.exe"'
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "Publisher" "Lunaris"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "DisplayVersion" "0.5.4"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "DisplayVersion" "0.6.1"
 SectionEnd
 
 Section "Uninstall"
@@ -174,6 +174,10 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\Lunaris Client\Uninstall Lunaris Client.lnk"
   RMDir "$SMPROGRAMS\Lunaris Client"
   Delete "$DESKTOP\Lunaris Client.lnk"
+
+  # Starting with Windows: the scheduled task (and the Run entry of older versions)
+  nsExec::Exec 'schtasks /Delete /TN "LunarisClient" /F'
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "LunarisClient"
 
   # Delete registry keys
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client"

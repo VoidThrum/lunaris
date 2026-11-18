@@ -42,6 +42,40 @@ fn desktop_exec_quote(path: &str) -> String {
     out
 }
 
+/// The app's icon, for a desktop entry of an app that no package installed.
+#[cfg(target_os = "linux")]
+const APP_ICON: &[u8] = include_bytes!("../qml/icon.png");
+
+/// The desktop entry a package installs (scripts/packaging/linux/stage.sh).
+#[cfg(target_os = "linux")]
+const PACKAGED_ENTRY: &str = "/usr/share/applications/lunaris-client.desktop";
+
+/// Whether this program is the one a package installed: it runs from /usr
+/// and the package's desktop entry is there.
+#[cfg(any(target_os = "linux", test))]
+fn installed_by_a_package(exe_path: &str, packaged_entry_exists: bool) -> bool {
+    packaged_entry_exists && exe_path.starts_with("/usr/")
+}
+
+/// The user's own desktop entry for a program run from a folder. The name
+/// of the icon is the one the packages use, so a theme's icon is found too.
+#[cfg(any(target_os = "linux", test))]
+fn desktop_entry(exe_path: &str) -> String {
+    format!(
+        r#"[Desktop Entry]
+Type=Application
+Name=Lunaris Client
+Comment=Connect to computers running the Lunaris agent
+Exec={} %u
+Icon=lunaris-client
+Terminal=false
+MimeType=x-scheme-handler/lunaris;
+Categories=Network;RemoteAccess;
+"#,
+        desktop_exec_quote(exe_path)
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn register_linux(exe_path: &str) -> Result<(), anyhow::Error> {
     let home = std::env::var("HOME")?;
@@ -61,20 +95,27 @@ fn register_linux(exe_path: &str) -> Result<(), anyhow::Error> {
     }
 
     let dest_file = dest_dir.join("lunaris-client.desktop");
-    let content = format!(
-        r#"[Desktop Entry]
-Type=Application
-Name=Lunaris Client
-Exec={} %u
-Terminal=false
-MimeType=x-scheme-handler/lunaris;
-Categories=Network;
-"#,
-        desktop_exec_quote(exe_path)
-    );
-
-    std::fs::write(&dest_file, content)?;
-    info!("Registered desktop entry at {:?}", dest_file);
+    if installed_by_a_package(exe_path, std::path::Path::new(PACKAGED_ENTRY).exists()) {
+        // The package's own entry (with its icon) does this job. An entry
+        // here, left by an earlier run, has the same name and would hide it:
+        // that is how an installed app came to show no icon.
+        if dest_file.exists() {
+            let _ = std::fs::remove_file(&dest_file);
+            info!("Removed {:?}: the installed package has its own entry", dest_file);
+        }
+    } else {
+        // Run from a folder (a build, an AppImage): the entry and its icon
+        // are the user's own.
+        let icon_file = std::path::Path::new(&home).join(".local/share/icons/hicolor/256x256/apps/lunaris-client.png");
+        if std::fs::metadata(&icon_file).map(|m| m.len() != APP_ICON.len() as u64).unwrap_or(true) {
+            if let Some(dir) = icon_file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&icon_file, APP_ICON);
+        }
+        std::fs::write(&dest_file, desktop_entry(exe_path))?;
+        info!("Registered desktop entry at {:?}", dest_file);
+    }
 
     // Register mimetype handler via xdg-mime
     let status = std::process::Command::new("xdg-mime")
@@ -143,7 +184,23 @@ fn register_windows(exe_path: &str) -> Result<(), anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::desktop_exec_quote;
+    use super::{desktop_entry, desktop_exec_quote, installed_by_a_package};
+
+    #[test]
+    fn a_program_run_from_a_folder_gets_an_entry_with_the_icon() {
+        let entry = desktop_entry("/home/a b/lunaris/client-desktop");
+        assert!(entry.contains("\nIcon=lunaris-client\n"));
+        assert!(entry.contains("\nExec=\"/home/a b/lunaris/client-desktop\" %u\n"));
+        assert!(entry.contains("\nMimeType=x-scheme-handler/lunaris;\n"));
+    }
+
+    #[test]
+    fn the_packaged_app_leaves_the_entry_to_its_package() {
+        assert!(installed_by_a_package("/usr/bin/lunaris-client", true));
+        assert!(!installed_by_a_package("/usr/bin/lunaris-client", false));
+        assert!(!installed_by_a_package("/home/a/target/release/client-desktop", true));
+        assert!(!installed_by_a_package("/tmp/.mount_Lunaris/usr/bin/lunaris-client", true));
+    }
 
     #[test]
     fn exec_path_is_quoted() {

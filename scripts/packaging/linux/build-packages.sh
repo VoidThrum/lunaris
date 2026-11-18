@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Builds the Linux distro packages inside a matching container:
 #   deb   ubuntu:24.04   → lunaris-{agent,client}_<ver>_amd64.deb (Ubuntu 24.04+, Debian 13+)
+#                          one package for all of them: built on the oldest release, checked
+#                          on each by smoke-deb.sh (run in ubuntu:24.04, ubuntu:26.04, debian:13)
 #   rpm   fedora:44      → lunaris-{agent,client}-<ver>-1.fcNN.x86_64.rpm
 #   arch  archlinux      → lunaris-{agent,client}-<ver>-1-x86_64.pkg.tar.zst (makepkg)
 #

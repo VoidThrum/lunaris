@@ -7,6 +7,8 @@ import { AdminUsers } from './components/AdminUsers';
 import { AdminGroups } from './components/AdminGroups';
 import { AdminTurnServers } from './components/AdminTurnServers';
 import FileManager from './components/FileManager';
+import { buildCards, currentMethod, layoutFields, loadMethods, newGroup, rememberMethod, typeShortName, type Card, type Method } from './computerCards';
+import { typeLogo } from './typeLogos';
 import './App.css';
 
 interface Host {
@@ -24,20 +26,40 @@ interface Host {
   needs_approval?: boolean;
 }
 
-/** One field of a connector's form ("kind": text, port or secret). */
+/** One field of a connector's form ("kind": text, port, secret, or choice:
+ *  one of `options`). */
 interface ConnectorField {
   key: string;
   label: string;
   kind: string;
   default?: string;
   required?: boolean;
+  options?: { value: string; label: string }[];
 }
+
+/** What a choice field is chosen from, when it says so in a way that can be shown. */
+const choicesOf = (field: ConnectorField): { value: string; label: string }[] =>
+  (field.kind === 'choice' && Array.isArray(field.options) ? field.options : [])
+    .filter(o => o && typeof o.value === 'string' && typeof o.label === 'string');
+
+/** The mark of a type of computer: its logo when it has one, else its first
+ *  letter. `id` is "lunaris" or a connector's id; `name` is for the letter. */
+const TypeMark = ({ id, name, small }: { id: string; name: string; small?: boolean }) => {
+  const logo = typeLogo(id);
+  return (
+    <span className={`type-mark${small ? ' small' : ''}${logo ? ' logo' : ''}`} aria-hidden="true">
+      {logo ? <img src={logo} alt="" draggable={false} /> : (name.trim()[0] || '?').toUpperCase()}
+    </span>
+  );
+};
 
 /** A type of computer other than Lunaris; its form is these fields. */
 interface Connector {
   id: string;
   name: string;
   fields: ConnectorField[];
+  /** One or two sentences for the person, under the Type choice. */
+  note?: string;
 }
 
 /** A Lunaris computer that can show other computers, and through what. */
@@ -56,7 +78,41 @@ interface Source {
   connector: string;
   connector_name: string;
   online: boolean;
+  /** What its connector can do. Not there when the server or the Lunaris
+   *  computer is from before this: then what was always offered is. */
+  capabilities?: { files?: boolean; clipboard?: boolean; audio?: boolean; input?: boolean };
+  /** Which computer it is, when that computer is listed in other ways too
+   *  (computerCards.ts). Not there when it has none. */
+  group?: string;
 }
+
+/** A computer's card and one of its ways to connect (computerCards.ts). */
+type ComputerCard = Card<Host, Source>;
+type ComputerMethod = Method<Host, Source>;
+
+/** Up to this many choices are all shown; more are a list to open. */
+const MAX_OPTION_CARDS = 4;
+
+/** A Lunaris computer that is only a place in the list yet (added by
+ *  address, never reached): it has no id of its own to group with. */
+const isPlaceholderHost = (host: Host) => host.id.startsWith('address:');
+
+/** Whether a computer of another type has files to offer: yes unless its
+ *  connector says it has none. */
+const sourceHasFiles = (source: Source): boolean => source.capabilities?.files !== false;
+
+const cardIcon = (children: React.ReactNode, size = 16) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    {children}
+  </svg>
+);
+const ICON_FILES = cardIcon(<><path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" /><path d="M12 10v6M9 13l3-3 3 3" /></>);
+const ICON_EDIT = cardIcon(<><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" /></>);
+const ICON_TRASH = cardIcon(<><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /></>);
+const ICON_APP = cardIcon(<><rect x="3" y="4" width="18" height="12" rx="1.5" /><path d="M8 20h8M12 16v4" /></>);
+const ICON_GEAR = cardIcon(<><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.65 1.65 0 0 0 15 19.4a1.65 1.65 0 0 0-1 .6 1.65 1.65 0 0 0-.4 1.08V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 8.6 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-.6-1 1.65 1.65 0 0 0-1.08-.4H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 8.6a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-.6 1.65 1.65 0 0 0 .4-1.08V3a2 2 0 1 1 4 0v.09A1.65 1.65 0 0 0 15.4 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.38.16.72.4 1 .7.29.29.6.9.6 1.3V12a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></>);
+const ICON_PLUS = cardIcon(<path d="M12 5v14M5 12h14" />);
+const ICON_CHEVRON = cardIcon(<polyline points="6 9 12 15 18 9" />, 14);
 
 /** "host:8091" -> "host" (the default port isn't worth showing). */
 const shortAddress = (a: string) => a.replace(/:8091$/, '');
@@ -351,6 +407,13 @@ function App() {
   // Computers of other types (sources), each reached through a Lunaris host.
   const [sources, setSources] = useState<Source[]>([]);
   const [selectedSource, setSelectedSource] = useState<Source | null>(null);
+  // One card for each computer: the way to connect used last for each card
+  // (kept in this browser), the one picked on a card since the page opened
+  // (it stays picked while it is offline, to edit or remove it), and the
+  // card whose "choose how to connect" list is open.
+  const [cardMethods, setCardMethods] = useState<Record<string, string>>(() => loadMethods(localStorage));
+  const [pickedMethods, setPickedMethods] = useState<Record<string, string>>({});
+  const [chooserCard, setChooserCard] = useState<string | null>(null);
   const [connectorHosts, setConnectorHosts] = useState<ConnectorHost[]>([]);
   const [agentToken, setAgentToken] = useState<string | null>(null);
   // The server only gives the connection token to administrators.
@@ -439,6 +502,7 @@ function App() {
             .map((c: any) => ({
               id: c.id,
               name: String(c.name || c.id),
+              note: typeof c.note === 'string' ? c.note : '',
               fields: (Array.isArray(c.fields) ? c.fields : []).filter((f: any) => f && typeof f.key === 'string'),
             })),
         }))
@@ -771,6 +835,18 @@ function App() {
   const [sourceHostId, setSourceHostId] = useState('');
   const [sourceValues, setSourceValues] = useState<Record<string, string>>({});
   const [editSource, setEditSource] = useState<Source | null>(null);
+  // The set-up of a computer being added (a pairing): what its Lunaris
+  // computer wants shown (a PIN to type at the other computer), until it is
+  // done; `failed` is why it did not work.
+  const [sourceSetup, setSourceSetup] = useState<{ hostId: string; setup: string; message: string; code: string; failed: string } | null>(null);
+  // "Add a connection method": the card the new source is to be one
+  // computer with. `lone` is that card's only source while it has no group
+  // yet (it gets one first).
+  const [addTo, setAddTo] = useState<{ title: string; group: string; lone?: Source } | null>(null);
+  // Edit: the card the source is one computer with ('' = a computer of its
+  // own), as it was when the dialog opened and as chosen.
+  const [editSame, setEditSame] = useState('');
+  const [editSameWas, setEditSameWas] = useState('');
   const [pendingDeleteSource, setPendingDeleteSource] = useState<Source | null>(null);
   const [deleteSourceBusy, setDeleteSourceBusy] = useState(false);
   const [deleteSourceError, setDeleteSourceError] = useState('');
@@ -780,6 +856,45 @@ function App() {
   connectorHosts.forEach(h => h.connectors.forEach(c => {
     if (!connectorTypes.some(x => x.id === c.id)) connectorTypes.push(c);
   }));
+  // One card for each computer (computerCards.ts). A source's method is
+  // named by its type, in the person's language.
+  const cards: ComputerCard[] = buildCards(hosts, sources, (source) => typeShortName(source.connector, t(source.connector_name || source.connector)));
+  const methodOf = (card: ComputerCard): ComputerMethod | undefined =>
+    card.methods.find(m => m.key === pickedMethods[card.key]) || currentMethod(card.methods, cardMethods[card.key]);
+  const pickMethod = (card: ComputerCard, method: ComputerMethod) => {
+    setPickedMethods(current => ({ ...current, [card.key]: method.key }));
+    setCardMethods(current => rememberMethod(localStorage, current, card.key, method.key));
+  };
+  const connectWith = (card: ComputerCard, method: ComputerMethod) => {
+    if (!method.online) return;
+    pickMethod(card, method);
+    setChooserCard(null);
+    if (method.host) connectToHost(method.host);
+    else if (method.source) setSelectedSource(method.source);
+  };
+  // The open list closes at Escape and at a click anywhere else.
+  useEffect(() => {
+    if (!chooserCard) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setChooserCard(null); };
+    const onDown = (e: MouseEvent) => {
+      if (!(e.target instanceof Element) || !e.target.closest('.method-chooser, .connect-more')) setChooserCard(null);
+    };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onDown);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onDown);
+    };
+  }, [chooserCard]);
+  // The other computers a source being edited can be said to be.
+  const editOwnCard = editSource ? cards.find(card => card.methods.some(m => m.source?.id === editSource.id && m.source.host_id === editSource.host_id)) : undefined;
+  const sameChoices = editSource
+    ? cards.filter(card => !(card.host && (isPlaceholderHost(card.host) || !card.group)) && !(card === editOwnCard && card.methods.length === 1))
+    : [];
+  const deleteSourceCard = pendingDeleteSource
+    ? cards.find(card => card.methods.some(m => m.source?.id === pendingDeleteSource.id && m.source.host_id === pendingDeleteSource.host_id))
+    : undefined;
+
   const dialogConnectorId = editSource ? editSource.connector : addType;
   // The Lunaris computers that can reach a computer of the chosen type.
   const dialogHosts = dialogConnectorId
@@ -794,6 +909,18 @@ function App() {
       || (editSource ? connectorTypes.find(c => c.id === dialogConnectorId) : null)
       || null)
     : null;
+
+  // The types the dialog offers ('' is Lunaris; not when a connection method
+  // is being added: a Lunaris computer is a card of its own), and the chosen one.
+  const dialogTypes: { id: string; name: string; note: string }[] = (addTo ? [] : [{
+    id: '',
+    name: 'Lunaris',
+    note: 'The server connects to the Lunaris app on that computer (remote control turned on). Its address and password are shown under "This computer" there.',
+  }]).concat(connectorTypes.map(c => ({ id: c.id, name: c.name, note: c.note || '' })));
+  const dialogType = dialogTypes.find(type => type.id === addType);
+  // The name and the Lunaris computer to go through share a row when there
+  // are one or two of those to choose from.
+  const throughBesideName = dialogHosts.length <= 2;
 
   const defaultsOf = (connector: Connector | null | undefined): Record<string, string> => {
     const values: Record<string, string> = {};
@@ -812,10 +939,12 @@ function App() {
     setAddHostPassword('');
     setAddHostError('');
     setAddType('');
+    setAddTo(null);
     setEditSource(null);
     setSourceName('');
     setSourceHostId('');
     setSourceValues({});
+    setSourceSetup(null);
     setAddHostOpen(true);
     fetchConnectors();
   };
@@ -837,8 +966,32 @@ function App() {
     setSourceValues(next);
   };
 
+  // "Add a connection method" on a card: the same dialog, for a computer of
+  // another type that is this card's computer.
+  const openAddMethod = (card: ComputerCard) => {
+    const first = connectorTypes[0];
+    const through = first ? connectorHosts.find(h => h.connectors.some(c => c.id === first.id)) : undefined;
+    setAddHostAddress('');
+    setAddHostPassword('');
+    setAddHostError('');
+    setEditSource(null);
+    setSourceSetup(null);
+    setAddTo({ title: card.title, group: card.group, lone: card.group ? undefined : card.methods[0]?.source });
+    setAddType(first?.id || '');
+    setSourceHostId(through?.host_id || '');
+    setSourceValues(defaultsOf(through?.connectors.find(c => c.id === first?.id)));
+    setSourceName(card.title);
+    setAddHostOpen(true);
+    fetchConnectors();
+  };
+
   const openEditSource = (source: Source) => {
     setAddHostError('');
+    setAddTo(null);
+    const own = cards.find(card => card.methods.some(m => m.source?.id === source.id && m.source.host_id === source.host_id));
+    const same = own && own.methods.length > 1 ? own.key : '';
+    setEditSame(same);
+    setEditSameWas(same);
     setEditSource(source);
     setSourceName(source.name);
     // The server never sends the fields back: they start empty, and an
@@ -886,13 +1039,38 @@ function App() {
     setAddHostBusy(true);
     setAddHostError('');
     try {
+      // Which computer it is. Nothing said: adding lets its Lunaris computer
+      // group it with one at the same address, and an edit keeps its group.
+      let group: string | undefined;
+      if (editSource) {
+        if (editSame !== editSameWas) {
+          const target = editSame ? cards.find(card => card.key === editSame) : undefined;
+          group = target ? await groupOfCard(target.group, target.group ? undefined : target.methods[0]?.source) : '';
+          if (group === undefined) return;
+        }
+      } else if (addTo) {
+        group = await groupOfCard(addTo.group, addTo.lone);
+        if (group === undefined) return;
+        // Not made a second time when the form is sent again.
+        if (group !== addTo.group) setAddTo({ title: addTo.title, group });
+      }
+      const said = group === undefined ? {} : { group };
       const base = `${getBackendProtocol().http}//${getBackendHost()}/api/hosts/${encodeURIComponent(editSource ? editSource.host_id : sourceHostId)}/sources`;
       const response = await fetch(editSource ? `${base}/${encodeURIComponent(editSource.id)}` : base, {
         method: editSource ? 'PUT' : 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(editSource ? { name, values } : { name, connector: addType, values }),
+        body: JSON.stringify(editSource ? { name, values, ...said } : { name, connector: addType, values, ...said }),
       });
-      if (response.ok) {
+      if (response.status === 202 && !editSource) {
+        // Its type has a set-up: the Lunaris computer says what to show, and
+        // is asked about it until it is done (below).
+        const body = await response.json().catch(() => null);
+        if (body && typeof body.setup === 'string' && body.setup) {
+          setSourceSetup({ hostId: sourceHostId, setup: body.setup, message: textOf(body.message), code: textOf(body.code), failed: '' });
+        } else {
+          setAddHostError(t('Could not add the computer'));
+        }
+      } else if (response.ok) {
         setAddHostOpen(false);
         setEditSource(null);
         fetchSources();
@@ -906,6 +1084,96 @@ function App() {
     } finally {
       setAddHostBusy(false);
     }
+  };
+
+  // The group of a card that another source is to join. A card that has
+  // none yet is one source alone (`lone`): it is given a new group first, by
+  // an edit that changes nothing else. `undefined` when that did not work
+  // (the reason is shown).
+  const groupOfCard = async (group: string, lone?: Source): Promise<string | undefined> => {
+    if (group) return group;
+    if (!lone) { setAddHostError(t('Could not save the computer')); return undefined; }
+    const made = newGroup();
+    const response = await fetch(`${getBackendProtocol().http}//${getBackendHost()}/api/hosts/${encodeURIComponent(lone.host_id)}/sources/${encodeURIComponent(lone.id)}`, {
+      method: 'PUT',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: lone.name, values: {}, group: made }),
+    });
+    if (response.status === 401) { handleLogout(); return undefined; }
+    if (!response.ok) { setAddHostError(await writeErrorText(response, t('Could not save the computer'))); return undefined; }
+    fetchSources();
+    return made;
+  };
+
+  const textOf = (value: unknown): string => (typeof value === 'string' ? value : '');
+  const sourceSetupUrl = (hostId: string, setup: string) =>
+    `${getBackendProtocol().http}//${getBackendHost()}/api/hosts/${encodeURIComponent(hostId)}/sources/setup/${encodeURIComponent(setup)}`;
+
+  // While a set-up waits for the person it is asked about once a second:
+  // done closes the dialog (the new card is listed), failed shows why.
+  const setupHostId = sourceSetup?.hostId || '';
+  const setupId = sourceSetup && !sourceSetup.failed ? sourceSetup.setup : '';
+  useEffect(() => {
+    if (!token || !setupId) return;
+    let stopped = false;
+    let asking = false;
+    let misses = 0;
+    const fail = (text: string) => setSourceSetup(current => (current && current.setup === setupId ? { ...current, failed: text } : current));
+    const ask = async () => {
+      if (stopped || asking) return;
+      asking = true;
+      try {
+        const response = await fetch(sourceSetupUrl(setupHostId, setupId), { headers: { 'Authorization': `Bearer ${token}` } });
+        if (stopped) return;
+        if (response.status === 401) {
+          handleLogout();
+        } else if (response.ok) {
+          misses = 0;
+          const body = await response.json().catch(() => null);
+          if (stopped || !body) return;
+          if (body.state === 'done') {
+            setSourceSetup(null);
+            setAddHostOpen(false);
+            fetchSources();
+          } else if (body.state === 'failed') {
+            fail(textOf(body.error) ? t(textOf(body.error)) : t('Could not add the computer'));
+          } else if (body.state === 'pending') {
+            const message = textOf(body.message);
+            const code = textOf(body.code);
+            setSourceSetup(current => (current && current.setup === setupId && (current.message !== message || current.code !== code)
+              ? { ...current, message, code }
+              : current));
+          }
+        } else if (response.status === 404) {
+          fail(t('That set-up is not there any more. Add the computer again.'));
+        } else if (++misses >= 5) {
+          // Not at the first hiccup: the computer may be back in a moment.
+          fail(await writeErrorText(response, t('Could not add the computer')));
+        }
+      } catch {
+        if (!stopped && ++misses >= 5) fail(t('Cannot reach the server'));
+      } finally {
+        asking = false;
+      }
+    };
+    const timer = window.setInterval(ask, 1000);
+    // The page is left: the set-up is not left waiting on that computer.
+    const leave = () => { fetch(sourceSetupUrl(setupHostId, setupId), { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` }, keepalive: true }).catch(() => {}); };
+    window.addEventListener('pagehide', leave);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      window.removeEventListener('pagehide', leave);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, setupHostId, setupId]);
+
+  // Closing the dialog while a set-up waits stops it on that computer.
+  const cancelSourceSetup = () => {
+    const current = sourceSetup;
+    setSourceSetup(null);
+    if (!current || current.failed || !token) return;
+    fetch(sourceSetupUrl(current.hostId, current.setup), { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` }, keepalive: true }).catch(() => {});
   };
 
   const handleDeleteSource = async (source: Source) => {
@@ -1064,9 +1332,7 @@ function App() {
     setSelectedHost(host);
   };
 
-  // The Lunaris hosts first, then the computers of other types by name.
-  const sortedSources = [...sources].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
-  const closeAddHost = () => { setAddHostOpen(false); setEditSource(null); };
+  const closeAddHost = () => { cancelSourceSetup(); setAddHostOpen(false); setEditSource(null); setAddTo(null); };
   const sourceDialog = !!editSource || !!addType;
 
   const currentViewingHost = viewingHost ? (hosts.find(h => h.id === viewingHost.id) || viewingHost) : null;
@@ -1080,6 +1346,7 @@ function App() {
         hostId={selectedSource.host_id}
         hostName={selectedSource.name}
         sourceId={selectedSource.id}
+        sourceFiles={sourceHasFiles(selectedSource)}
         token={token}
         serverCodecModeSupport={hosts.find(h => h.id === selectedSource.host_id)?.server_codec_mode_support}
         appId={0}
@@ -1610,62 +1877,121 @@ function App() {
                         </div>
                       ) : (
                         <div className="hosts-card-grid">
-                          {hosts.map((host) => {
-                            const isOnline = host.status === 'Online';
-
+                          {cards.map((card) => {
+                            const method = methodOf(card);
+                            if (!method) return null;
+                            const host = method.host;
+                            const source = method.source;
+                            const many = card.methods.length > 1;
+                            const isOnline = method.online;
+                            const status = host ? host.status : (source?.online ? 'Online' : 'Offline');
+                            // A computer of another type alone on its card: as it always looked.
+                            const lone = !card.host && !many ? source : undefined;
+                            const canAddMethod = userRole === 'admin' && connectorTypes.length > 0
+                              && (card.host ? !!card.group && !isPlaceholderHost(card.host) : true);
+                            const chooserOpen = chooserCard === card.key;
                             return (
                               <div
-                                key={host.id}
-                                className={`host-card ${host.status.toLowerCase()} ${isOnline ? 'clickable-host-card' : ''}`}
-                                onClick={() => {
-                                  if (isOnline) {
-                                    connectToHost(host);
-                                  }
-                                }}
+                                key={card.key}
+                                data-card={card.key}
+                                className={`host-card ${card.host ? '' : 'source-card '}${status.toLowerCase()} ${isOnline ? 'clickable-host-card' : ''}`}
+                                onClick={() => connectWith(card, method)}
                               >
                                 <div className="host-card-header">
-                                  <div>
-                                    <h3 className="host-name">{host.name}</h3>
-                                    {!host.id.startsWith('address:') && (
-                                      <span className="host-id">ID: {host.id.slice(0, 8)}...</span>
+                                  <div className="source-card-title">
+                                    <h3 className="host-name">{card.title}</h3>
+                                    {card.host && !isPlaceholderHost(card.host) && (
+                                      <span className="host-id">ID: {card.host.id.slice(0, 8)}...</span>
+                                    )}
+                                    {lone && (
+                                      <div className="source-card-sub">
+                                        <span className="source-type-badge">{t(lone.connector_name || lone.connector)}</span>
+                                        <span className="source-via">{t('via %1', lone.host_name)}</span>
+                                      </div>
                                     )}
                                   </div>
                                 </div>
 
-                                <div className="host-card-body">
-                                  <div className="host-meta-item">
-                                    <span className="meta-label">{t('IP Address')}</span>
-                                    <span className="meta-value">{host.address ? shortAddress(host.address) : (host.ip_address || t('Signaling Tunnel'))}</span>
+                                {/* The ways to connect to this computer: one is picked. */}
+                                {many && (
+                                  <div className="method-chips" role="radiogroup" aria-label={t('Ways to connect')} onClick={(e) => e.stopPropagation()}>
+                                    {card.methods.map((m) => (
+                                      <button
+                                        key={m.key}
+                                        type="button"
+                                        role="radio"
+                                        aria-checked={m.key === method.key}
+                                        className={`method-chip ${m.online ? 'online' : 'offline'}${m.key === method.key ? ' selected' : ''}`}
+                                        title={`${m.source ? t(m.source.connector_name || m.source.connector) : m.label}: ${t(m.online ? 'Online' : 'Offline')}`}
+                                        onClick={() => pickMethod(card, m)}
+                                      >
+                                        <span className="method-chip-dot" aria-hidden="true" />
+                                        <TypeMark id={m.source ? m.source.connector : 'lunaris'} name={m.label} small />
+                                        <span className="method-chip-label">{m.label}</span>
+                                      </button>
+                                    ))}
                                   </div>
-                                  {host.needs_approval && (
+                                )}
+
+                                <div className="host-card-body">
+                                  {host && (
+                                    <div className="host-meta-item">
+                                      <span className="meta-label">{t('IP Address')}</span>
+                                      <span className="meta-value">{host.address ? shortAddress(host.address) : (host.ip_address || t('Signaling Tunnel'))}</span>
+                                    </div>
+                                  )}
+                                  {host?.needs_approval && (
                                     <div className="host-meta-item">
                                       <span className="meta-label">{t('Access')}</span>
                                       <span className="meta-value">{t('Accepted at the computer')}</span>
                                     </div>
                                   )}
-                                  {host.link_error && (
+                                  {host?.link_error && (
                                     <div className="host-link-error" title={host.link_error}>{t(host.link_error)}</div>
+                                  )}
+                                  {source && many && (
+                                    <div className="host-meta-item">
+                                      <span className="meta-label">{t('Through')}</span>
+                                      <span className="meta-value method-through">{source.host_name}</span>
+                                    </div>
                                   )}
                                   <div className="host-meta-item">
                                     <span className="meta-label">{t('Status')}</span>
                                     <div className="host-status-badge">
-                                      <span className={`status-indicator ${host.status.toLowerCase()}`}></span>
-                                      <span className="status-label">{t(host.status)}</span>
+                                      <span className={`status-indicator ${status.toLowerCase()}`}></span>
+                                      <span className="status-label">{t(status)}</span>
                                     </div>
                                   </div>
                                 </div>
 
                                 <div className="host-card-actions" onClick={(e) => e.stopPropagation()}>
-                                  {isOnline && (
-                                    <button
-                                      type="button"
-                                      className="btn-primary host-card-connect"
-                                      onClick={() => connectToHost(host)}
-                                    >
-                                      {t('Connect')}
-                                    </button>
+                                  {(isOnline || many) && (
+                                    <div className="connect-split">
+                                      {isOnline && (
+                                        <button
+                                          type="button"
+                                          className="btn-primary host-card-connect"
+                                          onClick={() => connectWith(card, method)}
+                                        >
+                                          {t('Connect')}
+                                        </button>
+                                      )}
+                                      {many && (
+                                        <button
+                                          type="button"
+                                          className={`${isOnline ? 'btn-primary' : 'btn-secondary'} connect-more`}
+                                          title={t('Choose how to connect')}
+                                          aria-label={t('Choose how to connect')}
+                                          aria-haspopup="menu"
+                                          aria-expanded={chooserOpen}
+                                          onClick={() => setChooserCard(chooserOpen ? null : card.key)}
+                                        >
+                                          {ICON_CHEVRON}
+                                        </button>
+                                      )}
+                                    </div>
                                   )}
-                                  {isOnline && (
+                                  {host && isOnline && (
                                     <button
                                       type="button"
                                       className="host-action-btn"
@@ -1673,110 +1999,42 @@ function App() {
                                       aria-label="Open in the Lunaris app"
                                       onClick={() => openInDesktopApp(host)}
                                     >
-                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <rect x="3" y="4" width="18" height="12" rx="1.5" />
-                                        <path d="M8 20h8M12 16v4" />
-                                      </svg>
+                                      {ICON_APP}
                                     </button>
                                   )}
-                                  {isOnline && (
+                                  {isOnline && (host || (source && sourceHasFiles(source))) && (
+                                    <button
+                                      type="button"
+                                      className={`host-action-btn${source ? ' source-files-btn' : ''}`}
+                                      title={t('Files')}
+                                      aria-label={t('Files')}
+                                      onClick={() => { if (host) setFilesHost(host); else if (source) setFilesSource(source); }}
+                                    >
+                                      {ICON_FILES}
+                                    </button>
+                                  )}
+                                  {host && (
                                     <button
                                       type="button"
                                       className="host-action-btn"
-                                      title={t('Files')}
-                                      aria-label={t('Files')}
-                                      onClick={() => setFilesHost(host)}
+                                      title="Stream settings"
+                                      onClick={() => openHostSettings(host)}
                                     >
-                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" />
-                                        <path d="M12 10v6M9 13l3-3 3 3" />
-                                      </svg>
+                                      {ICON_GEAR}
                                     </button>
                                   )}
-                                  <button
-                                    type="button"
-                                    className="host-action-btn"
-                                    title="Stream settings"
-                                    onClick={() => openHostSettings(host)}
-                                  >
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                      <circle cx="12" cy="12" r="3" />
-                                      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.65 1.65 0 0 0 15 19.4a1.65 1.65 0 0 0-1 .6 1.65 1.65 0 0 0-.4 1.08V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 8.6 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-.6-1 1.65 1.65 0 0 0-1.08-.4H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 8.6a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-.6 1.65 1.65 0 0 0 .4-1.08V3a2 2 0 1 1 4 0v.09A1.65 1.65 0 0 0 15.4 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.38.16.72.4 1 .7.29.29.6.9.6 1.3V12a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-                                    </svg>
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="host-action-btn danger"
-                                    title="Delete host"
-                                    disabled={deleteHostLoading === host.id}
-                                    onClick={() => setPendingDeleteHost(host)}
-                                  >
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                      <polyline points="3 6 5 6 21 6" />
-                                      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                                      <path d="M10 11v6" />
-                                      <path d="M14 11v6" />
-                                      <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-                                    </svg>
-                                  </button>
-                                </div>
-
-                              </div>
-                            );
-                          })}
-                          {sortedSources.map((source) => {
-                            const isOnline = !!source.online;
-                            return (
-                              <div
-                                key={`source:${source.host_id}:${source.id}`}
-                                className={`host-card source-card ${isOnline ? 'online clickable-host-card' : 'offline'}`}
-                                onClick={() => { if (isOnline) setSelectedSource(source); }}
-                              >
-                                <div className="host-card-header">
-                                  <div className="source-card-title">
-                                    <h3 className="host-name">{source.name}</h3>
-                                    <div className="source-card-sub">
-                                      <span className="source-type-badge">{t(source.connector_name || source.connector)}</span>
-                                      <span className="source-via">{t('via %1', source.host_name)}</span>
-                                    </div>
-                                  </div>
-                                </div>
-
-                                <div className="host-card-body">
-                                  <div className="host-meta-item">
-                                    <span className="meta-label">{t('Status')}</span>
-                                    <div className="host-status-badge">
-                                      <span className={`status-indicator ${isOnline ? 'online' : 'offline'}`}></span>
-                                      <span className="status-label">{t(isOnline ? 'Online' : 'Offline')}</span>
-                                    </div>
-                                  </div>
-                                </div>
-
-                                <div className="host-card-actions" onClick={(e) => e.stopPropagation()}>
-                                  {isOnline && (
+                                  {canAddMethod && (
                                     <button
                                       type="button"
-                                      className="btn-primary host-card-connect"
-                                      onClick={() => setSelectedSource(source)}
+                                      className="host-action-btn add-method-btn"
+                                      title={t('Add a connection method')}
+                                      aria-label={t('Add a connection method')}
+                                      onClick={() => openAddMethod(card)}
                                     >
-                                      {t('Connect')}
+                                      {ICON_PLUS}
                                     </button>
                                   )}
-                                  {isOnline && (
-                                    <button
-                                      type="button"
-                                      className="host-action-btn"
-                                      title={t('Files')}
-                                      aria-label={t('Files')}
-                                      onClick={() => setFilesSource(source)}
-                                    >
-                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" />
-                                        <path d="M12 10v6M9 13l3-3 3 3" />
-                                      </svg>
-                                    </button>
-                                  )}
-                                  {userRole === 'admin' && (
+                                  {source && userRole === 'admin' && (
                                     <button
                                       type="button"
                                       className="host-action-btn"
@@ -1784,13 +2042,21 @@ function App() {
                                       aria-label={t('Edit')}
                                       onClick={() => openEditSource(source)}
                                     >
-                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M12 20h9" />
-                                        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" />
-                                      </svg>
+                                      {ICON_EDIT}
                                     </button>
                                   )}
-                                  {userRole === 'admin' && (
+                                  {host && (
+                                    <button
+                                      type="button"
+                                      className="host-action-btn danger"
+                                      title="Delete host"
+                                      disabled={deleteHostLoading === host.id}
+                                      onClick={() => setPendingDeleteHost(host)}
+                                    >
+                                      {ICON_TRASH}
+                                    </button>
+                                  )}
+                                  {source && userRole === 'admin' && (
                                     <button
                                       type="button"
                                       className="host-action-btn danger"
@@ -1798,16 +2064,35 @@ function App() {
                                       aria-label={t('Delete')}
                                       onClick={() => { setDeleteSourceError(''); setPendingDeleteSource(source); }}
                                     >
-                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <polyline points="3 6 5 6 21 6" />
-                                        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                                        <path d="M10 11v6" />
-                                        <path d="M14 11v6" />
-                                        <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-                                      </svg>
+                                      {ICON_TRASH}
                                     </button>
                                   )}
                                 </div>
+
+                                {/* Connecting another way, right here. */}
+                                {many && chooserOpen && (
+                                  <div className="method-chooser" role="menu" aria-label={t('Choose how to connect')} onClick={(e) => e.stopPropagation()}>
+                                    {card.methods.map((m) => (
+                                      <button
+                                        key={m.key}
+                                        type="button"
+                                        role="menuitem"
+                                        className={`method-option ${m.online ? 'online' : 'offline'}`}
+                                        disabled={!m.online}
+                                        onClick={() => connectWith(card, m)}
+                                      >
+                                        <span className="method-chip-dot" aria-hidden="true" />
+                                        <TypeMark id={m.source ? m.source.connector : 'lunaris'} name={m.label} />
+                                        <span className="method-option-text">
+                                          <span className="method-option-name">{t('Connect with %1', m.label)}</span>
+                                          <span className="method-option-sub">
+                                            {m.source ? `${t('via %1', m.source.host_name)} · ` : ''}{t(m.host ? m.host.status : (m.online ? 'Online' : 'Offline'))}
+                                          </span>
+                                        </span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
                               </div>
                             );
                           })}
@@ -1914,7 +2199,13 @@ function App() {
             </div>
             <div className="host-confirm-content">
               <h2 id="deleteSourceTitle">{t('Delete computer')}</h2>
-              <p>{t('Delete %1 from the list? It is reached through %2, which stays.', pendingDeleteSource.name, pendingDeleteSource.host_name)}</p>
+              <p>
+                {deleteSourceCard && deleteSourceCard.methods.length > 1
+                  ? t('Remove %1 from %2? The other ways to connect stay.',
+                    deleteSourceCard.methods.find(m => m.source?.id === pendingDeleteSource.id && m.source.host_id === pendingDeleteSource.host_id)?.label || pendingDeleteSource.name,
+                    deleteSourceCard.title)
+                  : t('Delete %1 from the list? It is reached through %2, which stays.', pendingDeleteSource.name, pendingDeleteSource.host_name)}
+              </p>
               {deleteSourceError && <p className="add-host-error" role="alert">{deleteSourceError}</p>}
             </div>
             <div className="host-confirm-actions">
@@ -1928,35 +2219,82 @@ function App() {
       )}
 
       {addHostOpen && (
-        <div className="host-confirm-overlay add-host-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget && !addHostBusy) closeAddHost(); }}>
+        <div className="host-confirm-overlay add-host-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget && !addHostBusy && !sourceSetup) closeAddHost(); }}>
           <form
             className="host-confirm-card add-host-card"
             role="dialog"
             aria-modal="true"
             aria-labelledby="addHostTitle"
             noValidate
-            onSubmit={(e) => { e.preventDefault(); if (sourceDialog) submitSource(); else submitAddHost(); }}
+            onSubmit={(e) => { e.preventDefault(); if (sourceSetup) return; if (sourceDialog) submitSource(); else submitAddHost(); }}
           >
             <div className="host-confirm-content">
-              <h2 id="addHostTitle">{editSource ? t('Edit computer') : t('Add computer')}</h2>
-              {editSource ? (
+              <h2 id="addHostTitle">{editSource ? t('Edit computer') : addTo ? t('Add a connection method to %1', addTo.title) : t('Add computer')}</h2>
+              {sourceSetup ? (
+                <p>{t('Setting up %1', sourceName.trim())}</p>
+              ) : addTo ? (
+                <p>{t('It is shown as one more way to connect to %1.', addTo.title)}</p>
+              ) : editSource ? (
                 <p>{t('%1, reached through %2.', t(editSource.connector_name || editSource.connector), editSource.host_name)}</p>
-              ) : !addType ? (
-                <p>{t('The server connects to the Lunaris app on that computer (remote control turned on). Its address and password are shown under "This computer" there.')}</p>
               ) : null}
             </div>
-            {!editSource && connectorTypes.length > 0 && (
-              <div className="form-group">
-                <label htmlFor="addHostType">{t('Type')}</label>
-                <select id="addHostType" value={addType} onChange={(e) => chooseAddType(e.target.value)}>
-                  <option value="">Lunaris</option>
-                  {connectorTypes.map(c => <option key={c.id} value={c.id}>{t(c.name)}</option>)}
-                </select>
+            {sourceSetup && (
+              <div className="source-setup" id="sourceSetup">
+                {sourceSetup.failed ? (
+                  <div className="add-host-error" role="alert">{sourceSetup.failed}</div>
+                ) : (
+                  <>
+                    {/* In the connector's own words. */}
+                    <p className="source-setup-message" aria-live="polite">{t(sourceSetup.message)}</p>
+                    {sourceSetup.code && (
+                      <div className="source-setup-code" aria-label={t('Code')}>{sourceSetup.code}</div>
+                    )}
+                    <div className="source-setup-waiting" role="status">
+                      <span className="source-setup-spinner" aria-hidden="true" />
+                      {t('Waiting for the other computer…')}
+                    </div>
+                  </>
+                )}
               </div>
             )}
-            {!sourceDialog && (
-              <>
-                <div className="form-group">
+            {!sourceSetup && !editSource && (
+              <div className="form-group">
+                {dialogTypes.length > 1 && (
+                  <>
+                    <span className="option-group-label" id="addHostTypeLabel">{t('Type')}</span>
+                    {/* Every type in sight, side by side: its logo and its short name. */}
+                    <div className="type-tiles" id="addHostType" role="radiogroup" aria-labelledby="addHostTypeLabel">
+                      {dialogTypes.map(type => (
+                        <button
+                          key={type.id || 'lunaris'}
+                          type="button"
+                          role="radio"
+                          aria-checked={addType === type.id}
+                          aria-label={t(type.name)}
+                          title={t(type.name)}
+                          data-type={type.id || 'lunaris'}
+                          className={`type-tile${addType === type.id ? ' selected' : ''}`}
+                          onClick={() => chooseAddType(type.id)}
+                        >
+                          <TypeMark id={type.id || 'lunaris'} name={t(type.name)} />
+                          <span className="type-tile-name">{typeShortName(type.id || 'lunaris', t(type.name))}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {/* What the chosen type is and says about itself (in its connector's words), once. */}
+                {dialogType && (
+                  <p className="type-note" id="addHostTypeNote">
+                    <strong>{t(dialogType.name)}</strong>
+                    {dialogType.note ? <span>{t(dialogType.note)}</span> : null}
+                  </p>
+                )}
+              </div>
+            )}
+            {!sourceSetup && !sourceDialog && (
+              <div className="form-grid">
+                <div className="form-group span-3">
                   <label htmlFor="addHostAddress">{t('Address')}</label>
                   <input
                     id="addHostAddress"
@@ -1967,7 +2305,7 @@ function App() {
                     autoComplete="off"
                   />
                 </div>
-                <div className="form-group">
+                <div className="form-group span-3">
                   <label htmlFor="addHostPassword">{t('Password (optional)')}</label>
                   <input
                     id="addHostPassword"
@@ -1976,13 +2314,13 @@ function App() {
                     onChange={(e) => setAddHostPassword(e.target.value)}
                     autoComplete="new-password"
                   />
-                  <span className="form-hint">{t('Without the password, the person at that computer is asked to accept each connection.')}</span>
                 </div>
-              </>
+                <span className="form-hint span-6">{t('Without the password, the person at that computer is asked to accept each connection.')}</span>
+              </div>
             )}
-            {sourceDialog && (
-              <>
-                <div className="form-group">
+            {!sourceSetup && sourceDialog && (
+              <div className="form-grid">
+                <div className={`form-group ${!editSource && throughBesideName ? 'span-3' : 'span-6'}`}>
                   <label htmlFor="sourceName">{t('Name')}</label>
                   <input
                     id="sourceName"
@@ -1993,48 +2331,142 @@ function App() {
                   />
                 </div>
                 {!editSource && (
-                  <div className="form-group">
-                    <label htmlFor="sourceHost">{t('Through which Lunaris computer')}</label>
-                    <select id="sourceHost" value={sourceHostId} onChange={(e) => chooseSourceHost(e.target.value)}>
-                      {dialogHosts.map(h => <option key={h.host_id} value={h.host_id}>{h.host_name}</option>)}
-                    </select>
-                    <span className="form-hint">{t('That computer must be on the same network as the computer being added.')}</span>
+                  <div className={`form-group ${throughBesideName ? 'span-3' : 'span-6'}`}>
+                    {/* A few to choose from: all in sight. Many: a list to open. */}
+                    {dialogHosts.length <= MAX_OPTION_CARDS ? (
+                      <>
+                        <span className="option-group-label" id="sourceHostLabel">{t('Through which Lunaris computer')}</span>
+                        <div className="option-cards compact" id="sourceHost" role="radiogroup" aria-labelledby="sourceHostLabel">
+                          {dialogHosts.map(h => (
+                            <button
+                              key={h.host_id}
+                              type="button"
+                              role="radio"
+                              aria-checked={sourceHostId === h.host_id}
+                              className={`option-card${sourceHostId === h.host_id ? ' selected' : ''}`}
+                              onClick={() => chooseSourceHost(h.host_id)}
+                            >
+                              <span className="option-card-name">{h.host_name}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <label htmlFor="sourceHost">{t('Through which Lunaris computer')}</label>
+                        <select id="sourceHost" value={sourceHostId} onChange={(e) => chooseSourceHost(e.target.value)}>
+                          {dialogHosts.map(h => <option key={h.host_id} value={h.host_id}>{h.host_name}</option>)}
+                        </select>
+                      </>
+                    )}
                   </div>
                 )}
+                {!editSource && (
+                  <span className="form-hint span-6">{t('That computer must be on the same network as the computer being added.')}</span>
+                )}
                 {editSource && (
-                  <span className="form-hint">
+                  <span className="form-hint span-6">
                     {dialogConnector
                       ? t('Leave a field empty to keep it.')
                       : t('Only the name can be changed while %1 is offline.', editSource.host_name)}
                   </span>
                 )}
-                {(dialogConnector?.fields || []).map(field => (
-                  <div className="form-group" key={field.key}>
-                    <label htmlFor={`sourceField-${field.key}`}>
+                {layoutFields(dialogConnector?.fields || []).map(({ field, span }) => {
+                  const choices = choicesOf(field);
+                  const label = (
+                    <>
                       {t(field.label || field.key)}
                       {!editSource && !field.required && !field.default ? ` ${t('(optional)')}` : ''}
-                    </label>
-                    <input
-                      id={`sourceField-${field.key}`}
-                      type={field.kind === 'secret' ? 'password' : field.kind === 'port' ? 'number' : 'text'}
-                      inputMode={field.kind === 'port' ? 'numeric' : undefined}
-                      min={field.kind === 'port' ? 1 : undefined}
-                      max={field.kind === 'port' ? 65535 : undefined}
-                      value={sourceValues[field.key] ?? ''}
-                      onChange={(e) => setSourceValues((current) => ({ ...current, [field.key]: e.target.value }))}
-                      autoComplete={field.kind === 'secret' ? 'new-password' : 'off'}
-                    />
-                  </div>
-                ))}
-              </>
+                    </>
+                  );
+                  // One of a few: options to press, not a box to type in.
+                  if (choices.length > 0) {
+                    return (
+                      <div className={`form-group span-${span}`} key={field.key}>
+                        <span className="option-group-label" id={`sourceFieldLabel-${field.key}`}>{label}</span>
+                        <div className="option-cards compact" id={`sourceField-${field.key}`} role="radiogroup" aria-labelledby={`sourceFieldLabel-${field.key}`}>
+                          {choices.map(choice => (
+                            <button
+                              key={choice.value}
+                              type="button"
+                              role="radio"
+                              aria-checked={(sourceValues[field.key] ?? '') === choice.value}
+                              data-value={choice.value}
+                              className={`option-card${(sourceValues[field.key] ?? '') === choice.value ? ' selected' : ''}`}
+                              onClick={() => setSourceValues((current) => ({ ...current, [field.key]: choice.value }))}
+                            >
+                              <span className="option-card-name">{t(choice.label)}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className={`form-group span-${span}`} key={field.key}>
+                      <label htmlFor={`sourceField-${field.key}`}>{label}</label>
+                      <input
+                        id={`sourceField-${field.key}`}
+                        type={field.kind === 'secret' ? 'password' : field.kind === 'port' ? 'number' : 'text'}
+                        inputMode={field.kind === 'port' ? 'numeric' : undefined}
+                        min={field.kind === 'port' ? 1 : undefined}
+                        max={field.kind === 'port' ? 65535 : undefined}
+                        value={sourceValues[field.key] ?? ''}
+                        onChange={(e) => setSourceValues((current) => ({ ...current, [field.key]: e.target.value }))}
+                        autoComplete={field.kind === 'secret' ? 'new-password' : 'off'}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
             )}
-            {addHostError && <div className="add-host-error" role="alert" ref={addHostErrorRef}>{addHostError}</div>}
-            <div className="host-confirm-actions">
-              <button type="button" className="btn-secondary" disabled={addHostBusy} onClick={closeAddHost}>{t('Cancel')}</button>
-              <button type="submit" className="btn-primary" disabled={addHostBusy}>
-                {editSource ? (addHostBusy ? t('Saving…') : t('Save')) : (addHostBusy ? t('Adding…') : t('Add'))}
-              </button>
-            </div>
+            {!sourceSetup && editSource && (sameChoices.length > 0 || editSameWas) && (
+              <div className="form-group">
+                <span className="option-group-label" id="sourceSameLabel">{t('Same computer as')}</span>
+                <div className="option-cards compact scroll" id="sourceSame" role="radiogroup" aria-labelledby="sourceSameLabel">
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={editSame === ''}
+                    className={`option-card${editSame === '' ? ' selected' : ''}`}
+                    onClick={() => setEditSame('')}
+                  >
+                    <span className="option-card-name">{t('A computer of its own')}</span>
+                  </button>
+                  {sameChoices.map(card => (
+                    <button
+                      key={card.key}
+                      type="button"
+                      role="radio"
+                      aria-checked={editSame === card.key}
+                      className={`option-card${editSame === card.key ? ' selected' : ''}`}
+                      onClick={() => setEditSame(card.key)}
+                    >
+                      <span className="option-card-name">{card.title}</span>
+                    </button>
+                  ))}
+                </div>
+                <span className="form-hint">{t('Computers that are the same machine are shown as one, with a way to connect for each.')}</span>
+              </div>
+            )}
+            {!sourceSetup && addHostError && <div className="add-host-error" role="alert" ref={addHostErrorRef}>{addHostError}</div>}
+            {sourceSetup ? (
+              <div className="host-confirm-actions">
+                {sourceSetup.failed && (
+                  <button type="button" className="btn-secondary" onClick={() => setSourceSetup(null)}>{t('Back')}</button>
+                )}
+                <button type="button" className={sourceSetup.failed ? 'btn-primary' : 'btn-secondary'} onClick={closeAddHost}>
+                  {sourceSetup.failed ? t('Close') : t('Cancel')}
+                </button>
+              </div>
+            ) : (
+              <div className="host-confirm-actions">
+                <button type="button" className="btn-secondary" disabled={addHostBusy} onClick={closeAddHost}>{t('Cancel')}</button>
+                <button type="submit" className="btn-primary" disabled={addHostBusy}>
+                  {editSource ? (addHostBusy ? t('Saving…') : t('Save')) : (addHostBusy ? t('Adding…') : t('Add'))}
+                </button>
+              </div>
+            )}
           </form>
         </div>
       )}

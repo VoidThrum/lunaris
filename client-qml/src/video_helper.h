@@ -41,7 +41,13 @@ void warp_cursor_helper(int x, int y);
 // Refresh rate in Hz of the screen the app's window is on (the primary screen
 // before a window exists), 0 when unknown.
 double window_screen_refresh_rate();
+// Asks the window system for the key combinations it keeps for itself
+// (Alt+Tab, the Super key, ...) while `grab`, for the stream window
+// (keyboard_grab.cpp).
 void set_keyboard_grab_helper(bool grab);
+// How it does that: see keyboard_grab.cpp (0 not at all, 1 the Wayland
+// compositor, 2 an X11 grab, 3 an X11 grab under XWayland, 4 inside the app only).
+int system_keys_support_helper();
 
 void register_bridge_instance(StreamBridge* bridge);
 void set_pointer_locked_helper(bool locked);

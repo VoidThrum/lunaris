@@ -16,6 +16,7 @@ CheckBox {
         Icon { anchors.centerIn: parent; visible: cb.checked; name: "check"; size: 14; strokeWidth: 2.4; color: "#ffffff" }
     }
     contentItem: Text {
+        textFormat: Text.PlainText
         leftPadding: cb.indicator.width + cb.spacing
         text: cb.text
         color: Theme.text

@@ -364,6 +364,9 @@ pub async fn run_agent(
     let (agent_tx, router) = hub::spawn_router(hub.clone());
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<SignalingMessage>();
     let mut tasks = AbortOnDrop(vec![router]);
+    // A set-up of a computer being added (a pairing that waits for its PIN)
+    // does not outlive the agent that started it.
+    let _setups = crate::connector::sources::StopSetupsOnDrop(crate::pairing::config_path().to_string());
 
     if config.direct_enabled {
         if crate::pairing::ensure_direct_password(&mut config) {
@@ -594,6 +597,8 @@ async fn connect_server_once(
     // kinds it can show (again whenever it changes them).
     let manageable = config.server_sessions.trim() != "ask";
     let server_tx_for_sources = server_tx.clone();
+    // Again when a set-up (a pairing) has added one, whoever still asks about it.
+    let _announcing = crate::connector::sources::announce_changes(server_tx.clone(), manageable);
     let _ = server_tx.send(crate::connector::sources::announcement(manageable));
     let gate = ServerGate::new(config.server_sessions.trim() == "ask", server_tx, inbound_tx.clone());
 
@@ -629,20 +634,14 @@ async fn connect_server_once(
             Ok(ServerToAgentMessage::ChangeSource { request_id, change, requester }) => {
                 // A computer that asks at its screen before each connection
                 // is not changed from the server: its sources are added in
-                // the Lunaris app on it.
-                let result = if manageable {
-                    info!("Sources: {:?} asked for by {} through the server", change, requester.as_deref().unwrap_or("someone"));
-                    crate::connector::sources::apply(&change)
-                } else {
-                    Err(crate::connector::sources::NOT_MANAGEABLE.to_string())
-                };
-                let (id, error) = match result {
-                    Ok(id) => (Some(id), None),
-                    Err(error) => (None, Some(error)),
-                };
-                // The new list first: the server has it when the answer is out.
-                let _ = server_tx_for_sources.send(crate::connector::sources::announcement(manageable));
-                let _ = server_tx_for_sources.send(AgentMessage::SourceChanged { request_id, id, error });
+                // the Lunaris app on it. Adding can wait a few seconds for a
+                // set-up's first step, so not on this loop.
+                let tx = server_tx_for_sources.clone();
+                tokio::task::spawn_blocking(move || {
+                    for message in crate::connector::sources::reply(request_id, &change, requester.as_deref(), "the server", manageable) {
+                        let _ = tx.send(message);
+                    }
+                });
             }
             // What a newer server may send is not written out: it can hold
             // what a person typed.
@@ -1512,9 +1511,10 @@ async fn run_session_logic(
                         // pointer by what that computer is.
                         host_os: Some(crate::connector::media::source_os().unwrap_or_else(|| std::env::consts::OS.to_string())),
                         // The other computers this one shows: id and name only.
+                        // (Not their groups: a viewer picks one by its name.)
                         sources: crate::connector::configured_sources()
                             .into_iter()
-                            .map(|s| common::SourceInfoMsg { id: s.id, name: s.name, connector: s.target.connector })
+                            .map(|s| common::SourceInfoMsg { id: s.id, name: s.name, connector: s.target.connector, group: None })
                             .collect(),
                     },
                 );

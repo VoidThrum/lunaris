@@ -215,6 +215,10 @@ pub struct PendingHostCursor {
     /// The host's `pointer_maybe_in_picture` (absent = false): its pointer
     /// may be drawn into the picture; `pointer_in_picture` then looks.
     pub pointer_maybe_in_picture: bool,
+    /// The host's `pointer_in_picture` is "always" (absent = false): its
+    /// pointer is part of its picture for the whole session, and the viewer
+    /// shows no pointer over the picture.
+    pub pointer_always_in_picture: bool,
     pub image_data_url: String,
     pub image_width: i32,
     pub image_height: i32,
@@ -422,6 +426,13 @@ pub static PENDING_SOURCE_STATUS: std::sync::Mutex<Option<(String, String)>> = s
 /// to QML (`source_displays_updated`).
 pub static PENDING_SOURCE_DISPLAYS: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
+/// The delay between the agent and the computer it shows, there and back,
+/// in microseconds, as the agent last told it on the general data channel
+/// (`own_computers::source_latency_ms`); 0 when it told none (it shows its
+/// own screen, or its connector does not measure it). Added to the ping
+/// shown; put back to 0 when a session starts or stops.
+pub static SOURCE_LATENCY_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Restarts a source asked for in a row, and when the last one was.
 static SOURCE_RESTARTS: std::sync::Mutex<(u32, Option<std::time::Instant>)> = std::sync::Mutex::new((0, None));
 
@@ -570,18 +581,9 @@ fn is_autostart_enabled_impl() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("reg")
-            .args(&[
-                "query",
-                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                "/v",
-                "LunarisClient",
-            ])
-            .output();
-        if let Ok(out) = output {
-            return out.status.success();
-        }
+        return crate::win_autostart::is_enabled();
     }
+    #[allow(unreachable_code)]
     false
 }
 
@@ -628,20 +630,10 @@ fn set_autostart_enabled_impl(enabled: bool) {
         }
         #[cfg(target_os = "windows")]
         {
-            let val = format!("\"{}\" --minimized", exe_path);
-            let _ = std::process::Command::new("reg")
-                .args(&[
-                    "add",
-                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                    "/v",
-                    "LunarisClient",
-                    "/t",
-                    "REG_SZ",
-                    "/d",
-                    &val,
-                    "/f",
-                ])
-                .output();
+            // A scheduled task, not the Run key: see win_autostart.rs.
+            if let Err(e) = crate::win_autostart::enable(&exe_path) {
+                eprintln!("Autostart could not be set: {}", e);
+            }
         }
     } else {
         #[cfg(target_os = "linux")]
@@ -658,15 +650,7 @@ fn set_autostart_enabled_impl(enabled: bool) {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("reg")
-                .args(&[
-                    "delete",
-                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                    "/v",
-                    "LunarisClient",
-                    "/f",
-                ])
-                .output();
+            crate::win_autostart::disable();
         }
     }
 }
@@ -723,6 +707,9 @@ pub mod qobject {
 
         #[rust_name = "set_keyboard_grab_helper"]
         fn set_keyboard_grab_helper(grab: bool);
+
+        #[rust_name = "system_keys_support_helper"]
+        fn system_keys_support_helper() -> i32;
 
         #[rust_name = "register_bridge_instance"]
         unsafe fn register_bridge_instance(bridge: *mut StreamBridge);
@@ -850,6 +837,12 @@ pub mod qobject {
         /// drag: hide the viewer's own pointer as for `in_window_move_size`.
         #[qsignal]
         fn pointer_in_picture_updated(self: Pin<&mut StreamBridge>, maybe: bool, found: bool);
+
+        /// With every cursor message: whether the host says its pointer is
+        /// part of its picture for the whole session (`pointer_in_picture`
+        /// is "always"). The viewer then shows no pointer over the picture.
+        #[qsignal]
+        fn pointer_always_in_picture_updated(self: Pin<&mut StreamBridge>, always: bool);
 
         #[qsignal]
         fn host_cursor_image_updated(
@@ -1014,6 +1007,31 @@ pub mod qobject {
 
         #[qinvokable]
         fn send_key_event(self: Pin<&mut StreamBridge>, key: i32, modifiers: i32, is_down: bool);
+
+        /// A key event with the key's position (Qt's `nativeScanCode`) and
+        /// whether it is the key repeating.
+        #[qinvokable]
+        fn send_key_event_at(
+            self: Pin<&mut StreamBridge>,
+            key: i32,
+            modifiers: i32,
+            native_scan_code: i32,
+            is_down: bool,
+            is_auto_repeat: bool,
+        );
+
+        /// Lets go of every key held on the remote computer (the stream
+        /// view stopped getting the keyboard).
+        #[qinvokable]
+        fn release_all_keys(self: Pin<&mut StreamBridge>);
+
+        /// How the window system gives the window the system's shortcuts:
+        /// "compositor" (Wayland: for as long as it is asked, it may ask
+        /// the user), "grab" (X11), "grab-maybe" (XWayland: the desktop may
+        /// ignore the grab), "window" (inside the app only: no system
+        /// shortcut is taken), "no".
+        #[qinvokable]
+        fn system_keys_support(self: Pin<&mut StreamBridge>) -> QString;
 
         #[qinvokable]
         fn warp_cursor(self: Pin<&mut StreamBridge>, x: i32, y: i32);
@@ -1244,14 +1262,36 @@ pub mod qobject {
         fn bridge_sources(self: Pin<&mut StreamBridge>) -> QString;
 
         /// Adds one; `values_json` is `{"<field key>": "<value>"}`. Returns
-        /// `{"id": ...}` or `{"error": ...}`.
+        /// `{"id": ...}` or `{"error": ...}`, or, when its type has a set-up
+        /// (a pairing), `{"setup": ..., "message": ..., "code": ...}`: what
+        /// to show the person; ask on with `bridgeSourceSetup`.
         #[qinvokable]
         fn bridge_add_source(self: Pin<&mut StreamBridge>, name: QString, connector: QString, values_json: QString) -> QString;
+
+        /// `bridgeAddSource`, saying which computer it is: `group` is the
+        /// group of the computers that are one with it ("" for none, "*" to
+        /// let it join a computer at the same address).
+        #[qinvokable]
+        fn bridge_add_source_grouped(self: Pin<&mut StreamBridge>, name: QString, connector: QString, values_json: QString, group: QString) -> QString;
+
+        /// Where that set-up is: `{"state":"pending","message":...,"code":...}`,
+        /// `{"state":"done","id":...}` or `{"state":"failed","error":...}`.
+        #[qinvokable]
+        fn bridge_source_setup(self: Pin<&mut StreamBridge>, setup: QString) -> QString;
+
+        /// Stops that set-up (the window was closed).
+        #[qinvokable]
+        fn bridge_cancel_setup(self: Pin<&mut StreamBridge>, setup: QString);
 
         /// Changes one: its name and its fields (an empty or missing field
         /// keeps its value). Returns `{"id": ...}` or `{"error": ...}`.
         #[qinvokable]
         fn bridge_update_source(self: Pin<&mut StreamBridge>, id: QString, name: QString, values_json: QString) -> QString;
+
+        /// `bridgeUpdateSource`, and its group: "" takes it out of its
+        /// group, "*" keeps it.
+        #[qinvokable]
+        fn bridge_update_source_grouped(self: Pin<&mut StreamBridge>, id: QString, name: QString, values_json: QString, group: QString) -> QString;
 
         /// Removes one; returns an error message or "".
         #[qinvokable]
@@ -1528,6 +1568,12 @@ impl qobject::StreamBridge {
         }
         self.as_mut().rust_mut().tokio_runtime = None;
         *self.as_mut().rust_mut().input_senders.lock().unwrap() = None;
+        // What the last session's source said of its delay is not the next
+        // one's (after the runtime went: nothing of the old session sets it).
+        SOURCE_LATENCY_US.store(0, std::sync::atomic::Ordering::Relaxed);
+        // Nothing is held on a computer that is no longer shown (the host
+        // lets the keys go itself when the session ends).
+        super::input::forget_pressed_keys();
 
         let decoder_handle = self
             .as_mut()
@@ -1602,6 +1648,47 @@ impl qobject::StreamBridge {
         if let Some(ref s) = *senders {
             super::input::handle_key_event(key, modifiers, is_down, s);
         }
+    }
+
+    pub fn send_key_event_at(
+        self: Pin<&mut Self>,
+        key: i32,
+        modifiers: i32,
+        native_scan_code: i32,
+        is_down: bool,
+        is_auto_repeat: bool,
+    ) {
+        let binding = self.as_ref();
+        let senders = binding.rust().input_senders.lock().unwrap();
+        if let Some(ref s) = *senders {
+            super::input::handle_key_event_at(
+                key,
+                modifiers,
+                native_scan_code.max(0) as u32,
+                is_down,
+                is_auto_repeat,
+                s,
+            );
+        }
+    }
+
+    pub fn release_all_keys(self: Pin<&mut Self>) {
+        let binding = self.as_ref();
+        let senders = binding.rust().input_senders.lock().unwrap();
+        match *senders {
+            Some(ref s) => super::input::release_all_keys(s),
+            None => super::input::forget_pressed_keys(),
+        }
+    }
+
+    pub fn system_keys_support(self: Pin<&mut Self>) -> QString {
+        QString::from(match qobject::system_keys_support_helper() {
+            1 => "compositor",
+            2 => "grab",
+            3 => "grab-maybe",
+            4 => "window",
+            _ => "no",
+        })
     }
 
     pub fn warp_cursor(self: Pin<&mut Self>, x: i32, y: i32) {
@@ -1770,6 +1857,8 @@ impl qobject::StreamBridge {
     pub fn poll_cursor(mut self: Pin<&mut Self>) {
         let cursor = { PENDING_HOST_CURSOR.lock().unwrap().take() };
         if let Some(cursor) = cursor {
+            // First: what follows is not drawn when the pointer is in the picture.
+            self.as_mut().pointer_always_in_picture_updated(cursor.pointer_always_in_picture);
             let kind_qstring = cxx_qt_lib::QString::from(&cursor.kind);
             self.as_mut().host_cursor_updated(
                 cursor.x,
@@ -2989,11 +3078,27 @@ impl qobject::StreamBridge {
     }
 
     pub fn bridge_add_source(self: Pin<&mut Self>, name: QString, connector: QString, values_json: QString) -> QString {
-        QString::from(&crate::own_computers::add_source(&name.to_string(), &connector.to_string(), &values_json.to_string()))
+        QString::from(&crate::own_computers::add_source(&name.to_string(), &connector.to_string(), &values_json.to_string(), crate::own_computers::GROUP_UNSAID))
+    }
+
+    pub fn bridge_add_source_grouped(self: Pin<&mut Self>, name: QString, connector: QString, values_json: QString, group: QString) -> QString {
+        QString::from(&crate::own_computers::add_source(&name.to_string(), &connector.to_string(), &values_json.to_string(), &group.to_string()))
+    }
+
+    pub fn bridge_source_setup(self: Pin<&mut Self>, setup: QString) -> QString {
+        QString::from(&crate::own_computers::source_setup(&setup.to_string()))
+    }
+
+    pub fn bridge_cancel_setup(self: Pin<&mut Self>, setup: QString) {
+        crate::own_computers::cancel_setup(&setup.to_string());
     }
 
     pub fn bridge_update_source(self: Pin<&mut Self>, id: QString, name: QString, values_json: QString) -> QString {
-        QString::from(&crate::own_computers::update_source(&id.to_string(), &name.to_string(), &values_json.to_string()))
+        QString::from(&crate::own_computers::update_source(&id.to_string(), &name.to_string(), &values_json.to_string(), crate::own_computers::GROUP_UNSAID))
+    }
+
+    pub fn bridge_update_source_grouped(self: Pin<&mut Self>, id: QString, name: QString, values_json: QString, group: QString) -> QString {
+        QString::from(&crate::own_computers::update_source(&id.to_string(), &name.to_string(), &values_json.to_string(), &group.to_string()))
     }
 
     pub fn bridge_remove_source(self: Pin<&mut Self>, id: QString) -> QString {
@@ -3393,6 +3498,13 @@ fn host_cursor_image(image: &serde_json::Value) -> Option<super::pointer_in_pict
     })
 }
 
+/// `pointer_in_picture` of a `host_cursor` message: only "always" says that
+/// the host's pointer is part of its picture for the whole session. Hosts
+/// from before the field do not send it; other hosts send null.
+fn pointer_always_in_picture(message: &serde_json::Value) -> bool {
+    message.get("pointer_in_picture").and_then(|v| v.as_str()) == Some("always")
+}
+
 fn handle_host_cursor_message(data: &[u8]) {
     let Ok(text) = std::str::from_utf8(data) else {
         return;
@@ -3428,6 +3540,7 @@ fn handle_host_cursor_message(data: &[u8]) {
         .get("pointer_maybe_in_picture")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let pointer_always_in_picture = pointer_always_in_picture(&value);
     let (image_data_url, image_width, image_height, image_hotspot_x, image_hotspot_y) = value
         .get("image")
         .and_then(encode_cursor_png_data_url)
@@ -3445,6 +3558,7 @@ fn handle_host_cursor_message(data: &[u8]) {
         kind,
         in_window_move_size,
         pointer_maybe_in_picture,
+        pointer_always_in_picture,
         image_data_url,
         image_width,
         image_height,
@@ -3754,6 +3868,9 @@ impl PeerConnectionEventHandler for ClientEventHandler {
                                 // A source lists its displays here too.
                                 if let Some(displays) = crate::own_computers::source_displays(&msg.data) {
                                     *PENDING_SOURCE_DISPLAYS.lock().unwrap() = Some(displays);
+                                } else if let Some(ms) = crate::own_computers::source_latency_ms(&msg.data) {
+                                    // And how far it is from the computer it shows.
+                                    SOURCE_LATENCY_US.store((ms * 1000.0).round() as u32, std::sync::atomic::Ordering::Relaxed);
                                 } else {
                                     handle_host_cursor_message(&msg.data);
                                 }
@@ -3766,6 +3883,7 @@ impl PeerConnectionEventHandler for ClientEventHandler {
                                     kind: "arrow".to_string(),
                                     in_window_move_size: false,
                                     pointer_maybe_in_picture: false,
+                                    pointer_always_in_picture: false,
                                     image_data_url: String::new(),
                                     image_width: 0,
                                     image_height: 0,
@@ -3834,7 +3952,7 @@ async fn handle_remote_track(
             };
             
             let annex_b_buf = Vec::<u8>::new();
-            let av1_obu_buf = Vec::<u8>::new();
+            let av1_assembler = crate::av1_rtp::Av1Assembler::default();
             
             let frame_count = 0;
             let byte_count = 0;
@@ -3925,7 +4043,7 @@ async fn handle_remote_track(
             let thread_handle = std::thread::spawn(move || {
                 let mut decoder = decoder;
                 let mut annex_b_buf = annex_b_buf;
-                let mut av1_obu_buf = av1_obu_buf;
+                let mut av1_assembler = av1_assembler;
                 let mut frame_count = frame_count;
                 let mut byte_count = byte_count;
                 let mut last_stats_time = last_stats_time;
@@ -3989,7 +4107,7 @@ async fn handle_remote_track(
                         pending_packets_decoder.store(0, std::sync::atomic::Ordering::SeqCst);
                         packet_buffer.clear();
                         annex_b_buf.clear();
-                        av1_obu_buf.clear();
+                        av1_assembler.reset();
                         h264_wait_for_idr = true;
                         h264_dropping_fragment = false;
                         h264_fragment_is_idr = false;
@@ -4080,7 +4198,7 @@ async fn handle_remote_track(
                         
                         // Clear corrupted frame buffer and request keyframe
                         annex_b_buf.clear();
-                        av1_obu_buf.clear();
+                        av1_assembler.reset();
                         h264_wait_for_idr = true;
                         h264_dropping_fragment = false;
                         h264_fragment_is_idr = false;
@@ -4573,97 +4691,12 @@ async fn handle_remote_track(
                                 }
                             }
                             super::decoder::CodecType::AV1 => {
-                                let h = payload[0];
-                                let z = (h & 0x80) != 0;
-                                let y = (h & 0x40) != 0;
-                                let w = (h & 0x30) >> 4;
-                                
-                                let mut offset = 1;
-                                
-                                let read_leb128 = |off: &mut usize| -> Option<usize> {
-                                    let mut value = 0;
-                                    let mut shift = 0;
-                                    while *off < payload.len() {
-                                        let b = payload[*off];
-                                        *off += 1;
-                                        value |= ((b & 0x7F) as usize) << shift;
-                                        if (b & 0x80) == 0 {
-                                            return Some(value);
-                                        }
-                                        shift += 7;
-                                        if shift >= 35 {
-                                            return None;
-                                        }
-                                    }
-                                    None
-                                };
-                                
-                                let mut first = true;
-                                
-                                // Process AV1 OBU fragment
-                                let mut process_fragment = |element_data: &[u8], is_first_elem: bool, is_last_elem: bool, av1_obu_buf_ref: &mut Vec<u8>, decoder_ref: &mut super::decoder::HardwareDecoder, decode_count_ref: &mut usize, total_decode_time_ref: &mut f64, frame_count_ref: &mut usize, has_decoded_ref: &Arc<std::sync::atomic::AtomicBool>, sink_ref: &VideoSinkWrapper| {
-                                    if is_first_elem && z {
-                                        av1_obu_buf_ref.extend_from_slice(element_data);
-                                    } else {
-                                        if !av1_obu_buf_ref.is_empty() {
-                                            if let Err(e) = process_and_deliver(av1_obu_buf_ref, decoder_ref, decode_count_ref, total_decode_time_ref, frame_count_ref, has_decoded_ref, sink_ref) {
-                                                eprintln!("Decoder error: {:?}. Requesting keyframe...", e);
-                                                av1_obu_buf_ref.clear();
-                                                let _ = pli_tx.send(());
-                                            }
-                                        }
-                                        av1_obu_buf_ref.extend_from_slice(element_data);
-                                    }
-                                    
-                                    if is_last_elem && y {
-                                        // Fragment continues in next packet
-                                    } else {
-                                        if let Err(e) = process_and_deliver(av1_obu_buf_ref, decoder_ref, decode_count_ref, total_decode_time_ref, frame_count_ref, has_decoded_ref, sink_ref) {
-                                            eprintln!("Decoder error: {:?}. Requesting keyframe...", e);
-                                            av1_obu_buf_ref.clear();
-                                            let _ = pli_tx.send(());
-                                        }
-                                    }
-                                };
-                                
-                                if w == 0 {
-                                    while offset < payload.len() {
-                                        if let Some(size) = read_leb128(&mut offset) {
-                                            if offset + size <= payload.len() {
-                                                let element_data = &payload[offset..offset + size];
-                                                offset += size;
-                                                let is_last = offset >= payload.len();
-                                                process_fragment(element_data, first, is_last, &mut av1_obu_buf, &mut decoder, &mut decode_count, &mut total_decode_time_ms, &mut frame_count, &has_decoded, &sink_inner);
-                                                first = false;
-                                            } else {
-                                                break;
-                                            }
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    for i in 0..w {
-                                        let is_first = i == 0;
-                                        let is_last = i == w - 1;
-                                        if !is_last {
-                                            if let Some(size) = read_leb128(&mut offset) {
-                                                if offset + size <= payload.len() {
-                                                    let element_data = &payload[offset..offset + size];
-                                                    offset += size;
-                                                    process_fragment(element_data, is_first, is_last, &mut av1_obu_buf, &mut decoder, &mut decode_count, &mut total_decode_time_ms, &mut frame_count, &has_decoded, &sink_inner);
-                                                } else {
-                                                    break;
-                                                }
-                                            } else {
-                                                break;
-                                            }
-                                        } else {
-                                            if offset < payload.len() {
-                                                let element_data = &payload[offset..];
-                                                process_fragment(element_data, is_first, is_last, &mut av1_obu_buf, &mut decoder, &mut decode_count, &mut total_decode_time_ms, &mut frame_count, &has_decoded, &sink_inner);
-                                            }
-                                        }
+                                // The packets of a frame become one temporal
+                                // unit (av1_rtp.rs); the decoder gets it whole.
+                                if let Some(unit) = av1_assembler.push(current_expected, pkt.header.timestamp, pkt.header.marker, payload) {
+                                    if let Err(e) = process_and_deliver(&unit, &mut decoder, &mut decode_count, &mut total_decode_time_ms, &mut frame_count, &has_decoded, &sink_inner) {
+                                        eprintln!("Decoder error: {:?}. Requesting keyframe...", e);
+                                        let _ = pli_tx.send(());
                                     }
                                 }
                             }
@@ -5057,6 +5090,16 @@ async fn setup_peer_connection(
             .with_setting_engine(
                 rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder::new()
                     .with_srtp_replay_protection_window(1024)
+                    // The ping shown is the round trip of ICE's check of the
+                    // pair in use: one STUN request and its answer, timed
+                    // (rtc-ice candidate_pair.rs `on_response_received` sets
+                    // `current_round_trip_time`), sent every keepalive
+                    // interval (agent/mod.rs `check_keepalive`), which is 2 s
+                    // unless said otherwise (agent_config.rs
+                    // `DEFAULT_KEEPALIVE_INTERVAL`). Every second here, so
+                    // that the ping is a second old at most. The other two
+                    // times stay the library's (None).
+                    .with_ice_timeouts(None, None, Some(std::time::Duration::from_secs(1)))
                     .build(),
             )
             .with_handler(handler)
@@ -5229,6 +5272,15 @@ async fn run_webrtc_client_task(
     let has_wt = Arc::clone(&wt_connected);
     tokio::spawn(async move {
         while let Some(buf) = kb_rx.recv().await {
+            // Keys go on the reliable, ordered data channel whenever there is
+            // one: a WebTransport datagram may be lost or arrive out of
+            // order, and a lost release leaves the key held on the host.
+            let chan = { k_c.lock().unwrap().clone() };
+            if let Some(chan) = chan {
+                if chan.send(bytes::BytesMut::from(&buf[..])).await.is_ok() {
+                    continue;
+                }
+            }
             let wt_sent = if has_wt.load(std::sync::atomic::Ordering::Acquire) {
                 let lock = wt_c.lock().unwrap();
                 if let Some(ref conn) = *lock {
@@ -5766,7 +5818,12 @@ async fn run_webrtc_client_task(
                                     }
 
                                     if let Some(ref mut s) = *STREAM_STATS.lock().unwrap() {
-                                        s.ping = dynamic_ping;
+                                        // To the agent and back, plus from the agent to the
+                                        // computer it shows and back when it shows another.
+                                        s.ping = crate::own_computers::shown_ping_ms(
+                                            dynamic_ping,
+                                            SOURCE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+                                        );
                                         s.connection_type = conn_type;
                                     }
                                 }
@@ -5838,6 +5895,7 @@ async fn run_webrtc_client_task(
 #[cfg(test)]
 mod source_tests {
     use super::{decode_codecs_for_request, source_restart_allowed};
+    use crate::av1_rtp::av1_obu_with_size;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -5860,6 +5918,27 @@ mod source_tests {
         assert_eq!(decode_codecs_for_request(all(), "hevc"), ["h265", "h264", "av1"]);
         // One this client has no decoder for is not added.
         assert_eq!(decode_codecs_for_request(vec!["h264".to_string()], "av1"), ["h264"]);
+    }
+
+    #[test]
+    fn an_av1_obu_from_rtp_gets_its_size_field() {
+        // OBU_FRAME (type 6), no extension, no size: header 0x30.
+        let mut obu = vec![0x30];
+        obu.extend(std::iter::repeat(7u8).take(200));
+        let out = av1_obu_with_size(&obu).unwrap();
+        assert_eq!(out[0], 0x32);
+        assert_eq!(&out[1..3], &[0xC8, 0x01], "200 as LEB128");
+        assert_eq!(&out[3..], &obu[1..]);
+        // With an extension byte: the size comes after it.
+        let out = av1_obu_with_size(&[0x34, 0x08, 1, 2, 3]).unwrap();
+        assert_eq!(out, [0x36, 0x08, 3, 1, 2, 3]);
+        // Has its size already: unchanged.
+        assert_eq!(av1_obu_with_size(&[0x0A, 1, 9]).unwrap(), [0x0A, 1, 9]);
+        // A sequence header alone, payload of one byte.
+        assert_eq!(av1_obu_with_size(&[0x08, 5]).unwrap(), [0x0A, 1, 5]);
+        assert!(av1_obu_with_size(&[]).is_none());
+        assert!(av1_obu_with_size(&[0x80, 1]).is_none());
+        assert!(av1_obu_with_size(&[0x34]).is_none());
     }
 }
 
@@ -5912,13 +5991,18 @@ mod chroma_tests {
 
 #[cfg(test)]
 mod host_cursor_tests {
-    use super::{handle_host_cursor_message, PENDING_HOST_CURSOR};
+    use super::{handle_host_cursor_message, pointer_always_in_picture, PENDING_HOST_CURSOR};
+
+    /// The pending message is one place for the whole process: the tests
+    /// that put one there and take it do so one at a time.
+    static TAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// `pointer_maybe_in_picture` is optional: hosts from before it, and
     /// hosts that know when their pointer is in the picture, do not send it.
     #[test]
     fn pointer_maybe_in_picture_is_optional() {
         let take = |json: &str| {
+            let _one = TAKING.lock().unwrap_or_else(|e| e.into_inner());
             handle_host_cursor_message(json.as_bytes());
             PENDING_HOST_CURSOR.lock().unwrap().take().expect("a host_cursor message")
         };
@@ -5930,5 +6014,39 @@ mod host_cursor_tests {
         assert!(!cursor.in_window_move_size);
         let cursor = take(r#"{"type":"host_cursor","x":10,"y":20,"pointer_maybe_in_picture":false}"#);
         assert!(!cursor.pointer_maybe_in_picture);
+    }
+
+    /// `pointer_in_picture` is its own field: only "always" counts, and
+    /// neither of the other two flags stands for it (nor it for them).
+    #[test]
+    fn pointer_always_in_picture_is_its_own_field() {
+        let says = |json: &str| pointer_always_in_picture(&serde_json::from_str(json).unwrap());
+        // As a Sunshine source's agent sends it.
+        assert!(says(
+            r#"{"type":"host_cursor","x":0,"y":0,"visible":false,"kind":"arrow","image":null,"in_window_move_size":false,"pointer_maybe_in_picture":false,"pointer_in_picture":"always"}"#
+        ));
+        // Hosts from before the field, hosts that send null, anything else.
+        assert!(!says(r#"{"type":"host_cursor","x":10,"y":20}"#));
+        assert!(!says(r#"{"type":"host_cursor","x":10,"y":20,"pointer_in_picture":null}"#));
+        assert!(!says(r#"{"type":"host_cursor","x":10,"y":20,"pointer_in_picture":true}"#));
+        assert!(!says(r#"{"type":"host_cursor","x":10,"y":20,"pointer_in_picture":"never"}"#));
+        assert!(!says(r#"{"type":"host_cursor","x":10,"y":20,"in_window_move_size":true,"pointer_maybe_in_picture":true}"#));
+    }
+
+    /// The whole message, as the UI thread takes it.
+    #[test]
+    fn a_message_of_a_host_whose_pointer_is_always_in_its_picture() {
+        // One lock for the two tests of this module that take the pending message.
+        let take = |json: &str| {
+            let _one = TAKING.lock().unwrap_or_else(|e| e.into_inner());
+            handle_host_cursor_message(json.as_bytes());
+            PENDING_HOST_CURSOR.lock().unwrap().take().expect("a host_cursor message")
+        };
+        let cursor = take(r#"{"type":"host_cursor","x":0,"y":0,"visible":false,"kind":"arrow","image":null,"in_window_move_size":false,"pointer_maybe_in_picture":false,"pointer_in_picture":"always"}"#);
+        assert!(cursor.pointer_always_in_picture);
+        assert!(!cursor.in_window_move_size && !cursor.pointer_maybe_in_picture && !cursor.visible);
+        let cursor = take(r#"{"type":"host_cursor","x":10,"y":20,"visible":true,"kind":"arrow","in_window_move_size":true,"pointer_maybe_in_picture":true}"#);
+        assert!(!cursor.pointer_always_in_picture);
+        assert!(cursor.in_window_move_size && cursor.pointer_maybe_in_picture);
     }
 }

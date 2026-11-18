@@ -26,6 +26,9 @@ enum FromAgent {
     /// In the place of `connect`: a session for the target's files, which
     /// this connector has none of (its manifest does not say `files`).
     OpenFiles {},
+    /// In the place of `connect`: the set-up of a target being added (the
+    /// manifest says `setup`).
+    Setup { target: Target },
     PointerMove { x: i32, y: i32 },
     PointerMoveRelative { dx: i32, dy: i32 },
     PointerButton { button: String, down: bool },
@@ -65,6 +68,9 @@ struct Target {
     then_file: String,
     #[serde(default)]
     then_after: String,
+    /// "1": adding this target has a (pretend) pairing first.
+    #[serde(default)]
+    pair: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +94,15 @@ enum ToAgent<'a> {
     /// Payload: the text.
     Clipboard,
     Displays { displays: Vec<Display<'a>>, current: usize },
+    /// Of a set-up: something to show the person, with a code (a PIN) or without.
+    SetupStep {
+        message: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<&'a str>,
+    },
+    /// The set-up's end: values the agent keeps with the target and hands
+    /// back in every later `connect` (they are never shown to anyone).
+    SetupDone { values: std::collections::BTreeMap<&'a str, &'a str> },
     Closed { reason: &'a str },
 }
 
@@ -205,6 +220,47 @@ fn main() {
     }
 }
 
+/// The set-up of a target being added. A real connector pairs with the
+/// other computer here: it makes a PIN, says it in a `setup_step`, waits
+/// until the person typed it there, and returns what it got (a certificate,
+/// a key) in `setup_done`. This one pretends, for a target with `pair` "1":
+/// the PIN is 0000, and the "other computer" accepts it when a file named
+/// `paired` appears in this program's folder (or refuses when one named
+/// `refused` does), or by itself after the seconds in the environment
+/// variable `LUNARIS_TEMPLATE_PAIR_SECONDS`. Any other target has nothing to
+/// set up.
+fn set_up(target: &Target) -> Result<(), String> {
+    let io_err = |e: io::Error| e.to_string();
+    if target.pair != "1" {
+        return send(&ToAgent::SetupDone { values: Default::default() }, &[]).map_err(io_err);
+    }
+    // The agent closing our input (the person closed the window, the agent
+    // ended) ends the set-up. The agent also stops the program.
+    std::thread::spawn(|| {
+        let mut stdin = io::stdin().lock();
+        while let Ok(Some(_)) = receive(&mut stdin) {}
+        std::process::exit(0);
+    });
+    send(&ToAgent::SetupStep { message: "Starting the demo pairing", code: None }, &[]).map_err(io_err)?;
+    send(&ToAgent::SetupStep { message: "Enter this PIN at the other computer. (Demo: create a file named \"paired\" in the connector's folder.)", code: Some("0000") }, &[])
+        .map_err(io_err)?;
+    let by_itself = std::env::var("LUNARIS_TEMPLATE_PAIR_SECONDS").ok().and_then(|s| s.parse::<f64>().ok()).map(Duration::from_secs_f64);
+    let start = Instant::now();
+    loop {
+        if std::path::Path::new("refused").exists() {
+            return Err("The other computer refused the pairing".into());
+        }
+        if std::path::Path::new("paired").exists() || by_itself.is_some_and(|after| start.elapsed() >= after) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Never write a PIN, a key or a certificate to standard error.
+    eprintln!("template connector: the demo pairing is done");
+    let values = [("paired_key", "demo-key-not-a-secret"), ("paired_id", "template-demo")].into_iter().collect();
+    send(&ToAgent::SetupDone { values }, &[]).map_err(io_err)
+}
+
 fn run() -> Result<(), String> {
     let mut stdin = io::stdin().lock();
     let io_err = |e: io::Error| e.to_string();
@@ -222,10 +278,15 @@ fn run() -> Result<(), String> {
     }
 
     // 2. connect: the target (this connector's own fields) and the viewer.
+    //    (Or `setup`, when a target is being added: see `set_up`.)
     let Some((header, _)) = receive(&mut stdin).map_err(io_err)? else { return Ok(()) };
     let (target, viewer) = match serde_json::from_slice::<FromAgent>(&header) {
         Ok(FromAgent::Connect { target, viewer }) => (target, viewer),
         Ok(FromAgent::OpenFiles {}) => return Err("This kind of computer has no file transfer".into()),
+        Ok(FromAgent::Setup { target }) => {
+            drop(stdin);
+            return set_up(&target);
+        }
         _ => return Err("the second message was not connect".into()),
     };
     let file = if target.file.is_empty() { "pattern.ivf" } else { &target.file };
@@ -313,7 +374,7 @@ fn run() -> Result<(), String> {
                 FromAgent::Key { position: _, down } => eprintln!("template connector: a key {}", if down { "down" } else { "up" }),
                 FromAgent::Text => eprintln!("template connector: text of {} bytes", payload.len()),
                 FromAgent::SwitchDisplay { index } => eprintln!("template connector: display {} asked for (there is one)", index),
-                FromAgent::Hello { .. } | FromAgent::Connect { .. } | FromAgent::OpenFiles {} => {}
+                FromAgent::Hello { .. } | FromAgent::Connect { .. } | FromAgent::OpenFiles {} | FromAgent::Setup { .. } => {}
             },
             // The agent closed our input: the session is over.
             Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),

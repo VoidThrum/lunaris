@@ -23,6 +23,13 @@
 //! `FileCommand`s and `FileEvent`s (`connector/files.rs`), one to one, as
 //! `file_...` messages. Only a connector whose manifest says
 //! `"files": true` in its capabilities is ever asked.
+//!
+//! A set-up (a pairing, done once when a target is added) is a run of its
+//! own too: after `hello` the agent sends `setup` with the target, the
+//! connector sends `setup_step` (a text and maybe a code to show the
+//! person) as often as it wants, then `setup_done` with the values to keep
+//! with the target, or `closed` with the reason. Only a connector whose
+//! manifest says `"setup": true` in its capabilities is ever asked.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -34,7 +41,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::files::{self, FileCommand, FileEntry, FileEvent, FileSession, FilesInfo, OnExists, Place, WalkFile};
-use super::{Button, Capabilities, Codec, Command, Connector, Description, DisplayInfo, Event, Field, Session, Target, Viewer, VERSION};
+use super::{Button, Capabilities, Codec, Command, Connector, Description, DisplayInfo, Event, Field, Session, SetupStep, Target, Viewer, VERSION};
 
 /// A header or a payload larger than this ends the session (a 4K key frame
 /// is a few megabytes).
@@ -57,6 +64,9 @@ pub struct Manifest {
     pub fields: Vec<Field>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// One or two plain sentences shown under the Type choice of "Add computer".
+    #[serde(default)]
+    pub note: String,
 }
 
 /// What the agent sends: `hello`, `connect`, then the commands.
@@ -110,6 +120,8 @@ pub enum CommandHeader {
     FileWriteData { id: String },
     FileWriteEnd { id: String },
     FileCancel { id: String },
+    /// In the place of `connect`: the set-up of a target being added.
+    Setup { target: Target },
     Close,
 }
 
@@ -132,7 +144,11 @@ pub enum EventHeader {
     CursorPosition { x: i32, y: i32, visible: bool },
     CursorEmbedded { embedded: bool },
     CursorMaybeEmbedded { maybe: bool },
+    CursorAlwaysEmbedded,
     Platform { os: String },
+    /// The delay to the computer and back, in milliseconds, whole or with
+    /// a fraction (`Event::Latency`).
+    Latency { ms: f32 },
     /// Payload: the text, UTF-8.
     Clipboard,
     /// Payload: the reason, UTF-8.
@@ -192,6 +208,17 @@ pub enum EventHeader {
     FileWriteSkip { id: String, reason: String, path: String },
     FileWriteDone { id: String, path: String },
     FileError { id: String, message: String },
+    /// Of a set-up: something to show the person (a PIN as `code`).
+    SetupStep {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+    },
+    /// The set-up's end: the values to keep with the target.
+    SetupDone {
+        #[serde(default)]
+        values: std::collections::BTreeMap<String, String>,
+    },
     Closed { reason: String },
 }
 
@@ -227,7 +254,15 @@ pub fn event_from_wire(header: EventHeader, payload: Bytes) -> Option<Event> {
         EventHeader::CursorPosition { x, y, visible } => Event::CursorPosition { x, y, visible },
         EventHeader::CursorEmbedded { embedded } => Event::CursorEmbedded { embedded },
         EventHeader::CursorMaybeEmbedded { maybe } => Event::CursorMaybeEmbedded { maybe },
+        EventHeader::CursorAlwaysEmbedded => Event::CursorAlwaysEmbedded,
         EventHeader::Platform { os } => Event::Platform { os },
+        // A delay is a number that is not negative.
+        EventHeader::Latency { ms } => {
+            if !ms.is_finite() || ms < 0.0 {
+                return None;
+            }
+            Event::Latency { ms }
+        }
         EventHeader::Clipboard => Event::Clipboard { text: String::from_utf8(payload.to_vec()).ok()? },
         EventHeader::ClipboardError => Event::ClipboardError { text: String::from_utf8(payload.to_vec()).ok()? },
         EventHeader::Displays { displays, current } => Event::Displays { displays, current },
@@ -245,6 +280,8 @@ pub fn event_from_wire(header: EventHeader, payload: Bytes) -> Option<Event> {
         | EventHeader::FileWriteSkip { .. }
         | EventHeader::FileWriteDone { .. }
         | EventHeader::FileError { .. } => return None,
+        // Of a set-up (`setup_over`).
+        EventHeader::SetupStep { .. } | EventHeader::SetupDone { .. } => return None,
     })
 }
 
@@ -361,6 +398,38 @@ where
     Ok(FileSession { info, events, commands })
 }
 
+/// A set-up with a connector that said `hello`, over its input and output:
+/// `setup` with the target, its `setup_step`s (each goes to `steps`), then
+/// `setup_done` with the values to keep, or `closed` with the reason. How
+/// long it may take is the caller's to decide (it waits for a person).
+pub async fn setup_over<R, W>(
+    mut from_connector: R,
+    mut to_connector: W,
+    target: &Target,
+    name: &str,
+    steps: mpsc::Sender<SetupStep>,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    write_message(&mut to_connector, &CommandHeader::Setup { target: target.clone() }, &[])
+        .await
+        .map_err(|e| anyhow::anyhow!("Connector \"{}\" ended: {}", name, e))?;
+    loop {
+        let Some((header, _)) = read_message(&mut from_connector).await? else { anyhow::bail!("Connector \"{}\" ended", name) };
+        // What is not understood is skipped (and not written out: a step holds a code).
+        match serde_json::from_slice::<EventHeader>(&header) {
+            Ok(EventHeader::SetupStep { message, code }) => {
+                let _ = steps.send(SetupStep { message, code }).await;
+            }
+            Ok(EventHeader::SetupDone { values }) => return Ok(values),
+            Ok(EventHeader::Closed { reason }) => anyhow::bail!("{}", reason),
+            _ => {}
+        }
+    }
+}
+
 pub async fn write_message<W: AsyncWrite + Unpin>(out: &mut W, header: &impl Serialize, payload: &[u8]) -> std::io::Result<()> {
     let header = serde_json::to_vec(header).map_err(std::io::Error::other)?;
     let mut buf = Vec::with_capacity(8 + header.len());
@@ -433,7 +502,58 @@ impl Connector for ProcessConnector {
             name: self.manifest.name.clone(),
             fields: self.manifest.fields.clone(),
             capabilities: self.manifest.capabilities.clone(),
+            note: self.manifest.note.clone(),
         }
+    }
+
+    /// A run of the program for the set-up alone: started, greeted, asked
+    /// with `setup`, and stopped when it is over or given up on (dropping
+    /// this stops the program). A connector whose manifest does not say it
+    /// has a set-up is not started: there is nothing to do.
+    async fn setup(&self, target: &Target, steps: mpsc::Sender<SetupStep>) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        if !self.manifest.capabilities.setup {
+            return Ok(Default::default());
+        }
+        let id = self.manifest.id.clone();
+        let mut child = tokio::process::Command::new(&self.program)
+            .args(&self.manifest.args)
+            .current_dir(&self.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Connector \"{}\" could not be started: {}", id, e))?;
+        let mut stdin = child.stdin.take().expect("piped");
+        let mut stdout = child.stdout.take().expect("piped");
+        if let Some(stderr) = child.stderr.take() {
+            let id = id.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    debug!("connector {}: {}", id, line);
+                }
+            });
+        }
+        write_message(&mut stdin, &CommandHeader::Hello { version: VERSION }, &[]).await?;
+        let hello = tokio::time::timeout(HELLO_TIMEOUT, read_message(&mut stdout))
+            .await
+            .map_err(|_| anyhow::anyhow!("Connector \"{}\" did not answer", id))??;
+        match hello.and_then(|(header, _)| serde_json::from_slice::<EventHeader>(&header).ok()) {
+            Some(EventHeader::Hello { version }) if version == VERSION => {}
+            Some(EventHeader::Hello { version }) => {
+                anyhow::bail!("Connector \"{}\" speaks version {} of the protocol, this agent version {}", id, version, VERSION)
+            }
+            _ => anyhow::bail!("Connector \"{}\" did not say hello", id),
+        }
+        let result = setup_over(&mut stdout, &mut stdin, target, &id, steps).await;
+        // It has a moment to leave by itself, then it is stopped.
+        drop(stdin);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await.is_err() {
+            let _ = child.kill().await;
+        }
+        result
     }
 
     /// A program of its own for the files, as for a picture session: started,
@@ -558,6 +678,40 @@ impl Connector for ProcessConnector {
             let _ = event_tx.send(Event::Closed { reason }).await;
         });
         Ok(Session { events, commands })
+    }
+}
+
+#[cfg(test)]
+mod pointer_wire_tests {
+    use super::*;
+
+    fn event(header: &str) -> Option<Event> {
+        event_from_wire(serde_json::from_str(header).expect("a known header"), Bytes::new())
+    }
+
+    /// The three things a connector can say of the pointer and the picture
+    /// are three messages, and stay three events.
+    #[test]
+    fn what_a_connector_says_of_the_pointer_in_the_picture() {
+        assert_eq!(event(r#"{"type":"cursor_always_embedded"}"#), Some(Event::CursorAlwaysEmbedded));
+        assert_eq!(event(r#"{"type":"cursor_embedded","embedded":true}"#), Some(Event::CursorEmbedded { embedded: true }));
+        assert_eq!(event(r#"{"type":"cursor_maybe_embedded","maybe":true}"#), Some(Event::CursorMaybeEmbedded { maybe: true }));
+        // As the connector writes it.
+        assert_eq!(serde_json::to_string(&EventHeader::CursorAlwaysEmbedded).unwrap(), r#"{"type":"cursor_always_embedded"}"#);
+    }
+
+    /// The delay to the computer and back, as a connector writes it.
+    #[test]
+    fn the_delay_to_the_computer_is_an_event() {
+        // Whole milliseconds or a fraction of one: both are numbers of JSON.
+        assert_eq!(event(r#"{"type":"latency","ms":12}"#), Some(Event::Latency { ms: 12.0 }));
+        assert_eq!(event(r#"{"type":"latency","ms":0.4}"#), Some(Event::Latency { ms: 0.4 }));
+        assert_eq!(serde_json::to_string(&EventHeader::Latency { ms: 12.5 }).unwrap(), r#"{"type":"latency","ms":12.5}"#);
+        // A delay is not negative.
+        assert_eq!(event(r#"{"type":"latency","ms":-1}"#), None);
+        // Not a number of milliseconds: not a known header at all.
+        assert!(serde_json::from_str::<EventHeader>(r#"{"type":"latency","ms":"12"}"#).is_err());
+        assert!(serde_json::from_str::<EventHeader>(r#"{"type":"latency"}"#).is_err());
     }
 }
 
@@ -733,6 +887,64 @@ mod file_tests {
         let error = connector.open_files(&target()).await.err().unwrap();
         assert_eq!(error.to_string(), files::NO_FILES);
         assert_eq!(error.to_string(), "This kind of computer has no file transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_set_up_with_an_external_connector() {
+        use serde_json::json;
+        let (mut far, from_connector, to_connector) = pipes();
+        let connector = tokio::spawn(async move {
+            let (header, _) = far.read().await;
+            assert_eq!(header, json!({"type": "setup", "target": {"connector": "thử", "host": "192.0.2.9"}}));
+            far.write(json!({"type": "setup_step", "message": "Nhập mã này ở máy kia", "code": "4711"}), &[]).await;
+            // A message of a later protocol is skipped; a step need not have a code.
+            far.write(json!({"type": "setup_progress", "percent": 50}), &[]).await;
+            far.write(json!({"type": "setup_step", "message": "Almost there"}), &[]).await;
+            far.write(json!({"type": "setup_done", "values": {"client_key": "KEY", "unique_id": "0123"}}), &[]).await;
+        });
+        let (steps_tx, mut steps) = mpsc::channel(8);
+        let values = setup_over(from_connector, to_connector, &target(), "thử", steps_tx).await.unwrap();
+        assert_eq!(values.get("client_key").map(String::as_str), Some("KEY"));
+        assert_eq!(values.len(), 2);
+        assert_eq!(steps.recv().await, Some(SetupStep { message: "Nhập mã này ở máy kia".into(), code: Some("4711".into()) }));
+        assert_eq!(steps.recv().await, Some(SetupStep { message: "Almost there".into(), code: None }));
+        assert_eq!(steps.recv().await, None);
+        connector.await.unwrap();
+
+        // `closed` is the reason it failed; `setup_done` without values is nothing to keep.
+        let (mut far, from_connector, to_connector) = pipes();
+        tokio::spawn(async move {
+            far.read().await;
+            far.write(json!({"type": "closed", "reason": "Sai mã PIN"}), &[]).await;
+        });
+        let error = setup_over(from_connector, to_connector, &target(), "thử", mpsc::channel(1).0).await.err().unwrap();
+        assert_eq!(error.to_string(), "Sai mã PIN");
+        let (mut far, from_connector, to_connector) = pipes();
+        tokio::spawn(async move {
+            far.read().await;
+            far.write(json!({"type": "setup_done"}), &[]).await;
+        });
+        assert!(setup_over(from_connector, to_connector, &target(), "thử", mpsc::channel(1).0).await.unwrap().is_empty());
+        // It ends without a word.
+        let (far, from_connector, to_connector) = pipes();
+        drop(far);
+        let error = setup_over(from_connector, to_connector, &target(), "thử", mpsc::channel(1).0).await.err().unwrap();
+        assert!(error.to_string().contains("thử"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn a_connector_without_a_set_up_is_not_started_for_one() {
+        let dir = std::env::temp_dir().join(format!("lunaris-connector-nosetup-{}", std::process::id()));
+        let folder = dir.join("plain");
+        std::fs::create_dir_all(&folder).unwrap();
+        // Not a program: starting it would fail.
+        std::fs::write(folder.join("program"), b"not a program").unwrap();
+        // A manifest from before set-ups: no "setup" in its capabilities.
+        std::fs::write(folder.join("connector.json"), r#"{"id":"plain","name":"Plain","command":"program","capabilities":{"video":["vp8"]}}"#).unwrap();
+        let connector = ProcessConnector::load(&dir, "plain").unwrap();
+        assert!(!connector.describe().capabilities.setup);
+        assert!(connector.setup(&target(), mpsc::channel(1).0).await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

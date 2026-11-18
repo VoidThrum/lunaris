@@ -128,6 +128,7 @@ fn main() {
             cc.file("src/d3d11_video_item.cpp");
             cc.file("src/vaapi_dmabuf_video_item.cpp");
             cc.file("src/host_cursor.cpp");
+            cc.file("src/keyboard_grab.cpp");
             for moc_cpp in &moc_cpp_files {
                 cc.file(moc_cpp);
             }
@@ -164,6 +165,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/vaapi_dmabuf_video_item.cpp");
     println!("cargo:rerun-if-changed=src/host_cursor.h");
     println!("cargo:rerun-if-changed=src/host_cursor.cpp");
+    println!("cargo:rerun-if-changed=src/keyboard_grab.cpp");
+    println!("cargo:rerun-if-changed=src/video_helper.h");
     println!("cargo:rerun-if-changed=qml/main.qml");
     println!("cargo:rerun-if-changed=qml/LunarisMenuBar.qml");
     println!("cargo:rerun-if-changed=qml/Settings.qml");

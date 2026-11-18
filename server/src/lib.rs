@@ -281,6 +281,11 @@ pub(crate) async fn run_server(
             "/api/hosts/{id}/sources/{source_id}",
             axum::routing::put(sources::update_source).delete(sources::remove_source),
         )
+        // The set-up of one being added (a pairing that waits for its PIN).
+        .route(
+            "/api/hosts/{id}/sources/setup/{setup}",
+            get(sources::setup_state).delete(sources::cancel_setup),
+        )
         .route("/api/agent/token", get(agent_token_handler))
         .route("/api/server/ports", get(ports_handler))
         .route(

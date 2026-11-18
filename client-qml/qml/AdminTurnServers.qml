@@ -45,6 +45,7 @@ Item {
         anchors.left: parent.left
         anchors.right: parent.right
         visible: page.error !== ""
+        textFormat: Text.PlainText
         text: page.error
         color: Theme.danger
         font.pixelSize: 13
@@ -114,11 +115,11 @@ Item {
                         Rectangle {
                             implicitWidth: kindText.implicitWidth + 12; implicitHeight: 20; radius: 10
                             color: String(modelData.urls).indexOf("stun:") === 0 ? Theme.surface3 : Theme.accentA(0.15)
-                            Text { id: kindText; anchors.centerIn: parent; text: String(modelData.urls).split(":")[0].toUpperCase(); font.pixelSize: 10; font.weight: Font.DemiBold; color: String(modelData.urls).indexOf("stun:") === 0 ? Theme.textMuted : Theme.accentFg }
+                            Text { textFormat: Text.PlainText; id: kindText; anchors.centerIn: parent; text: String(modelData.urls).split(":")[0].toUpperCase(); font.pixelSize: 10; font.weight: Font.DemiBold; color: String(modelData.urls).indexOf("stun:") === 0 ? Theme.textMuted : Theme.accentFg }
                         }
-                        Text { Layout.fillWidth: true; Layout.preferredWidth: 10; text: modelData.urls; color: Theme.textStrong; font.pixelSize: 13; font.family: "monospace"; elide: Text.ElideRight }
+                        Text { textFormat: Text.PlainText; Layout.fillWidth: true; Layout.preferredWidth: 10; text: modelData.urls; color: Theme.textStrong; font.pixelSize: 13; font.family: "monospace"; elide: Text.ElideRight }
                     }
-                    Text { Layout.preferredWidth: table.wUser; Layout.maximumWidth: table.wUser; text: modelData.username || "—"; color: modelData.username ? Theme.text : Theme.textSubtle; font.pixelSize: 13; elide: Text.ElideRight }
+                    Text { textFormat: Text.PlainText; Layout.preferredWidth: table.wUser; Layout.maximumWidth: table.wUser; text: modelData.username || "—"; color: modelData.username ? Theme.text : Theme.textSubtle; font.pixelSize: 13; elide: Text.ElideRight }
                     Text { Layout.preferredWidth: 90; text: modelData.credential ? "••••••" : "—"; color: Theme.textSubtle; font.pixelSize: 13 }
                     IconButton { Layout.preferredWidth: 34; iconName: "trash"; tip: I18n.t("Delete"); iconColor: Theme.danger; onClicked: deleteDialog.openFor(modelData) }
                 }
@@ -166,7 +167,7 @@ Item {
         contentItem: ColumnLayout {
             spacing: 12
             Text { text: I18n.t("Add TURN/STUN server"); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
-            Text { visible: createDialog.err !== ""; text: createDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Text { textFormat: Text.PlainText; visible: createDialog.err !== ""; text: createDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             Text { text: I18n.t("Address"); color: Theme.textMuted; font.pixelSize: 12 }
             InputField { id: tUrl; placeholder: "turn:turn.example.com:3478"; onAccepted: tUser.input.forceActiveFocus() }
             Text { text: I18n.t("Username (optional)"); color: Theme.textMuted; font.pixelSize: 12 }
@@ -194,12 +195,13 @@ Item {
             Text { text: I18n.t("Delete server?"); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
             Text {
                 Layout.fillWidth: true
+                textFormat: Text.PlainText
                 text: deleteDialog.server ? I18n.t("%1 will no longer be offered to new connections.").arg(deleteDialog.server.urls) : ""
                 color: Theme.textMuted
                 font.pixelSize: 13
                 wrapMode: Text.WrapAnywhere
             }
-            Text { visible: deleteDialog.err !== ""; text: deleteDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Text { textFormat: Text.PlainText; visible: deleteDialog.err !== ""; text: deleteDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 8

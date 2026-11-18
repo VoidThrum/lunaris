@@ -3,6 +3,11 @@
 # (Ubuntu 24.04+, Debian 13+). Run on the build distro: dpkg-shlibdeps computes
 # the shared-library dependencies (Qt, PipeWire, libva, ...) against it.
 #
+# One package serves every release from the build distro (Ubuntu 24.04) up, so
+# the Qt dependencies name both spellings of each library package, see
+# qt_package_alternatives. scripts/packaging/linux/smoke-deb.sh installs and
+# starts the result on each supported release.
+#
 # Usage: make-deb.sh <cargo target dir> <output dir> <static ffmpeg prefix>
 set -euo pipefail
 
@@ -16,6 +21,17 @@ ARCH="$(dpkg --print-architecture)"
 QML_COMMON="qml6-module-qtquick, qml6-module-qtquick-controls, qml6-module-qtquick-layouts, \
 qml6-module-qtquick-templates, qml6-module-qtquick-window, qml6-module-qtqml-workerscript, \
 qml6-module-qt-labs-platform, qt6-qpa-plugins"
+
+# Ubuntu 24.04 ships the Qt libraries as libqt6gui6t64, libqt6widgets6t64,
+# libqt6opengl6t64 ...; Ubuntu 26.04 (Qt 6.10) and Debian 13 (Qt 6.8) name them
+# libqt6gui6, libqt6widgets6, libqt6opengl6 again, with no Provides for the old
+# names (libqt6core6t64 kept its name). Without the second name apt refuses the
+# package there: "Depends: libqt6gui6t64 but it is not installable". The
+# libraries are the same public Qt 6 ABI on 64-bit, so either name will do:
+#   libqt6gui6t64 (>= 6.1.2)  ->  libqt6gui6t64 (>= 6.1.2) | libqt6gui6 (>= 6.1.2)
+qt_package_alternatives() {
+    sed -E 's/(libqt6[a-z0-9-]+)t64( \([^)]*\))?/\1t64\2 | \1\2/g'
+}
 
 build() {
     local kind="$1" bin="$2" extra_deps="$3" recommends="$4" description="$5"
@@ -31,6 +47,13 @@ build() {
     printf 'Source: %s\n' "$name" > "$work/debian/control"
     local shlibs
     shlibs="$(cd "$work" && dpkg-shlibdeps -O -e "$root/usr/bin/$name" 2>/dev/null | sed -n 's/^shlibs:Depends=//p')"
+    # A dependency on Qt's private ABI pins the package to the exact Qt version
+    # of the build distro; the alternatives below would then promise too much.
+    if grep -q 'private-abi' <<<"$shlibs"; then
+        echo "error: $name uses Qt private API ($shlibs): it would only run with the build distro's Qt" >&2
+        exit 1
+    fi
+    shlibs="$(qt_package_alternatives <<<"$shlibs")"
 
     mkdir -p "$root/DEBIAN"
     cat > "$root/DEBIAN/control" <<EOF

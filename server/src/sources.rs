@@ -9,6 +9,17 @@
 //! and the Lunaris computer it is reached through, as the agent announces
 //! them (`AgentMessage::Sources`), to list it while that computer is away.
 //!
+//! A source can have a group (`common::SourceInfoMsg::group`): an opaque
+//! word its agent keeps and announces, which says that it is the same
+//! computer as the other sources with that word, or (`host:<id>`) as the
+//! Lunaris computer with that id. The clients then show one card for that
+//! computer, with a way to connect for each. It changes nothing about who
+//! may use what: a source is listed for those who may use the Lunaris
+//! computer it is reached through, and one that names a Lunaris computer
+//! the user may not use is listed without its group. A group is a word of
+//! `common::valid_source_group`; anything else from an agent is dropped,
+//! and from a form refused.
+//!
 //! Who may do what: listing and connecting need the right to use the
 //! Lunaris computer (`security::host_access`, as for the computer itself);
 //! adding, changing and removing are for administrators, as adding and
@@ -16,6 +27,14 @@
 //! connection does not take changes from here (its agent says so and
 //! refuses them); connecting to its sources is asked for there like any
 //! other connection.
+//!
+//! Adding one of a type that has a set-up (a pairing: the agent's connector
+//! makes a PIN that the person types at the other computer) is answered
+//! with 202 and what to show; the client then asks about the set-up once a
+//! second until it is done or failed, and cancels it when the person closes
+//! the window. The PIN passes through like the fields do: in the answer,
+//! once, neither stored nor logged. Of a set-up the server remembers only
+//! which computer it is on.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -25,7 +44,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use common::{ConnectorInfoMsg, ServerToAgentMessage, SourceChange, SourceInfoMsg};
+use common::{ConnectorInfoMsg, ServerToAgentMessage, SetupInfo, SourceChange, SourceInfoMsg};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
@@ -44,8 +63,20 @@ pub struct Announced {
     pub manageable: bool,
 }
 
-/// The answer to a change: the source's id, or why not.
-type Answer = Result<String, String>;
+/// How long a set-up is known here: longer than an agent keeps one (5
+/// minutes to finish it, 10 to remember its end).
+const SETUP_KNOWN: Duration = Duration::from_secs(20 * 60);
+
+/// What an agent answered that worked.
+enum Changed {
+    /// The source's id.
+    Id(String),
+    /// The source's set-up waits for the person: what to show them.
+    Setup(SetupInfo),
+}
+
+/// The answer to a change, or why not.
+type Answer = Result<Changed, String>;
 
 #[derive(Default)]
 pub struct Registry {
@@ -53,6 +84,25 @@ pub struct Registry {
     announced: RwLock<HashMap<String, Announced>>,
     /// request id -> (the agent asked, who waits for its answer).
     pending: Mutex<HashMap<String, (String, oneshot::Sender<Answer>)>>,
+    /// set-up id -> (the agent it runs on, since when): only these are
+    /// asked about, and only on that agent.
+    setups: Mutex<HashMap<String, (String, std::time::Instant)>>,
+}
+
+impl Registry {
+    fn setup_started(&self, setup: &str, host_id: &str) {
+        let mut setups = self.setups.lock().unwrap();
+        setups.retain(|_, (_, since)| since.elapsed() < SETUP_KNOWN);
+        setups.insert(setup.to_string(), (host_id.to_string(), std::time::Instant::now()));
+    }
+
+    fn setup_known(&self, setup: &str, host_id: &str) -> bool {
+        self.setups.lock().unwrap().get(setup).is_some_and(|(host, since)| host == host_id && since.elapsed() < SETUP_KNOWN)
+    }
+
+    fn setup_over(&self, setup: &str) {
+        self.setups.lock().unwrap().remove(setup);
+    }
 }
 
 /// An agent told its sources and connectors: they are kept (the sources in
@@ -77,12 +127,15 @@ pub(crate) async fn announced(
         sqlx::query("DELETE FROM host_sources WHERE host_id = ?").bind(agent_id).execute(&mut *tx).await?;
         for source in &sources {
             let connector_name = connectors.iter().find(|c| c.id == source.connector).map(|c| c.name.as_str()).unwrap_or(&source.connector);
-            sqlx::query("INSERT OR REPLACE INTO host_sources (host_id, source_id, name, connector, connector_name) VALUES (?, ?, ?, ?, ?)")
+            // What an agent calls a group is kept only when it can be one.
+            let group = source.group.as_deref().filter(|group| common::valid_source_group(group));
+            sqlx::query("INSERT OR REPLACE INTO host_sources (host_id, source_id, name, connector, connector_name, source_group) VALUES (?, ?, ?, ?, ?, ?)")
                 .bind(agent_id)
                 .bind(&source.id)
                 .bind(&source.name)
                 .bind(&source.connector)
                 .bind(connector_name)
+                .bind(group)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -97,16 +150,24 @@ pub(crate) async fn announced(
 }
 
 /// An agent answered a change. Only the agent that was asked is believed.
-pub(crate) fn changed(state: &Arc<SignalingState>, agent_id: &str, request_id: &str, id: Option<String>, error: Option<String>) {
+pub(crate) fn changed(
+    state: &Arc<SignalingState>,
+    agent_id: &str,
+    request_id: &str,
+    id: Option<String>,
+    error: Option<String>,
+    setup: Option<SetupInfo>,
+) {
     let mut pending = state.sources.pending.lock().unwrap();
     if !pending.get(request_id).is_some_and(|(asked, _)| asked == agent_id) {
         return;
     }
     if let Some((_, waiting)) = pending.remove(request_id) {
-        let answer = match (id, error) {
-            (Some(id), None) => Ok(id),
-            (_, Some(error)) => Err(error),
-            (None, None) => Err("That computer did not say whether it worked".to_string()),
+        let answer = match (id, error, setup) {
+            (_, Some(error), _) => Err(error),
+            (_, None, Some(setup)) => Ok(Changed::Setup(setup)),
+            (Some(id), None, None) => Ok(Changed::Id(id)),
+            (None, None, None) => Err(NO_ANSWER.to_string()),
         };
         let _ = waiting.send(answer);
     }
@@ -127,6 +188,28 @@ struct SourceEntry {
     connector: String,
     connector_name: String,
     online: bool,
+    /// What its connector can do, as its agent says while it is connected.
+    /// Left out when that is not known (the agent is away or from before
+    /// this): a client then offers what it always offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<common::ConnectorCapabilitiesMsg>,
+    /// Which computer it is, when that computer is listed in other ways
+    /// too: the sources with the same group are one computer, and
+    /// `host:<id>` is the Lunaris computer with that id. Left out when it
+    /// has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+}
+
+/// The group of a source as `access` may see it: a group that names a
+/// Lunaris computer is for those who may use that computer (the others are
+/// not told that it exists).
+fn group_for(access: &crate::security::HostAccess, group: Option<String>) -> Option<String> {
+    let group = group.filter(|group| common::valid_source_group(group))?;
+    match group.strip_prefix(common::SOURCE_GROUP_HOST) {
+        Some(host_id) if !access.allows(host_id) => None,
+        _ => Some(group),
+    }
 }
 
 /// GET /api/sources: the sources of the computers the user may use.
@@ -138,8 +221,8 @@ pub async fn list_sources(user: crate::auth::AuthenticatedUser, State(state): St
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Internal Database Error" }))).into_response();
         }
     };
-    let rows: Vec<(String, String, String, String, String, String)> = match sqlx::query_as(
-        "SELECT s.host_id, h.name, s.source_id, s.name, s.connector, s.connector_name
+    let rows: Vec<(String, String, String, String, String, String, Option<String>)> = match sqlx::query_as(
+        "SELECT s.host_id, h.name, s.source_id, s.name, s.connector, s.connector_name, s.source_group
          FROM host_sources s INNER JOIN hosts h ON h.id = s.host_id
          ORDER BY s.name COLLATE NOCASE, s.source_id",
     )
@@ -153,10 +236,13 @@ pub async fn list_sources(user: crate::auth::AuthenticatedUser, State(state): St
         }
     };
     let online = state.agents.read().unwrap();
+    let announced = state.sources.announced.read().unwrap();
     let entries: Vec<SourceEntry> = rows
         .into_iter()
         .filter(|row| access.allows(&row.0))
-        .map(|(host_id, host_name, id, name, connector, connector_name)| SourceEntry {
+        .map(|(host_id, host_name, id, name, connector, connector_name, group)| SourceEntry {
+            group: group_for(&access, group),
+            capabilities: announced.get(&host_id).and_then(|a| a.connectors.iter().find(|c| c.id == connector)).and_then(|c| c.capabilities),
             online: online.contains_key(&host_id),
             host_id,
             host_name,
@@ -216,59 +302,160 @@ pub struct SourceForm {
     connector: String,
     #[serde(default)]
     values: std::collections::BTreeMap<String, String>,
+    /// Which computer it is (`common::SourceInfoMsg::group`). Left out:
+    /// adding lets the agent group it with a source at the same address,
+    /// and changing keeps its group; empty: no group.
+    #[serde(default)]
+    group: Option<String>,
+}
+
+/// The group of a form, checked here too (the agent checks it again): the
+/// response that refuses it when it cannot be one.
+fn form_group(group: Option<String>) -> Result<Option<String>, axum::response::Response> {
+    match group.map(|group| group.trim().to_string()) {
+        Some(group) if !group.is_empty() && !common::valid_source_group(&group) => {
+            Err(refused(StatusCode::BAD_REQUEST, "That group of computers is not valid"))
+        }
+        group => Ok(group),
+    }
 }
 
 fn refused(status: StatusCode, text: &str) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": text }))).into_response()
 }
 
-/// Asks the agent of `host_id` to make `change` and waits for its answer.
-async fn change(state: &Arc<SignalingState>, host_id: &str, change: SourceChange, requester: &str) -> axum::response::Response {
+const NO_ANSWER: &str = "That computer did not say whether it worked";
+
+/// For an answer that can carry a set-up's code (a PIN): it is for the
+/// person's eyes now, and is not to be kept by a browser or anything
+/// between it and the server.
+fn not_stored(response: impl IntoResponse) -> axum::response::Response {
+    let mut response = response.into_response();
+    response.headers_mut().insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Asks the agent of `host_id` to make `change` and waits for its answer;
+/// the error is the response that says why not.
+async fn ask(state: &Arc<SignalingState>, host_id: &str, change: SourceChange, requester: &str) -> Result<Changed, axum::response::Response> {
     let agent = state.agents.read().unwrap().get(host_id).cloned();
     let Some(agent) = agent else {
-        return refused(StatusCode::CONFLICT, "That computer is offline");
+        return Err(refused(StatusCode::CONFLICT, "That computer is offline"));
     };
     // An agent that did not announce its sources is from before this: the
     // message would be nothing it knows (and it would write it to its log).
     let announced = state.sources.announced.read().unwrap().get(host_id).cloned();
     let Some(announced) = announced else {
-        return refused(StatusCode::CONFLICT, "The Lunaris on that computer is too old for this. Update it first.");
+        return Err(refused(StatusCode::CONFLICT, "The Lunaris on that computer is too old for this. Update it first."));
     };
     if !announced.manageable {
-        return refused(
+        return Err(refused(
             StatusCode::CONFLICT,
             "That computer asks at its screen before each connection, so computers cannot be added to it from here. Add it in the Lunaris app on that computer.",
-        );
+        ));
     }
     let request_id = uuid::Uuid::new_v4().to_string();
     let (answer_tx, answer_rx) = oneshot::channel();
     state.sources.pending.lock().unwrap().insert(request_id.clone(), (host_id.to_string(), answer_tx));
-    info!("Sources of {}: {:?} asked for by {}", host_id, change, requester);
+    // Not each time a set-up is asked about (once a second).
+    if !matches!(change, SourceChange::SetupState { .. }) {
+        info!("Sources of {}: {:?} asked for by {}", host_id, change, requester);
+    }
     let sent = agent.send(ServerToAgentMessage::ChangeSource { request_id: request_id.clone(), change, requester: Some(requester.to_string()) });
     let answer = match sent {
         Ok(()) => tokio::time::timeout(CHANGE_TIMEOUT, answer_rx).await,
         Err(()) => {
             state.sources.pending.lock().unwrap().remove(&request_id);
-            return refused(StatusCode::CONFLICT, "That computer is offline");
+            return Err(refused(StatusCode::CONFLICT, "That computer is offline"));
         }
     };
     state.sources.pending.lock().unwrap().remove(&request_id);
     match answer {
-        Ok(Ok(Ok(id))) => Json(serde_json::json!({ "id": id })).into_response(),
-        Ok(Ok(Err(text))) => refused(StatusCode::UNPROCESSABLE_ENTITY, &text),
-        Ok(Err(_)) => refused(StatusCode::CONFLICT, "That computer went offline"),
-        Err(_) => refused(StatusCode::GATEWAY_TIMEOUT, "That computer did not answer"),
+        Ok(Ok(Ok(changed))) => Ok(changed),
+        Ok(Ok(Err(text))) => Err(refused(StatusCode::UNPROCESSABLE_ENTITY, &text)),
+        Ok(Err(_)) => Err(refused(StatusCode::CONFLICT, "That computer went offline")),
+        Err(_) => Err(refused(StatusCode::GATEWAY_TIMEOUT, "That computer did not answer")),
     }
 }
 
-/// POST /api/hosts/{host_id}/sources
+/// A change that has no set-up: the source's id, or why not.
+async fn change(state: &Arc<SignalingState>, host_id: &str, change: SourceChange, requester: &str) -> axum::response::Response {
+    match ask(state, host_id, change, requester).await {
+        Ok(Changed::Id(id)) => Json(serde_json::json!({ "id": id })).into_response(),
+        Ok(Changed::Setup(_)) => refused(StatusCode::BAD_GATEWAY, NO_ANSWER),
+        Err(response) => response,
+    }
+}
+
+/// POST /api/hosts/{host_id}/sources: 200 `{"id"}` when it is added, or 202
+/// `{"setup", "message", "code"}` when its type has a set-up that waits for
+/// the person (ask on with GET .../sources/setup/{setup}).
 pub async fn add_source(
     admin: crate::auth::AdminUser,
     Path(host_id): Path<String>,
     State(state): State<Arc<SignalingState>>,
     Json(form): Json<SourceForm>,
 ) -> impl IntoResponse {
-    change(&state, &host_id, SourceChange::Add { name: form.name, connector: form.connector, values: form.values }, &admin.username).await
+    let group = match form_group(form.group) {
+        Ok(group) => group,
+        Err(response) => return response,
+    };
+    let add = SourceChange::Add { name: form.name, connector: form.connector, values: form.values, group };
+    match ask(&state, &host_id, add, &admin.username).await {
+        Ok(Changed::Id(id)) => Json(serde_json::json!({ "id": id })).into_response(),
+        Ok(Changed::Setup(setup)) => {
+            state.sources.setup_started(&setup.setup, &host_id);
+            not_stored((StatusCode::ACCEPTED, Json(serde_json::json!({ "setup": setup.setup, "message": setup.message, "code": setup.code }))))
+        }
+        Err(response) => response,
+    }
+}
+
+/// GET /api/hosts/{host_id}/sources/setup/{setup}: where the set-up of a
+/// source being added is. `{"state":"pending","message","code"}`,
+/// `{"state":"done","id"}` or `{"state":"failed","error"}`; 404 for one that
+/// was not started here on that computer (or long ago).
+pub async fn setup_state(
+    admin: crate::auth::AdminUser,
+    Path((host_id, setup)): Path<(String, String)>,
+    State(state): State<Arc<SignalingState>>,
+) -> impl IntoResponse {
+    if !state.sources.setup_known(&setup, &host_id) {
+        return refused(StatusCode::NOT_FOUND, "That set-up is not there any more. Add the computer again.");
+    }
+    match ask(&state, &host_id, SourceChange::SetupState { setup: setup.clone() }, &admin.username).await {
+        Ok(Changed::Setup(info)) => not_stored(Json(serde_json::json!({ "state": "pending", "message": info.message, "code": info.code }))),
+        Ok(Changed::Id(id)) => {
+            state.sources.setup_over(&setup);
+            Json(serde_json::json!({ "state": "done", "id": id })).into_response()
+        }
+        Err(response) if response.status() == StatusCode::UNPROCESSABLE_ENTITY => {
+            // The agent's words: why the set-up failed.
+            state.sources.setup_over(&setup);
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap_or_default();
+            let error = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["error"].as_str().map(str::to_string)).unwrap_or_default();
+            Json(serde_json::json!({ "state": "failed", "error": error })).into_response()
+        }
+        // The computer cannot be asked now (offline, no answer).
+        Err(response) => response,
+    }
+}
+
+/// DELETE /api/hosts/{host_id}/sources/setup/{setup}: stops the set-up (the
+/// person closed the window). Nothing to stop is not an error.
+pub async fn cancel_setup(
+    admin: crate::auth::AdminUser,
+    Path((host_id, setup)): Path<(String, String)>,
+    State(state): State<Arc<SignalingState>>,
+) -> impl IntoResponse {
+    if !state.sources.setup_known(&setup, &host_id) {
+        return Json(serde_json::json!({})).into_response();
+    }
+    state.sources.setup_over(&setup);
+    match ask(&state, &host_id, SourceChange::SetupCancel { setup }, &admin.username).await {
+        Ok(_) => Json(serde_json::json!({})).into_response(),
+        Err(response) => response,
+    }
 }
 
 /// PUT /api/hosts/{host_id}/sources/{id}
@@ -278,7 +465,11 @@ pub async fn update_source(
     State(state): State<Arc<SignalingState>>,
     Json(form): Json<SourceForm>,
 ) -> impl IntoResponse {
-    change(&state, &host_id, SourceChange::Update { id, name: form.name, values: form.values }, &admin.username).await
+    let group = match form_group(form.group) {
+        Ok(group) => group,
+        Err(response) => return response,
+    };
+    change(&state, &host_id, SourceChange::Update { id, name: form.name, values: form.values, group }, &admin.username).await
 }
 
 /// DELETE /api/hosts/{host_id}/sources/{id}
@@ -335,12 +526,12 @@ mod tests {
     }
 
     fn rustdesk() -> ConnectorInfoMsg {
-        let field = |key: &str, kind: &str, required: bool| ConnectorFieldMsg { key: key.into(), label: key.into(), kind: kind.into(), default: String::new(), required };
-        ConnectorInfoMsg { id: "rustdesk".into(), name: "RustDesk (by IP address)".into(), fields: vec![field("host", "text", true), field("password", "secret", true)] }
+        let field = |key: &str, kind: &str, required: bool| ConnectorFieldMsg { key: key.into(), label: key.into(), kind: kind.into(), default: String::new(), required, options: Vec::new() };
+        ConnectorInfoMsg { id: "rustdesk".into(), name: "RustDesk (by IP address)".into(), fields: vec![field("host", "text", true), field("password", "secret", true)], note: String::new(), capabilities: None }
     }
 
     fn source(id: &str, name: &str) -> SourceInfoMsg {
-        SourceInfoMsg { id: id.into(), name: name.into(), connector: "rustdesk".into() }
+        SourceInfoMsg { id: id.into(), name: name.into(), connector: "rustdesk".into(), group: None }
     }
 
     async fn body(response: impl IntoResponse) -> (StatusCode, serde_json::Value) {
@@ -391,6 +582,33 @@ mod tests {
         assert_eq!(offer.as_array().unwrap().len(), 1);
         assert_eq!((offer[0]["host_id"].as_str(), offer[0]["connectors"][0]["id"].as_str()), (Some("h1"), Some("rustdesk")));
         assert_eq!(offer[0]["connectors"][0]["fields"][1]["kind"], "secret");
+        // A connector's note is offered with it; one without a note has no "note" (as before notes).
+        assert!(offer[0]["connectors"][0].get("note").is_none());
+        let mut noted = rustdesk();
+        noted.note = "It must be running on that computer.".into();
+        announced(&state, "h1", vec![], vec![noted], true).await;
+        let (_, offer) = body(list_connectors(user("alice"), State(state.clone())).await).await;
+        assert_eq!(offer[0]["connectors"][0]["note"], "It must be running on that computer.");
+        // What a connector can do goes with the type and with each source of
+        // it; an agent from before this says nothing, and nothing is made up.
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert!(list[0].get("capabilities").is_none());
+        let mut plain = rustdesk();
+        plain.capabilities = Some(common::ConnectorCapabilitiesMsg { input: true, audio: true, ..Default::default() });
+        announced(&state, "h1", vec![source("lab-1", "Lab server renamed")], vec![plain], true).await;
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert_eq!(list[0]["capabilities"]["files"], false);
+        assert_eq!(list[0]["capabilities"]["input"], true);
+        let (_, offer) = body(list_connectors(user("alice"), State(state.clone())).await).await;
+        assert_eq!(offer[0]["connectors"][0]["capabilities"]["files"], false);
+        let old: ConnectorInfoMsg = serde_json::from_str(r#"{"id":"rustdesk","name":"RustDesk"}"#).unwrap();
+        assert_eq!(old.capabilities, None);
+        let new: ConnectorInfoMsg = serde_json::from_str(r#"{"id":"rdp","name":"RDP","capabilities":{"files":true,"later":1}}"#).unwrap();
+        assert!(new.capabilities.is_some_and(|c| c.files && !c.clipboard));
+        // An agent from before notes announces none.
+        let old: ConnectorInfoMsg = serde_json::from_str(r#"{"id":"rustdesk","name":"RustDesk"}"#).unwrap();
+        assert_eq!(old.note, "");
+        announced(&state, "h1", vec![source("lab-1", "Lab server renamed")], vec![rustdesk()], true).await;
         state.agents.write().unwrap().remove("h1");
         agent_gone(&state, "h1");
         let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
@@ -416,19 +634,21 @@ mod tests {
         let agent = tokio::spawn(async move {
             let Some(ServerToAgentMessage::ChangeSource { request_id, change, requester }) = to_agent.recv().await else { panic!("no ChangeSource") };
             assert_eq!(requester.as_deref(), Some("admin"));
-            let SourceChange::Add { name, connector, values } = &change else { panic!("not an add") };
+            let SourceChange::Add { name, connector, values, group } = &change else { panic!("not an add") };
+            assert_eq!(group, &None, "a form without a group says nothing about it");
             assert_eq!((name.as_str(), connector.as_str()), ("Den PC", "rustdesk"));
             assert_eq!(values.get("password").map(String::as_str), Some("s3cret-pw"));
             crate::signaling::agent_message(&agent_state, "h1", AgentMessage::Sources { sources: vec![source("den-pc-ab12", "Den PC")], connectors: vec![rustdesk()], manageable: true }).await;
             // An answer from another agent with the same request id is not believed.
-            crate::signaling::agent_message(&agent_state, "h2", AgentMessage::SourceChanged { request_id: request_id.clone(), id: None, error: Some("forged".into()) }).await;
-            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: Some("den-pc-ab12".into()), error: None }).await;
+            crate::signaling::agent_message(&agent_state, "h2", AgentMessage::SourceChanged { request_id: request_id.clone(), id: None, error: Some("forged".into()), setup: None }).await;
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: Some("den-pc-ab12".into()), error: None, setup: None }).await;
             to_agent
         });
         let form = SourceForm {
             name: "Den PC".into(),
             connector: "rustdesk".into(),
             values: [("host".to_string(), "192.168.1.50".to_string()), ("password".to_string(), "s3cret-pw".to_string())].into_iter().collect(),
+            group: None,
         };
         let (status, answer) = body(add_source(admin(), Path("h1".into()), State(state.clone()), Json(form)).await).await;
         assert_eq!((status, answer["id"].as_str()), (StatusCode::OK, Some("den-pc-ab12")));
@@ -457,10 +677,10 @@ mod tests {
         let agent = tokio::spawn(async move {
             let Some(ServerToAgentMessage::ChangeSource { request_id, change, .. }) = to_agent.recv().await else { panic!("no ChangeSource") };
             assert!(matches!(change, SourceChange::Update { ref id, .. } if id == "den-pc-ab12"));
-            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: None, error: Some("host is required".into()) }).await;
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: None, error: Some("host is required".into()), setup: None }).await;
             to_agent
         });
-        let form = SourceForm { name: "Den".into(), connector: String::new(), values: Default::default() };
+        let form = SourceForm { name: "Den".into(), connector: String::new(), values: Default::default(), group: None };
         let (status, answer) = body(update_source(admin(), Path(("h1".into(), "den-pc-ab12".into())), State(state.clone()), Json(form)).await).await;
         assert_eq!((status, answer["error"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("host is required")));
         let mut to_agent = agent.await.unwrap();
@@ -471,7 +691,7 @@ mod tests {
             let Some(ServerToAgentMessage::ChangeSource { request_id, change, .. }) = to_agent.recv().await else { panic!("no ChangeSource") };
             assert_eq!(change, SourceChange::Remove { id: "den-pc-ab12".into() });
             crate::signaling::agent_message(&agent_state, "h1", AgentMessage::Sources { sources: vec![], connectors: vec![rustdesk()], manageable: true }).await;
-            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: Some("den-pc-ab12".into()), error: None }).await;
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: Some("den-pc-ab12".into()), error: None, setup: None }).await;
         });
         let (status, _) = body(remove_source(admin(), Path(("h1".into(), "den-pc-ab12".into())), State(state.clone())).await).await;
         assert_eq!(status, StatusCode::OK);
@@ -487,6 +707,7 @@ mod tests {
             name: "Den PC".into(),
             connector: "rustdesk".into(),
             values: [("password".to_string(), "s3cret-pw".to_string())].into_iter().collect(),
+            group: None,
         };
         // Not connected.
         let (status, answer) = body(add_source(admin(), Path("h1".into()), State(state.clone()), Json(form())).await).await;
@@ -521,7 +742,7 @@ mod tests {
         // The messages as they are on the wire; a change is never printed with its values.
         let wire = serde_json::to_string(&ServerToAgentMessage::ChangeSource {
             request_id: "r".into(),
-            change: SourceChange::Add { name: "n".into(), connector: "rustdesk".into(), values: form().values },
+            change: SourceChange::Add { name: "n".into(), connector: "rustdesk".into(), values: form().values, group: None },
             requester: None,
         })
         .unwrap();
@@ -532,5 +753,410 @@ mod tests {
         let announce: AgentMessage =
             serde_json::from_str(r#"{"event":"Sources","data":{"sources":[{"id":"a","name":"A","connector":"rustdesk"}],"connectors":[{"id":"rustdesk","name":"RustDesk"}]}}"#).unwrap();
         assert!(matches!(announce, AgentMessage::Sources { manageable: false, ref connectors, .. } if connectors[0].fields.is_empty()));
+    }
+
+    fn grouped(id: &str, name: &str, group: &str) -> SourceInfoMsg {
+        SourceInfoMsg { group: Some(group.into()), ..source(id, name) }
+    }
+
+    #[tokio::test]
+    async fn a_group_is_listed_as_announced_and_only_to_those_it_is_for() {
+        let state = state().await;
+        let _h1 = connect(&state, "h1");
+        // Two that are one computer, one that is the Lunaris computer h2, one
+        // that is h1 itself, one with no group, and one whose "group" is not one.
+        announced(
+            &state,
+            "h1",
+            vec![
+                grouped("den-rd", "Den PC", "g-0a1b2c3d4e5f"),
+                grouped("den-sun", "Den PC (Sunshine)", "g-0a1b2c3d4e5f"),
+                grouped("lab-rd", "Lab", "host:h2"),
+                grouped("office-sun", "Office", "host:h1"),
+                source("alone", "Alone"),
+                grouped("bad", "Bad", "<script>alert(1)</script>"),
+                grouped("bad2", "Bad 2", "x'; DROP TABLE host_sources; --"),
+            ],
+            vec![rustdesk()],
+            true,
+        )
+        .await;
+        let groups = |list: &serde_json::Value| -> Vec<(String, Option<String>)> {
+            let mut all: Vec<(String, Option<String>)> =
+                list.as_array().unwrap().iter().map(|s| (s["id"].as_str().unwrap().to_string(), s["group"].as_str().map(str::to_string))).collect();
+            all.sort();
+            all
+        };
+        let some = |id: &str, group: &str| (id.to_string(), Some(group.to_string()));
+        let none = |id: &str| (id.to_string(), None);
+
+        // The administrator may use every computer: every group that is one.
+        let (_, list) = body(list_sources(user("admin"), State(state.clone())).await).await;
+        assert_eq!(
+            groups(&list),
+            [none("alone"), none("bad"), none("bad2"), some("den-rd", "g-0a1b2c3d4e5f"), some("den-sun", "g-0a1b2c3d4e5f"), some("lab-rd", "host:h2"), some("office-sun", "host:h1")]
+        );
+        // A source without a group is listed as it always was: no "group" at all.
+        let alone = list.as_array().unwrap().iter().find(|s| s["id"] == "alone").unwrap();
+        assert!(alone.get("group").is_none());
+        // What was not fit to be a group is not in the database either; the table is whole.
+        let stored: Vec<Option<String>> = sqlx::query_scalar("SELECT source_group FROM host_sources WHERE source_id LIKE 'bad%'").fetch_all(&state.db).await.unwrap();
+        assert_eq!(stored, [None, None]);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM host_sources").fetch_one(&state.db).await.unwrap();
+        assert_eq!(count, 7);
+
+        // alice may use h1 and not h2: she sees h1's sources as before, the
+        // groups among them and the one that is h1; the one that names h2 is
+        // listed without its group (it is a card of its own for her).
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert_eq!(
+            groups(&list),
+            [none("alone"), none("bad"), none("bad2"), some("den-rd", "g-0a1b2c3d4e5f"), some("den-sun", "g-0a1b2c3d4e5f"), none("lab-rd"), some("office-sun", "host:h1")]
+        );
+        assert!(!list.to_string().contains("h2"), "nothing of a computer she may not use: {}", list);
+        // bob may use nothing: a group gives him nothing.
+        let (_, list) = body(list_sources(user("bob"), State(state.clone())).await).await;
+        assert!(list.as_array().unwrap().is_empty());
+        // A source of h2 that says it is h1 is not listed for alice at all:
+        // she may not use the computer it is reached through.
+        announced(&state, "h2", vec![grouped("spy", "Spy", "host:h1")], vec![rustdesk()], true).await;
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert!(list.as_array().unwrap().iter().all(|s| s["host_id"] == "h1"));
+
+        // The next announcement replaces the groups with the rest.
+        announced(&state, "h1", vec![source("den-rd", "Den PC"), grouped("den-sun", "Den PC (Sunshine)", "g-new")], vec![rustdesk()], true).await;
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert_eq!(groups(&list), [none("den-rd"), some("den-sun", "g-new")]);
+    }
+
+    #[tokio::test]
+    async fn a_group_passes_to_the_agent_when_it_can_be_one() {
+        let state = state().await;
+        let mut to_agent = connect(&state, "h1");
+        announced(&state, "h1", vec![], vec![rustdesk()], true).await;
+        let form = |group: Option<&str>| SourceForm {
+            name: "Den PC".into(),
+            connector: "rustdesk".into(),
+            values: [("host".to_string(), "192.168.1.50".to_string())].into_iter().collect(),
+            group: group.map(str::to_string),
+        };
+        // What cannot be a group is refused here; the agent is sent nothing.
+        for bad in ["a b", "<b>", "x'; DROP TABLE hosts; --", &"x".repeat(65)] {
+            let (status, answer) = body(add_source(admin(), Path("h1".into()), State(state.clone()), Json(form(Some(bad)))).await).await;
+            assert_eq!((status, answer["error"].as_str()), (StatusCode::BAD_REQUEST, Some("That group of computers is not valid")));
+            let (status, _) = body(update_source(admin(), Path(("h1".into(), "a".into())), State(state.clone()), Json(form(Some(bad)))).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        assert!(to_agent.rx_try().is_none());
+
+        // Adding with a group, changing it, and taking the source out of it
+        // (an empty group): each reaches the agent as it was asked.
+        for (update, group) in [(false, Some("host:h2")), (true, Some("g-0a1b2c3d4e5f")), (true, Some("")), (true, None)] {
+            let agent_state = state.clone();
+            let expected = group.map(str::to_string);
+            let agent = tokio::spawn(async move {
+                let (request_id, change) = asked(&mut to_agent).await;
+                match &change {
+                    SourceChange::Add { group, .. } | SourceChange::Update { group, .. } => assert_eq!(group, &expected),
+                    other => panic!("{:?}", other),
+                }
+                // A group is not printed with the change either way (it is no secret, but the log names fields only).
+                crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: Some("den-pc-ab12".into()), error: None, setup: None }).await;
+                to_agent
+            });
+            let (status, _) = if update {
+                body(update_source(admin(), Path(("h1".into(), "den-pc-ab12".into())), State(state.clone()), Json(form(group))).await).await
+            } else {
+                body(add_source(admin(), Path("h1".into()), State(state.clone()), Json(form(group))).await).await
+            };
+            assert_eq!(status, StatusCode::OK);
+            to_agent = agent.await.unwrap();
+        }
+
+        // On the wire: a change without a group is what it always was, and an
+        // agent from before groups reads one with a group (it skips the field).
+        let plain = SourceChange::Update { id: "a".into(), name: "A".into(), values: Default::default(), group: None };
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"op":"update","id":"a","name":"A","values":{}}"#);
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum OldChange {
+            Add {
+                name: String,
+                #[allow(dead_code)]
+                connector: String,
+                #[allow(dead_code)]
+                values: std::collections::BTreeMap<String, String>,
+            },
+        }
+        let wire = serde_json::to_string(&SourceChange::Add { name: "A".into(), connector: "rustdesk".into(), values: Default::default(), group: Some("host:h1".into()) }).unwrap();
+        let OldChange::Add { name, .. } = serde_json::from_str::<OldChange>(&wire).unwrap();
+        assert_eq!(name, "A");
+        // A server from before groups reads a new agent's announcement, and a
+        // new one an old agent's.
+        #[derive(Deserialize)]
+        struct OldSource {
+            id: String,
+        }
+        let told = serde_json::to_string(&grouped("a", "A", "g-1")).unwrap();
+        assert_eq!(told, r#"{"id":"a","name":"A","connector":"rustdesk","group":"g-1"}"#);
+        assert_eq!(serde_json::from_str::<OldSource>(&told).unwrap().id, "a");
+        let old: SourceInfoMsg = serde_json::from_str(r#"{"id":"a","name":"A","connector":"rustdesk"}"#).unwrap();
+        assert_eq!(old.group, None);
+        assert_eq!(serde_json::to_string(&old).unwrap(), r#"{"id":"a","name":"A","connector":"rustdesk"}"#);
+        // A form from an older client has no "group".
+        let old_form: SourceForm = serde_json::from_str(r#"{"name":"A","values":{}}"#).unwrap();
+        assert_eq!(old_form.group, None);
+    }
+
+    /// A database from before groups gets the column, and what it has stays.
+    #[tokio::test]
+    async fn an_older_database_gets_the_group_column() {
+        let dir = std::env::temp_dir().join(format!("lunaris-sources-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("old.db").display());
+        let password_file = dir.join("admin_password.txt");
+        // As a server from before groups left it: the table without the column, with a source in it.
+        {
+            let pool = crate::db::init_db(&url, &password_file).await.unwrap();
+            sqlx::query("DROP TABLE host_sources").execute(&pool).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE host_sources (host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE, source_id TEXT NOT NULL, name TEXT NOT NULL,
+                 connector TEXT NOT NULL, connector_name TEXT NOT NULL DEFAULT '', PRIMARY KEY (host_id, source_id))",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO hosts (id, name, status) VALUES ('h1', 'Office PC', 'Offline')").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO host_sources (host_id, source_id, name, connector, connector_name) VALUES ('h1', 'den-1', 'Den PC', 'rustdesk', 'RustDesk')").execute(&pool).await.unwrap();
+            let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('host_sources')").fetch_all(&pool).await.unwrap();
+            assert!(!columns.iter().any(|c| c == "source_group"));
+            pool.close().await;
+        }
+        let pool = crate::db::init_db(&url, &password_file).await.unwrap();
+        let row: (String, Option<String>) = sqlx::query_as("SELECT name, source_group FROM host_sources WHERE source_id = 'den-1'").fetch_one(&pool).await.unwrap();
+        assert_eq!(row, ("Den PC".to_string(), None));
+        // Opening it again changes nothing.
+        pool.close().await;
+        let pool = crate::db::init_db(&url, &password_file).await.unwrap();
+        let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('host_sources')").fetch_all(&pool).await.unwrap();
+        assert_eq!(columns.iter().filter(|c| c.as_str() == "source_group").count(), 1);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The pretend agent's next request; `None` when nothing was sent.
+    async fn asked(to_agent: &mut crate::queue::Inbox<ServerToAgentMessage>) -> (String, SourceChange) {
+        match to_agent.recv().await {
+            Some(ServerToAgentMessage::ChangeSource { request_id, change, .. }) => (request_id, change),
+            other => panic!("no ChangeSource: {:?}", other),
+        }
+    }
+
+    fn step(setup: &str, message: &str, code: Option<&str>) -> Option<SetupInfo> {
+        Some(SetupInfo { setup: setup.into(), message: message.into(), code: code.map(str::to_string) })
+    }
+
+    #[tokio::test]
+    async fn adding_with_a_set_up_is_answered_202_then_asked_about_until_it_is_done() {
+        let state = state().await;
+        let mut to_agent = connect(&state, "h1");
+        announced(&state, "h1", vec![], vec![rustdesk()], true).await;
+        let _other = connect(&state, "h2");
+        announced(&state, "h2", vec![], vec![rustdesk()], true).await;
+        let form = || SourceForm { name: "Den PC".into(), connector: "sunshine".into(), values: [("host".to_string(), "192.168.1.50".to_string())].into_iter().collect(), group: None };
+        const MESSAGE: &str = "Open Sunshine on the other computer (its web page, PIN) and enter this PIN.";
+
+        // The agent starts the pairing and says what to show.
+        let agent_state = state.clone();
+        let agent = tokio::spawn(async move {
+            let (request_id, change) = asked(&mut to_agent).await;
+            assert!(matches!(change, SourceChange::Add { ref connector, .. } if connector == "sunshine"));
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: None, error: None, setup: step("su-1", MESSAGE, Some("4711")) }).await;
+            to_agent
+        });
+        let response = add_source(admin(), Path("h1".into()), State(state.clone()), Json(form())).await.into_response();
+        // The answer has the PIN: it is not to be kept anywhere on its way.
+        assert_eq!(response.headers().get(axum::http::header::CACHE_CONTROL).map(|v| v.as_bytes()), Some(&b"no-store"[..]));
+        let (status, answer) = body(response).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(answer, serde_json::json!({ "setup": "su-1", "message": MESSAGE, "code": "4711" }));
+        let mut to_agent = agent.await.unwrap();
+
+        // Only a set-up started here is asked about, and only on its computer:
+        // anything else is 404 and nothing is sent to an agent.
+        let (status, _) = body(setup_state(admin(), Path(("h1".into(), "su-other".into())), State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = body(setup_state(admin(), Path(("h2".into(), "su-1".into())), State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, answer) = body(cancel_setup(admin(), Path(("h2".into(), "su-1".into())), State(state.clone())).await).await;
+        assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
+        assert!(to_agent.rx_try().is_none());
+
+        // Still waiting: the step as it is now (a step without a code has none).
+        let agent_state = state.clone();
+        let agent = tokio::spawn(async move {
+            let (request_id, change) = asked(&mut to_agent).await;
+            assert_eq!(change, SourceChange::SetupState { setup: "su-1".into() });
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: None, error: None, setup: step("su-1", "Almost there", None) }).await;
+            to_agent
+        });
+        let response = setup_state(admin(), Path(("h1".into(), "su-1".into())), State(state.clone())).await.into_response();
+        assert_eq!(response.headers().get(axum::http::header::CACHE_CONTROL).map(|v| v.as_bytes()), Some(&b"no-store"[..]));
+        let (status, answer) = body(response).await;
+        assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({ "state": "pending", "message": "Almost there", "code": null })));
+        let mut to_agent = agent.await.unwrap();
+
+        // Done: the agent's new list first, then the id. The card is there at once.
+        let agent_state = state.clone();
+        let agent = tokio::spawn(async move {
+            let (request_id, _) = asked(&mut to_agent).await;
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::Sources { sources: vec![SourceInfoMsg { id: "den-pc-ab12".into(), name: "Den PC".into(), connector: "sunshine".into(), group: None }], connectors: vec![rustdesk()], manageable: true }).await;
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: Some("den-pc-ab12".into()), error: None, setup: None }).await;
+            to_agent
+        });
+        let (status, answer) = body(setup_state(admin(), Path(("h1".into(), "su-1".into())), State(state.clone())).await).await;
+        assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({ "state": "done", "id": "den-pc-ab12" })));
+        let mut to_agent = agent.await.unwrap();
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert_eq!(list[0]["id"], "den-pc-ab12");
+        // It is over: not known any more, and the agent is not asked again.
+        let (status, _) = body(setup_state(admin(), Path(("h1".into(), "su-1".into())), State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(to_agent.rx_try().is_none());
+        assert!(state.sources.pending.lock().unwrap().is_empty() && state.sources.setups.lock().unwrap().is_empty());
+
+        // Nothing of the PIN or the address is kept, in any table.
+        let tables: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'").fetch_all(&state.db).await.unwrap();
+        for table in tables {
+            let rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT * FROM \"{}\"", table))).fetch_all(&state.db).await.unwrap();
+            for row in rows {
+                use sqlx::Row;
+                for i in 0..row.len() {
+                    let text: Option<String> = row.try_get(i).ok().flatten();
+                    assert!(!text.as_deref().unwrap_or("").contains("4711") && !text.as_deref().unwrap_or("").contains("192.168.1.50"), "{}", table);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_set_up_that_fails_or_is_cancelled() {
+        let state = state().await;
+        let to_agent = connect(&state, "h1");
+        announced(&state, "h1", vec![], vec![rustdesk()], true).await;
+        let form = || SourceForm { name: "Den PC".into(), connector: "sunshine".into(), values: Default::default(), group: None };
+
+        /// Adds with the pretend agent answering "set-up `setup` waits".
+        async fn add(state: &Arc<SignalingState>, mut to_agent: crate::queue::Inbox<ServerToAgentMessage>, form: SourceForm, setup: &'static str) -> crate::queue::Inbox<ServerToAgentMessage> {
+            let agent_state = state.clone();
+            let agent = tokio::spawn(async move {
+                let (request_id, _) = asked(&mut to_agent).await;
+                crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: None, error: None, setup: step(setup, "Enter this PIN", Some("0000")) }).await;
+                to_agent
+            });
+            let (status, _) = body(add_source(admin(), Path("h1".into()), State(state.clone()), Json(form)).await).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            agent.await.unwrap()
+        }
+
+        // Failed: the agent's words, with 200 (the question was answered).
+        let mut to_agent = add(&state, to_agent, form(), "su-1").await;
+        let agent_state = state.clone();
+        let agent = tokio::spawn(async move {
+            let (request_id, _) = asked(&mut to_agent).await;
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: None, error: Some("Pairing was not completed in time".into()), setup: None }).await;
+            to_agent
+        });
+        let (status, answer) = body(setup_state(admin(), Path(("h1".into(), "su-1".into())), State(state.clone())).await).await;
+        assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({ "state": "failed", "error": "Pairing was not completed in time" })));
+        let to_agent = agent.await.unwrap();
+        let (status, _) = body(setup_state(admin(), Path(("h1".into(), "su-1".into())), State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Cancelled: the agent is told once; cancelling again is not an error and tells nobody.
+        let mut to_agent = add(&state, to_agent, form(), "su-2").await;
+        let agent_state = state.clone();
+        let agent = tokio::spawn(async move {
+            let (request_id, change) = asked(&mut to_agent).await;
+            assert_eq!(change, SourceChange::SetupCancel { setup: "su-2".into() });
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: Some("su-2".into()), error: None, setup: None }).await;
+            to_agent
+        });
+        let (status, answer) = body(cancel_setup(admin(), Path(("h1".into(), "su-2".into())), State(state.clone())).await).await;
+        assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
+        let mut to_agent = agent.await.unwrap();
+        let (status, _) = body(cancel_setup(admin(), Path(("h1".into(), "su-2".into())), State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(to_agent.rx_try().is_none());
+
+        // The computer goes offline while its set-up waits: asking says so
+        // (409), and the set-up is still known for when it is back.
+        let _to_agent = add(&state, to_agent, form(), "su-3").await;
+        state.agents.write().unwrap().remove("h1");
+        agent_gone(&state, "h1");
+        let (status, answer) = body(setup_state(admin(), Path(("h1".into(), "su-3".into())), State(state.clone())).await).await;
+        assert_eq!((status, answer["error"].as_str()), (StatusCode::CONFLICT, Some("That computer is offline")));
+        assert!(state.sources.setup_known("su-3", "h1"));
+
+        // An answer with a set-up to a change that has none is not taken for success.
+        let mut to_agent = connect(&state, "h1");
+        announced(&state, "h1", vec![], vec![rustdesk()], true).await;
+        let agent_state = state.clone();
+        tokio::spawn(async move {
+            let (request_id, _) = asked(&mut to_agent).await;
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: None, error: None, setup: step("x", "m", None) }).await;
+        });
+        let (status, _) = body(update_source(admin(), Path(("h1".into(), "a".into())), State(state.clone()), Json(form())).await).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn set_up_messages_on_the_wire_and_with_older_peers() {
+        use serde::Deserialize;
+        // Asking about a set-up and stopping it are changes like the others.
+        let ask = ServerToAgentMessage::ChangeSource { request_id: "r".into(), change: SourceChange::SetupState { setup: "s1".into() }, requester: None };
+        assert_eq!(serde_json::to_string(&ask).unwrap(), r#"{"event":"ChangeSource","data":{"request_id":"r","change":{"op":"setup_state","setup":"s1"}}}"#);
+        let cancel: SourceChange = serde_json::from_str(r#"{"op":"setup_cancel","setup":"s1"}"#).unwrap();
+        assert_eq!(cancel, SourceChange::SetupCancel { setup: "s1".into() });
+
+        // The answer with a set-up; a step without a code has no "code".
+        let info = SetupInfo { setup: "s1".into(), message: "Enter this PIN".into(), code: Some("4711".into()) };
+        let answer = AgentMessage::SourceChanged { request_id: "r".into(), id: None, error: None, setup: Some(info.clone()) };
+        let wire = serde_json::to_string(&answer).unwrap();
+        assert_eq!(wire, r#"{"event":"SourceChanged","data":{"request_id":"r","setup":{"setup":"s1","message":"Enter this PIN","code":"4711"}}}"#);
+        assert!(matches!(serde_json::from_str::<AgentMessage>(&wire).unwrap(), AgentMessage::SourceChanged { setup: Some(read), .. } if read == info));
+        let plain = serde_json::to_string(&SetupInfo { code: None, ..info.clone() }).unwrap();
+        assert_eq!(plain, r#"{"setup":"s1","message":"Enter this PIN"}"#);
+        // What is printed of them never has the code or the message.
+        let printed = format!("{:?} {:?}", answer, ask);
+        assert!(!printed.contains("4711") && !printed.contains("Enter this PIN"), "{}", printed);
+
+        // Peers from before set-ups: their answer has no `setup`, and an
+        // answer without one is on the wire as it always was.
+        let old: AgentMessage = serde_json::from_str(r#"{"event":"SourceChanged","data":{"request_id":"r","id":"den-1"}}"#).unwrap();
+        assert!(matches!(old, AgentMessage::SourceChanged { id: Some(_), error: None, setup: None, .. }));
+        let same = serde_json::to_string(&AgentMessage::SourceChanged { request_id: "r".into(), id: None, error: Some("no".into()), setup: None }).unwrap();
+        assert_eq!(same, r#"{"event":"SourceChanged","data":{"request_id":"r","error":"no"}}"#);
+        // An older peer that derives the same way skips the field it does not know.
+        #[derive(Deserialize)]
+        struct OldAnswer {
+            #[allow(dead_code)]
+            request_id: String,
+            id: Option<String>,
+            error: Option<String>,
+        }
+        let read: OldAnswer = serde_json::from_str(r#"{"request_id":"r","setup":{"setup":"s1","message":"m","code":"1"}}"#).unwrap();
+        assert!(read.id.is_none() && read.error.is_none());
+        // An older agent does not know the new changes: the message fails to
+        // parse there as a whole (and is dropped), which is why they are only
+        // ever sent about a set-up that agent started itself.
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum OldChange {
+            #[allow(dead_code)]
+            Remove { id: String },
+        }
+        assert!(serde_json::from_str::<OldChange>(r#"{"op":"setup_state","setup":"s1"}"#).is_err());
     }
 }

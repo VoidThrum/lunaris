@@ -28,10 +28,15 @@
 //! which the agent's file sessions serve to the Lunaris file manager. A
 //! connector that has none leaves it out.
 //!
+//! Adding a target can have a set-up of its own ([`Connector::setup`]: a
+//! pairing, with a PIN the person types at the other computer). What it
+//! returns is kept with the target and never shown (`sources.rs`).
+//!
 //! An external connector is a program the user chose to run with their own
 //! rights. Nothing installs or downloads one: it exists when the user put
 //! its folder there, and it is started only for a target that names it.
 
+pub mod cursor_contrast;
 pub mod files;
 pub mod keys;
 pub mod media;
@@ -39,6 +44,7 @@ pub mod process;
 pub mod rustdesk;
 pub mod rustdesk_files;
 pub mod sources;
+pub mod sunshine;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -67,12 +73,18 @@ pub struct Field {
     /// The key in [`Target::values`].
     pub key: String,
     pub label: String,
-    /// "text", "port" or "secret" (a secret is never shown or logged).
+    /// "text", "port", "secret" (a secret is never shown or logged) or
+    /// "choice": one of `options`, shown as that many options to press. Its
+    /// value is text like any other (an older client shows a text box for
+    /// it), and it is the connector that says what it takes.
     pub kind: String,
     #[serde(default)]
     pub default: String,
     #[serde(default)]
     pub required: bool,
+    /// What a "choice" is chosen from: the value kept and its label.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<common::FieldOptionMsg>,
 }
 
 /// What a connector can deliver and take.
@@ -90,6 +102,18 @@ pub struct Capabilities {
     /// The target's files can be browsed and copied ([`Connector::open_files`]).
     #[serde(default)]
     pub files: bool,
+    /// Adding a target has a set-up of its own ([`Connector::setup`]).
+    #[serde(default)]
+    pub setup: bool,
+}
+
+/// Something to show the person while a set-up waits for them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStep {
+    pub message: String,
+    /// A code to show large (a PIN), when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +123,10 @@ pub struct Description {
     pub name: String,
     pub fields: Vec<Field>,
     pub capabilities: Capabilities,
+    /// One or two plain sentences for the person, shown under the Type
+    /// choice of "Add computer" (what must be there before adding one).
+    #[serde(default)]
+    pub note: String,
 }
 
 /// A computer to show: which connector, and its values for the
@@ -125,11 +153,16 @@ impl std::fmt::Debug for Target {
 
 /// A source of this agent: a computer it shows besides its own screen. In
 /// the agent's config as `{"id": ..., "name": ..., "connector": ..., and the
-/// connector's fields}`. Only the id and the name leave this computer.
+/// connector's fields}`. Only the id, the name and the group leave this computer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub id: String,
     pub name: String,
+    /// Which computer it is, when that computer is listed in other ways
+    /// too (`common::SourceInfoMsg::group`); an opaque word, told with the
+    /// id and the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     #[serde(flatten)]
     pub target: Target,
 }
@@ -154,6 +187,17 @@ pub struct Viewer {
     /// deliver one of them (the agent does not transcode).
     pub codecs: Vec<Codec>,
     pub fps: u32,
+    /// The picture's size the viewer asked for, in pixels; 0 = no wish. For
+    /// a connector whose computer sends in the size a client asks for.
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    /// The bitrate the viewer asked for, in kbit/s; 0 = no wish. For a
+    /// connector whose protocol fixes it when the session starts (later
+    /// wishes come as `Command::Quality`).
+    #[serde(default)]
+    pub bitrate_kbps: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,9 +240,26 @@ pub enum Event {
     /// for the computer's in the picture; it hides its own only if it finds
     /// it. `false`: the moment is over.
     CursorMaybeEmbedded { maybe: bool },
+    /// The pointer is part of the picture for the whole session, and no
+    /// shape or position of it will come (a computer that always draws its
+    /// pointer into what it sends). Said once, at the start. The viewer
+    /// shows no pointer at all over the picture, neither one it draws nor
+    /// its own system's: the only pointer is the one in the picture.
+    /// Unlike `CursorEmbedded` it does not depend on the kind of computer
+    /// or on a button being held.
+    CursorAlwaysEmbedded,
     /// What kind of computer it is: "windows", "linux", "macos", "android"
     /// (viewers treat the pointer differently by it).
     Platform { os: String },
+    /// The delay between the agent and the computer, there and back, in
+    /// milliseconds (fractions for what is under a millisecond), as the
+    /// connector's protocol measures it (a round trip: a protocol that only
+    /// knows one way doubles it). Told when it is known and again when it
+    /// changes, about once a second at most. The viewer adds it to its own
+    /// round trip to the agent and shows the sum as the ping. Never told =
+    /// nothing is added (Lunaris's own event; no protocol is asked to have
+    /// it). Never negative, never not a number.
+    Latency { ms: f32 },
     /// The remote computer's clipboard text changed.
     Clipboard { text: String },
     /// The clipboard cannot be shared (now): the reason, for the viewer
@@ -256,11 +317,24 @@ pub trait Connector: Send + Sync {
     async fn open_files(&self, _target: &Target) -> anyhow::Result<files::FileSession> {
         anyhow::bail!(files::NO_FILES)
     }
+
+    /// Done once when a target is added, when `capabilities.setup` is true:
+    /// may need the person (a PIN to type at the other computer). Each step
+    /// to show goes to `steps`. Returns values to keep with the target
+    /// (secrets included; they never leave the agent). An error is a text
+    /// for the person who asked.
+    async fn setup(
+        &self,
+        _target: &Target,
+        _steps: mpsc::Sender<SetupStep>,
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        Ok(BTreeMap::new())
+    }
 }
 
 /// The connectors built into the agent.
 pub fn builtin() -> Vec<Arc<dyn Connector>> {
-    vec![Arc::new(rustdesk::RustdeskConnector)]
+    vec![Arc::new(rustdesk::RustdeskConnector), Arc::new(sunshine::SunshineConnector::new())]
 }
 
 /// Where external connectors live: `connectors/` beside the agent's config.

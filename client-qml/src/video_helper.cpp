@@ -3,6 +3,7 @@
 #include <QtMultimedia/QVideoFrame>
 #include <QtMultimedia/QVideoFrameFormat>
 #include <QCursor>
+#include <QIcon>
 #include <QGuiApplication>
 #include <QApplication>
 #include <QQuickStyle>
@@ -181,59 +182,7 @@ double window_screen_refresh_rate() {
     return screen ? screen->refreshRate() : 0.0;
 }
 
-#if defined(Q_OS_LINUX)
-#include <dlfcn.h>
-
-typedef int (*XGrabKeyboardFn)(void*, unsigned long, int, int, int, unsigned long);
-typedef int (*XUngrabKeyboardFn)(void*, unsigned long);
-#endif
-
-void set_keyboard_grab_helper(bool grab) {
-    QWindow* window = nullptr;
-    auto windows = QGuiApplication::allWindows();
-    if (!windows.isEmpty()) {
-        window = windows.first();
-    }
-    std::cerr << "Lunaris Client: set_keyboard_grab_helper(" << (grab ? "true" : "false") << ") - Target Window: " << window << std::endl;
-    if (!window) return;
-
-    if (grab) {
-        window->requestActivate();
-    }
-
-#if defined(Q_OS_LINUX)
-    auto* x11App = qApp->nativeInterface<QNativeInterface::QX11Application>();
-    if (x11App) {
-        void* display = x11App->display();
-        unsigned long x_window = (unsigned long)window->winId();
-        if (display && x_window) {
-            void* libX11 = dlopen("libX11.so.6", RTLD_LAZY | RTLD_NOLOAD);
-            if (!libX11) libX11 = dlopen("libX11.so", RTLD_LAZY | RTLD_NOLOAD);
-            if (!libX11) libX11 = dlopen("libX11.so.6", RTLD_LAZY);
-            if (!libX11) libX11 = dlopen("libX11.so", RTLD_LAZY);
-
-            if (libX11) {
-                auto grab_fn = (XGrabKeyboardFn)dlsym(libX11, "XGrabKeyboard");
-                auto ungrab_fn = (XUngrabKeyboardFn)dlsym(libX11, "XUngrabKeyboard");
-                if (grab_fn && ungrab_fn) {
-                    if (grab) {
-                        int result = grab_fn(display, x_window, 1, 1, 1, 0); // GrabModeAsync=1, CurrentTime=0
-                        std::cerr << "Lunaris Client: Native XGrabKeyboard returned: " << result << std::endl;
-                    } else {
-                        ungrab_fn(display, 0); // CurrentTime=0
-                        std::cerr << "Lunaris Client: Native XUngrabKeyboard called" << std::endl;
-                    }
-                    return;
-                }
-            }
-        }
-    }
-#endif
-
-    // Fallback if not Linux/X11 or if native loading failed
-    bool success = window->setKeyboardGrabEnabled(grab);
-    std::cerr << "Lunaris Client: Fallback setKeyboardGrabEnabled returned: " << (success ? "true" : "false") << std::endl;
-}
+// set_keyboard_grab_helper: keyboard_grab.cpp.
 
 static bool g_pointerLocked = false;
 static QObject* g_streamBridge = nullptr;
@@ -517,6 +466,10 @@ void create_widgets_application() {
 #ifdef LUNARIS_VERSION
         QCoreApplication::setApplicationVersion(QStringLiteral(LUNARIS_VERSION));
 #endif
+        // The window's icon. On Wayland a window has no icon of its own: the
+        // desktop takes it from the desktop entry named here (the app id).
+        QGuiApplication::setDesktopFileName(QStringLiteral("lunaris-client"));
+        QGuiApplication::setWindowIcon(QIcon(QStringLiteral(":/icon.png")));
 #if defined(Q_OS_LINUX)
         // KDE's platform theme switches Qt Quick Controls to "org.kde.desktop"
         // as soon as a QApplication exists; that style breaks our custom

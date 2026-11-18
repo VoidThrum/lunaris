@@ -440,7 +440,16 @@ pub async fn setup_bridge_session(
     // viewer is the one it sends.
     let connector_source = match connector_target {
         Some(target) => {
-            let source = crate::connector::media::open(&target, &requested_codec, decode_codecs.as_deref(), stream_fps).await?;
+            // What the viewer itself asked for (not this function's defaults).
+            let source = crate::connector::media::open(
+                &target,
+                &requested_codec,
+                decode_codecs.as_deref(),
+                stream_fps,
+                (width.unwrap_or(0), height.unwrap_or(0)),
+                bitrate.unwrap_or(0),
+            )
+            .await?;
             codec_str = crate::connector::media::codec_name(source.codec).to_string();
             Some(source)
         }
@@ -1128,6 +1137,9 @@ pub async fn setup_bridge_session(
     if let Some(injector) = local_injector {
         let injector = std::sync::Arc::new(injector);
         let injector_clone = injector.clone();
+        // The keys the viewer holds, let go when its input ends (below).
+        let held_keys = std::sync::Arc::new(HeldKeys::default());
+        let held_keys_clone = held_keys.clone();
 
         // Spawn a DEDICATED OS THREAD for mouse inputs — tokio::spawn can
         // starve the mouse task when the pipeline is CPU-heavy (e.g. encoding
@@ -1143,9 +1155,11 @@ pub async fn setup_bridge_session(
             .spawn(move || {
                 info!("InputInjector: started mouse input processing thread");
                 while let Some(first_packet) = input_rx.blocking_recv() {
-                    process_mouse_input_batch(first_packet, &mut input_rx, &injector);
+                    process_mouse_input_batch(first_packet, &mut input_rx, &injector, &held_keys);
                     injector.flush();
                 }
+                // Keys may come this way too (WebTransport input).
+                release_held_keys(&injector, &held_keys);
                 info!("InputInjector: stopped mouse input processing thread");
             })
             .expect("Failed to spawn mouse input thread");
@@ -1156,8 +1170,11 @@ pub async fn setup_bridge_session(
             .spawn(move || {
                 info!("InputInjector: started keyboard input processing thread");
                 while let Some((packet, last_timestamp)) = key_input_rx.blocking_recv() {
-                    handle_inbound_packet(packet, &injector_clone, &last_timestamp);
+                    handle_inbound_packet(packet, &injector_clone, &last_timestamp, &held_keys_clone);
                 }
+                // The viewer is gone (closed, lost its connection): the
+                // releases of what it held will not come.
+                release_held_keys(&injector_clone, &held_keys_clone);
                 info!("InputInjector: stopped keyboard input processing thread");
             })
             .expect("Failed to spawn keyboard input thread");
@@ -1289,34 +1306,12 @@ pub async fn setup_bridge_session(
                         }
                         latest_cursor_image = Some(image_json.clone());
                     }
-                    let realtime_payload = serde_json::json!({
-                        "type": "host_cursor",
-                        "x": cursor.x,
-                        "y": cursor.y,
-                        "visible": cursor.visible,
-                        "kind": cursor_kind,
-                        "image": image,
-                        "in_window_move_size": cursor.in_window_move_size,
-                        // A source that cannot know (connector/media.rs): the
-                        // viewer looks for the pointer in the picture itself.
-                        // Viewers from before this field keep their own pointer.
-                        "pointer_maybe_in_picture": crate::connector::media::pointer_maybe_in_picture(),
-                    })
-                    .to_string();
-                    let cached_payload = serde_json::json!({
-                        "type": "host_cursor",
-                        "x": cursor.x,
-                        "y": cursor.y,
-                        "visible": cursor.visible,
-                        "kind": cursor_kind,
-                        "image": latest_cursor_image.clone(),
-                        "in_window_move_size": cursor.in_window_move_size,
-                        // A source that cannot know (connector/media.rs): the
-                        // viewer looks for the pointer in the picture itself.
-                        // Viewers from before this field keep their own pointer.
-                        "pointer_maybe_in_picture": crate::connector::media::pointer_maybe_in_picture(),
-                    })
-                    .to_string();
+                    // What a source says of its pointer and its picture
+                    // (connector/media.rs).
+                    let maybe_in_picture = crate::connector::media::pointer_maybe_in_picture();
+                    let in_picture = crate::connector::media::pointer_in_picture();
+                    let realtime_payload = host_cursor_message(&cursor, image.as_ref(), maybe_in_picture, in_picture);
+                    let cached_payload = host_cursor_message(&cursor, latest_cursor_image.as_ref(), maybe_in_picture, in_picture);
                     *latest_host_cursor_for_media.lock().await = Some(cached_payload.clone());
 
                     if image.is_some()
@@ -2096,6 +2091,7 @@ fn process_mouse_input_batch(
     first: InputQueueItem,
     input_rx: &mut mpsc::UnboundedReceiver<InputQueueItem>,
     injector: &lunaris_media::input::InputInjector,
+    held_keys: &HeldKeys,
 ) {
     let mut pending = Some(first);
     while let Ok(next) = input_rx.try_recv() {
@@ -2103,7 +2099,7 @@ fn process_mouse_input_batch(
             match coalesce_mouse_input(current, next) {
                 Ok(coalesced) => pending = Some(coalesced),
                 Err((current, next)) => {
-                    handle_inbound_packet(current.0, injector, &current.1);
+                    handle_inbound_packet(current.0, injector, &current.1, held_keys);
                     pending = Some(next);
                 }
             }
@@ -2113,7 +2109,7 @@ fn process_mouse_input_batch(
     }
 
     if let Some((packet, last_timestamp)) = pending {
-        handle_inbound_packet(packet, injector, &last_timestamp);
+        handle_inbound_packet(packet, injector, &last_timestamp, held_keys);
     }
 }
 
@@ -2177,10 +2173,76 @@ fn coalesce_mouse_input(
     }
 }
 
+/// The keys a viewer has pressed here and not let go (virtual-key codes).
+/// When the viewer's input ends with keys still down - it closed, or lost
+/// its connection, in the middle of a combination - they are let go, or the
+/// key would stay held on this computer for whoever uses it next
+/// (moonlight-qt raises its keys the same way from the viewer's side,
+/// keyboard.cpp raiseAllKeys 521-537; the host cannot count on that).
+#[derive(Default)]
+struct HeldKeys(std::sync::Mutex<Vec<u16>>);
+
+impl HeldKeys {
+    fn note(&self, key: u16, is_press: bool) {
+        let mut held = self.0.lock().unwrap();
+        held.retain(|k| *k != key);
+        if is_press {
+            held.push(key);
+        }
+    }
+
+    /// The keys still held, last pressed first; none are held afterwards.
+    fn take(&self) -> Vec<u16> {
+        let mut held = std::mem::take(&mut *self.0.lock().unwrap());
+        held.reverse();
+        held
+    }
+}
+
+/// Keys the Linux injector has no entry for when named by virtual-key code
+/// (lunaris-media `vk_to_linux_keycode` and `vk_to_keysym`: Pause, Caps
+/// Lock, Print Screen, the menu key, F13 to F24, the key beside the left
+/// Shift of ISO keyboards, the volume keys), as the kernel's key code from
+/// `connector/keys.rs`. They are pressed by position instead
+/// (`InputInjector::key_position`); before, they were dropped on a Linux
+/// host. None for every other key.
+#[cfg(any(target_os = "linux", test))]
+fn linux_position_of_unmapped_vk(key: u16) -> Option<u32> {
+    match key {
+        0x13 | 0x14 | 0x2C | 0x5D | 0x7C..=0x87 | 0xE2 | 0xAD..=0xAF => {
+            crate::connector::keys::position_of_vk(key)
+        }
+        _ => None,
+    }
+}
+
+fn inject_key(injector: &lunaris_media::input::InputInjector, key: u16, is_press: bool) {
+    #[cfg(target_os = "linux")]
+    if let Some(position) = linux_position_of_unmapped_vk(key) {
+        injector.key_position(position, is_press);
+        return;
+    }
+    injector.keyboard_key(key, is_press);
+}
+
+fn release_held_keys(injector: &lunaris_media::input::InputInjector, held_keys: &HeldKeys) {
+    let held = held_keys.take();
+    if held.is_empty() {
+        return;
+    }
+    // How many, never which (privacy).
+    info!("The viewer's input ended with {} key(s) held: let go", held.len());
+    for key in held {
+        inject_key(injector, key, false);
+    }
+    injector.flush();
+}
+
 fn handle_inbound_packet(
     packet: InboundPacket,
     injector: &lunaris_media::input::InputInjector,
     last_timestamp: &std::sync::atomic::AtomicU32,
+    held_keys: &HeldKeys,
 ) {
     match packet {
         InboundPacket::MousePosition {
@@ -2304,12 +2366,131 @@ fn handle_inbound_packet(
                 }
             }
 
-            injector.keyboard_key(key, is_press);
+            held_keys.note(key, is_press);
+            inject_key(injector, key, is_press);
         }
         InboundPacket::Text { text } => {
             crate::share::type_text(injector, &text);
         }
         _ => {}
+    }
+}
+
+/// The `host_cursor` message for the viewers. Viewers read every field but
+/// `type`, `x` and `y` as optional, and fields they do not know not at all.
+/// `image`: the cursor's picture as JSON (it goes with the message that
+/// brings a new one, and with the message kept for a viewer that opens its
+/// channel later).
+/// `maybe_in_picture`: a source that cannot know whether its pointer is in
+/// its picture now; the viewer looks for it in the picture itself (viewers
+/// from before this field keep their own pointer).
+/// `in_picture`: `Some("always")` for a source whose pointer is part of its
+/// picture for the whole session; the viewer shows no pointer over the
+/// picture (viewers from before this field keep their own pointer).
+/// Otherwise null.
+fn host_cursor_message(
+    cursor: &lunaris_media::types::CursorState,
+    image: Option<&serde_json::Value>,
+    maybe_in_picture: bool,
+    in_picture: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "type": "host_cursor",
+        "x": cursor.x,
+        "y": cursor.y,
+        "visible": cursor.visible,
+        "kind": cursor.kind.as_str(),
+        "image": image,
+        "in_window_move_size": cursor.in_window_move_size,
+        "pointer_maybe_in_picture": maybe_in_picture,
+        "pointer_in_picture": in_picture,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod held_keys_tests {
+    use super::{linux_position_of_unmapped_vk, HeldKeys};
+
+    #[test]
+    fn keys_still_down_are_the_ones_to_let_go() {
+        let held = HeldKeys::default();
+        held.note(0xA2, true); // Ctrl
+        held.note(0x12, true); // Alt
+        held.note(0x09, true); // Tab
+        held.note(0x09, false);
+        held.note(0x12, true); // the key repeating
+        assert_eq!(held.take(), vec![0x12, 0xA2]);
+        assert!(held.take().is_empty());
+        // A release without a press holds nothing.
+        held.note(0x41, false);
+        assert!(held.take().is_empty());
+    }
+
+    #[test]
+    fn keys_the_linux_injector_lacks_go_by_position() {
+        assert_eq!(linux_position_of_unmapped_vk(0x14), Some(58)); // Caps Lock
+        assert_eq!(linux_position_of_unmapped_vk(0x2C), Some(99)); // Print Screen
+        assert_eq!(linux_position_of_unmapped_vk(0x13), Some(119)); // Pause
+        assert_eq!(linux_position_of_unmapped_vk(0x5D), Some(127)); // menu key
+        assert_eq!(linux_position_of_unmapped_vk(0x7C), Some(183)); // F13
+        assert_eq!(linux_position_of_unmapped_vk(0xE2), Some(86)); // ISO key
+        // The keys it has stay with it.
+        assert_eq!(linux_position_of_unmapped_vk(0x41), None);
+        assert_eq!(linux_position_of_unmapped_vk(0x5B), None);
+        assert_eq!(linux_position_of_unmapped_vk(0x7B), None); // F12
+        assert_eq!(linux_position_of_unmapped_vk(0xA5), None);
+    }
+}
+
+#[cfg(test)]
+mod host_cursor_message_tests {
+    use super::host_cursor_message;
+    use lunaris_media::types::{CursorKind, CursorState};
+
+    fn cursor() -> CursorState {
+        CursorState { x: 10, y: 20, visible: true, kind: CursorKind::Arrow, image: None, in_window_move_size: false }
+    }
+
+    fn parsed(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// An ordinary host and a source that says nothing of its picture: the
+    /// message is what it was before `pointer_in_picture`, with that field null.
+    #[test]
+    fn nothing_said_of_the_picture() {
+        let message = parsed(&host_cursor_message(&cursor(), None, false, None));
+        assert_eq!(
+            message,
+            serde_json::json!({
+                "type": "host_cursor", "x": 10, "y": 20, "visible": true, "kind": "arrow", "image": null,
+                "in_window_move_size": false, "pointer_maybe_in_picture": false, "pointer_in_picture": null,
+            })
+        );
+    }
+
+    /// The three things a host can say are three fields; none stands for another.
+    #[test]
+    fn always_in_the_picture_is_its_own_field() {
+        let message = parsed(&host_cursor_message(&cursor(), None, false, Some("always")));
+        assert_eq!(message["pointer_in_picture"], "always");
+        assert_eq!(message["in_window_move_size"], false);
+        assert_eq!(message["pointer_maybe_in_picture"], false);
+
+        let mut moved = cursor();
+        moved.in_window_move_size = true;
+        let message = parsed(&host_cursor_message(&moved, None, true, None));
+        assert_eq!(message["in_window_move_size"], true);
+        assert_eq!(message["pointer_maybe_in_picture"], true);
+        assert!(message["pointer_in_picture"].is_null());
+    }
+
+    #[test]
+    fn the_cursors_picture_goes_with_it() {
+        let image = serde_json::json!({"width": 1, "height": 1, "hotspot_x": 0, "hotspot_y": 0, "rgba": "AAAAAA=="});
+        let message = parsed(&host_cursor_message(&cursor(), Some(&image), false, None));
+        assert_eq!(message["image"], image);
     }
 }
 

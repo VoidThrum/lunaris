@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import "Cards.js" as Cards
 
 // The app's main screen: "This computer" (let others control it) on the
 // left, "Control a remote computer" with recent, favorite and server
@@ -104,6 +105,9 @@ Rectangle {
         Theme.mode = home.prefs.theme || "system";
         I18n.lang = home.prefs.language === "vi" ? "vi" : "en";
         window.closeToTray = home.prefs.closeToTray !== false;
+        // The way used last for each card of the Server tab (kept here,
+        // with the app's settings).
+        serverDashboard.cardMethods = home.prefs.serverCardMethods || ({});
         var storedPeers = bridge.loadStore("peers");
         if (storedPeers !== "") {
             try { home.peers = JSON.parse(storedPeers).peers || []; } catch (e) { console.log("peers: " + e); }
@@ -123,6 +127,95 @@ Rectangle {
         return !!peer && String(peer.address || "").indexOf("source:") === 0;
     }
 
+    // ---- One card for each computer (Cards.js) ----
+    // A saved Lunaris computer and the computers of other types that are
+    // the same machine are one card, with a way to connect for each. Which
+    // are one machine is said by a group (an opaque word): a computer of
+    // another type has it from the app's helper (`ownSources`, where one
+    // added at the address of another gets the other's), a Lunaris computer
+    // has it in the list (`group`, given when a way is first added to it).
+    // A card: { key, title, host, group, methods, peers, favorite, lastUsed }.
+    function peerCards() {
+        var hosts = [];
+        var sources = [];
+        for (var i = 0; i < home.peers.length; i++) {
+            var p = home.peers[i];
+            if (isSource(p)) {
+                var s = ownSource(p.sourceId || "");
+                sources.push({ host_id: "", host_name: "", id: String(p.sourceId || ""), name: p.name || (s ? s.name : ""),
+                               connector: String(p.type || ""), connector_name: typeName(p), online: true,
+                               group: s && s.group ? String(s.group) : "", peer: p });
+            } else {
+                hosts.push({ id: p.address, name: p.name ? p.name : displayAddress(p.address || ""), status: "Online", peer: p });
+            }
+        }
+        var cards = Cards.buildCards(hosts, sources,
+            function (source) { return Cards.typeShortName(source.connector, I18n.t(source.connector_name)); }, "Lunaris",
+            function (host) { return String(host.peer.group || ""); });
+        for (var c = 0; c < cards.length; c++) {
+            var members = cards[c].methods.map(function (m) { return methodPeer(m); });
+            cards[c].peers = members;
+            cards[c].favorite = !!members[0].favorite;
+            cards[c].lastUsed = members.reduce(function (latest, peer) { return Math.max(latest, peer.lastUsed || 0); }, 0);
+        }
+        return cards;
+    }
+    function methodPeer(method) { return method.host ? method.host.peer : method.source.peer; }
+    function peerCardByKey(key) {
+        var cards = peerCards();
+        for (var i = 0; i < cards.length; i++) if (cards[i].key === key) return cards[i];
+        return null;
+    }
+    // The way a card connects with now, and choosing another (remembered
+    // with the app's settings).
+    function methodOf(card) { return Cards.currentMethod(card.methods, (home.prefs.cardMethods || {})[card.key]); }
+    function chooseMethod(card, methodKey) {
+        if ((home.prefs.cardMethods || {})[card.key] === methodKey) return;
+        setPref("cardMethods", Cards.remembered(home.prefs.cardMethods || {}, card.key, methodKey));
+    }
+    function connectMethod(card, method) {
+        if (!method) return;
+        chooseMethod(card, method.key);
+        requestConnect(methodPeer(method).address);
+    }
+    // The cards a computer of another type can be said to be the same
+    // computer as, and the one it is on now ("" for a card of its own).
+    function sameOptionsFor(peer) {
+        var cards = peerCards();
+        var options = [];
+        var now = "";
+        for (var i = 0; i < cards.length; i++) {
+            var mine = cards[i].peers.some(function (p) { return p.address === peer.address; });
+            if (mine && cards[i].methods.length === 1) continue;
+            if (mine) now = cards[i].key;
+            options.push({ value: cards[i].key, label: cards[i].title, group: cards[i].group });
+        }
+        return { options: options, now: now };
+    }
+    // The group that was said with a form (AddComputerDialog), as the
+    // helper takes it. "@<card key>" is a card that has no group yet: it is
+    // given a new one first. Returns { group, error }.
+    function groupFor(said) {
+        if (said === undefined || said === null) return { group: "*", error: "" };
+        if (String(said).charAt(0) !== "@") return { group: String(said), error: "" };
+        var card = peerCardByKey(String(said).slice(1));
+        if (!card || card.methods.length !== 1) return { group: "*", error: I18n.t("That computer is not there any more") };
+        var group = Cards.newGroup();
+        var first = card.peers[0];
+        if (!isSource(first)) {
+            updatePeer(first.address, { group: group });
+            return { group: group, error: "" };
+        }
+        var answer;
+        try { answer = JSON.parse(bridge.bridgeUpdateSourceGrouped(first.sourceId, first.name || card.title, "{}", group)); } catch (e) { answer = null; }
+        if (!answer || answer.error) return { group: "*", error: I18n.tError(String((answer && answer.error) || "The computer could not be saved")) };
+        return { group: group, error: "" };
+    }
+    function addMethodTo(card) {
+        refreshOwnComputers();
+        addDialog.openAddMethod({ key: card.key, title: card.title, group: card.group });
+    }
+
     function refreshOwnComputers() {
         try { home.connectors = JSON.parse(bridge.bridgeConnectors()) || []; } catch (e) { console.log("connectors: " + e); }
         try { home.ownSources = JSON.parse(bridge.bridgeSources()) || []; } catch (e) { console.log("own computers: " + e); }
@@ -140,6 +233,14 @@ Rectangle {
             added = true;
         }
         if (added) { home.peers = list; savePeers(); }
+    }
+
+    // Whether a computer of another type has files to offer: yes unless
+    // its connector says it has none (a type that is not installed any
+    // more says nothing).
+    function sourceHasFiles(peer) {
+        var c = connectorById(peer.type || "");
+        return !(c && c.capabilities && c.capabilities.files === false);
     }
 
     function ownSource(id) {
@@ -198,37 +299,73 @@ Rectangle {
 
     // "Add computer" with a connector type (`sourceId` ""), or "Edit" of
     // one. The fields go to the app's helper; the card keeps the name and
-    // the type. Returns an error message or "".
-    function saveSource(connectorId, sourceId, name, values) {
+    // the type. Returns an error message or "". A type with a set-up (a
+    // pairing) is not added yet: the dialog shows what it wants shown
+    // (addDialog.setupShown) and the card comes when it is done.
+    // `group` says which computer it is (see groupFor); left out: nothing said.
+    function saveSource(connectorId, sourceId, name, values, group) {
+        var said = groupFor(group);
+        if (said.error !== "") return said.error;
         var answer;
         try {
             answer = JSON.parse(sourceId === ""
-                ? bridge.bridgeAddSource(name, connectorId, JSON.stringify(values))
-                : bridge.bridgeUpdateSource(sourceId, name, JSON.stringify(values)));
+                ? bridge.bridgeAddSourceGrouped(name, connectorId, JSON.stringify(values), said.group)
+                : bridge.bridgeUpdateSourceGrouped(sourceId, name, JSON.stringify(values), said.group));
         } catch (e) {
             return I18n.t("The computer could not be saved");
         }
+        if (answer && !answer.error && answer.setup && sourceId === "") {
+            addDialog.setupShow(answer.setup, "", answer.message, answer.code);
+            return "";
+        }
         if (!answer || answer.error || !answer.id) return I18n.tError(String((answer && answer.error) || "The computer could not be saved"));
-        refreshOwnComputers();
         if (sourceId === "") {
-            var list = home.peers.slice();
-            list.push({ address: "source:" + answer.id, name: name, type: connectorId, sourceId: answer.id, favorite: false, lastUsed: Date.now() });
-            home.peers = list;
-            savePeers();
-            home.peerTab = "recent";
+            sourceAdded(answer.id, name, connectorId);
         } else {
+            refreshOwnComputers();
             updatePeer("source:" + sourceId, { name: name });
         }
         return "";
     }
 
+    // A computer of another type was added (at once, or when its set-up was
+    // done): its card.
+    function sourceAdded(id, name, connectorId) {
+        refreshOwnComputers();
+        var list = home.peers.slice();
+        list.push({ address: "source:" + id, name: name, type: connectorId, sourceId: id, favorite: false, lastUsed: Date.now() });
+        home.peers = list;
+        savePeers();
+        home.peerTab = "recent";
+    }
+
+    // How the set-up of the computer being added stands (asked once a
+    // second by the dialog).
+    function askSourceSetup(setup) {
+        var state;
+        try { state = JSON.parse(bridge.bridgeSourceSetup(setup)); } catch (e) { state = null; }
+        if (addDialog.setupId !== setup) return;
+        if (!state || state.state === "failed") {
+            addDialog.setupFailed(I18n.tError(String((state && state.error) || "")));
+        } else if (state.state === "done" && state.id) {
+            var name = addDialog.setupName;
+            var type = addDialog.setupType;
+            addDialog.setupFinished();
+            sourceAdded(state.id, name, type);
+            addDialog.close();
+        } else {
+            addDialog.setupUpdate(state.message, state.code);
+        }
+    }
+
     function editSource(peer) {
         refreshOwnComputers();
         var s = ownSource(peer.sourceId || "");
+        var same = sameOptionsFor(peer);
         addDialog.openEdit({
             id: peer.sourceId, name: peer.name || (s ? s.name : ""),
             connector: peer.type || (s ? s.connector : ""), connector_name: typeName(peer)
-        }, s ? s.values : ({}));
+        }, s ? s.values : ({}), same.options, same.now);
     }
 
     // Removes the card and what the helper keeps for it (its address and password).
@@ -513,12 +650,14 @@ Rectangle {
         savePeers();
     }
 
+    // The cards of the list: by tab and search, the one used last first.
     function visiblePeers() {
         var q = home.searchText.trim().toLowerCase();
-        var list = home.peers.filter(function (p) {
-            if (home.peerTab === "favorites" && !p.favorite) return false;
+        var list = peerCards().filter(function (card) {
+            if (home.peerTab === "favorites" && !card.favorite) return false;
             if (q === "") return true;
-            return (p.address + " " + (p.name || "")).toLowerCase().indexOf(q) !== -1;
+            return card.peers.some(function (p) { return (p.address + " " + (p.name || "")).toLowerCase().indexOf(q) !== -1; })
+                || String(card.title).toLowerCase().indexOf(q) !== -1;
         });
         list.sort(function (a, b) { return (b.lastUsed || 0) - (a.lastUsed || 0); });
         return list;
@@ -865,6 +1004,8 @@ Rectangle {
                 font.pixelSize: 12
                 elide: Text.ElideRight
                 width: home.width - 220
+                // (It can hold what another computer said: never markup.)
+                textFormat: Text.PlainText
                 text: home.statusText !== "" ? home.statusText
                     : (home.hostStatus.running ? I18n.t("Ready. Others can control this computer with its address and password.")
                                                : I18n.t("Ready. Remote control of this computer is off."))
@@ -1335,7 +1476,7 @@ Rectangle {
                                 anchors.fill: parent
                                 anchors.rightMargin: 16
                                 anchors.bottomMargin: 16
-                                peer: modelData
+                                cardData: modelData
                             }
                         }
                     }
@@ -1400,6 +1541,7 @@ Rectangle {
                     anchors.bottom: parent.bottom
                     anchors.fill: undefined
                     visible: home.peerTab === "server"
+                    onCardMethodChosen: (card, method) => home.setPref("serverCardMethods", serverDashboard.cardMethods)
                     onStartSessionRequested: (server, token, hostId, hostName, appId, res, fps, codec, bitrate, queueLimit, disableCuda, renderBackend, inputProtocol, encoder, displayId, sourceId) => {
                         // Not to a saved computer: what the session lists belongs to the Server tab.
                         home.sessionPeer = "";
@@ -1427,11 +1569,19 @@ Rectangle {
     component PeerCard: Rectangle {
         id: card
         objectName: "peerCard"
-        property var peer: ({})
+        // The computer (Cards.js: its ways to connect) and the way that is
+        // chosen for it. Everything on the card acts on that way: `peer` is
+        // its entry in the list of saved computers.
+        property var cardData: ({ key: "", title: "", methods: [], peers: [] })
+        readonly property bool multi: cardData.methods.length > 1
+        readonly property var method: home.methodOf(cardData)
+        readonly property var peer: method ? home.methodPeer(method) : ({})
+        // The entry the card's star is kept with.
+        readonly property var firstPeer: cardData.peers.length > 0 ? cardData.peers[0] : peer
         // A computer of another type: a badge says which, there is no
         // address of its own to check or to show, and no Lunaris files.
         readonly property bool isSource: home.isSource(peer)
-        readonly property string title: peer.name ? peer.name : home.displayAddress(peer.address || "")
+        readonly property string title: multi ? cardData.title : (peer.name ? peer.name : home.displayAddress(peer.address || ""))
         readonly property var cardColors: ["#3b4a6b", "#4a3b6b", "#2f5560", "#5a4632", "#3e5a3a", "#5c3a4a"]
         radius: Theme.radius
         color: Theme.surface
@@ -1450,8 +1600,8 @@ Rectangle {
             anchors.fill: parent
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
-            onDoubleClicked: home.requestConnect(card.peer.address)
-            onClicked: home.requestConnect(card.peer.address)
+            onDoubleClicked: home.connectMethod(card.cardData, card.method)
+            onClicked: home.connectMethod(card.cardData, card.method)
         }
 
         Rectangle {
@@ -1461,19 +1611,23 @@ Rectangle {
             anchors.top: parent.top
             height: parent.height - 44
             radius: Theme.radius
-            color: card.colorFor(card.peer.address || "")
+            color: card.colorFor(card.firstPeer.address || "")
             // square off the bottom corners
             Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: Theme.radius; color: parent.color }
 
             Column {
                 anchors.centerIn: parent
-                spacing: 8
-                Icon { anchors.horizontalCenter: parent.horizontalCenter; name: "monitor"; size: 34; color: "#ffffff"; strokeWidth: 1.6 }
+                // (Below the ways to connect, when there are several.)
+                anchors.verticalCenterOffset: card.multi ? (methodChips.height + 9) / 2 : 0
+                spacing: card.multi ? 4 : 8
+                Icon { anchors.horizontalCenter: parent.horizontalCenter; name: "monitor"; size: card.multi ? 24 : 34; color: "#ffffff"; strokeWidth: 1.6 }
                 Text {
+                    objectName: "peerCardName"
                     anchors.horizontalCenter: parent.horizontalCenter
                     width: card.width - 24
                     horizontalAlignment: Text.AlignHCenter
-                    text: card.peer.name ? card.peer.name : (card.peer.os || I18n.t("Computer"))
+                    textFormat: Text.PlainText
+                    text: card.multi ? card.cardData.title : (card.peer.name ? card.peer.name : (card.peer.os || I18n.t("Computer")))
                     color: Qt.rgba(1, 1, 1, 0.85)
                     font.pixelSize: 12
                     elide: Text.ElideRight
@@ -1481,7 +1635,7 @@ Rectangle {
             }
             Icon {
                 id: favoriteStar
-                visible: !!card.peer.favorite
+                visible: !!card.firstPeer.favorite
                 anchors.right: parent.right
                 anchors.top: parent.top
                 anchors.margins: 10
@@ -1490,13 +1644,33 @@ Rectangle {
                 color: "#fcd34d"
             }
             TypeBadge {
-                visible: card.isSource
+                visible: card.isSource && !card.multi
                 anchors.left: parent.left
                 anchors.top: parent.top
                 anchors.margins: 9
                 onColor: true
                 typeName: card.isSource ? home.typeName(card.peer) : ""
                 maxWidth: card.width - 18 - (favoriteStar.visible ? 26 : 0)
+            }
+            // The ways to connect, when there is more than one: a click
+            // chooses the one the card acts on (two rows at most; all of
+            // them are in the card's menu).
+            MethodChips {
+                id: methodChips
+                objectName: "peerChips"
+                dots: false
+                visible: card.multi
+                anchors.left: parent.left
+                anchors.top: parent.top
+                anchors.margins: 9
+                width: card.width - 18 - (favoriteStar.visible ? 26 : 0)
+                height: card.multi ? Math.min(implicitHeight, 45) : 0
+                clip: true
+                z: 2
+                onColor: true
+                methods: card.multi ? card.cardData.methods : []
+                current: card.method ? card.method.key : ""
+                onChosen: (key) => home.chooseMethod(card.cardData, key)
             }
         }
 
@@ -1519,6 +1693,7 @@ Rectangle {
             }
             Text {
                 Layout.fillWidth: true
+                textFormat: Text.PlainText
                 text: card.isSource ? home.sourceSummary(card.peer) : home.displayAddress(card.peer.address || "")
                 color: Theme.textStrong
                 font.pixelSize: 13
@@ -1527,6 +1702,7 @@ Rectangle {
             }
             IconButton {
                 objectName: "peerFilesButton"
+                visible: !card.isSource || home.sourceHasFiles(card.peer)
                 iconName: "folder"
                 tip: I18n.t("Files")
                 onClicked: home.openPeerFiles(card.peer.address)
@@ -1548,13 +1724,53 @@ Rectangle {
         ThemedMenu {
             id: peerMenu
             objectName: "peerMenu"
-            MenuItem { text: I18n.t("Connect"); onTriggered: home.requestConnect(card.peer.address) }
+            width: card.multi ? 250 : implicitWidth
             MenuItem {
-                text: card.peer.favorite ? I18n.t("Remove from favorites") : I18n.t("Add to favorites")
-                onTriggered: home.updatePeer(card.peer.address, { favorite: !card.peer.favorite })
+                visible: !card.multi
+                height: visible ? implicitHeight : 0
+                text: I18n.t("Connect")
+                onTriggered: home.connectMethod(card.cardData, card.method)
+            }
+            // Several ways to connect: each, to connect with it at once.
+            // (Put in by hand, after "Connect", which a card with several has not.)
+            Instantiator {
+                model: card.multi ? card.cardData.methods : []
+                onObjectAdded: (index, object) => peerMenu.insertItem(index + 1, object)
+                onObjectRemoved: (index, object) => peerMenu.removeItem(object)
+                delegate: MenuItem {
+                    id: methodEntry
+                    required property var modelData
+                    objectName: "peerMethodItem"
+                    property string methodKey: modelData.key
+                    text: I18n.t("Connect with %1").arg(modelData.label)
+                    leftPadding: 36
+                    TypeLogo {
+                        x: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        typeId: Cards.methodType(methodEntry.modelData)
+                        name: String(methodEntry.modelData.label)
+                        size: 18
+                    }
+                    contentItem: Text {
+                        textFormat: Text.PlainText
+                        text: methodEntry.text
+                        color: Theme.text
+                        font.pixelSize: 13
+                        elide: Text.ElideRight
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    onTriggered: home.connectMethod(card.cardData, modelData)
+                }
+            }
+            MenuItem {
+                text: card.firstPeer.favorite ? I18n.t("Remove from favorites") : I18n.t("Add to favorites")
+                onTriggered: home.updatePeer(card.firstPeer.address, { favorite: !card.firstPeer.favorite })
             }
             // What a card of another type has not is left out, not greyed.
             MenuItem {
+                objectName: "peerFilesItem"
+                visible: !card.isSource || home.sourceHasFiles(card.peer)
+                height: visible ? implicitHeight : 0
                 text: I18n.t("Files")
                 onTriggered: home.openPeerFiles(card.peer.address)
             }
@@ -1578,8 +1794,14 @@ Rectangle {
                 enabled: !!card.peer.password
                 onTriggered: home.updatePeer(card.peer.address, { password: "" })
             }
+            MenuItem {
+                objectName: "peerAddMethodItem"
+                text: I18n.t("Add a connection method…")
+                onTriggered: home.addMethodTo(card.cardData)
+            }
             MenuSeparator {}
             MenuItem {
+                objectName: "peerRemoveItem"
                 text: I18n.t("Remove")
                 onTriggered: card.isSource ? home.removeSourcePeer(card.peer) : home.removePeer(card.peer.address)
             }
@@ -1633,7 +1855,7 @@ Rectangle {
         }
         contentItem: ColumnLayout {
             spacing: 12
-            Text { text: I18n.t("Password for %1").arg(home.displayAddress(passwordDialog.address)); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
+            Text { textFormat: Text.PlainText; text: I18n.t("Password for %1").arg(home.displayAddress(passwordDialog.address)); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
             Text {
                 Layout.fillWidth: true
                 text: I18n.t("Enter the password shown under \"This computer\" on that computer.")
@@ -1675,7 +1897,7 @@ Rectangle {
         }
         contentItem: ColumnLayout {
             spacing: 12
-            Text { text: I18n.t("Rename %1").arg(home.displayAddress(renameDialog.address)); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
+            Text { textFormat: Text.PlainText; text: I18n.t("Rename %1").arg(home.displayAddress(renameDialog.address)); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
             InputField { id: nameField; placeholder: I18n.t("Name, e.g. Office PC"); onAccepted: renameDialog.accept() }
             RowLayout {
                 Layout.fillWidth: true
@@ -1698,10 +1920,20 @@ Rectangle {
             if (error !== "") { addDialog.error = error; return; }
             addDialog.close();
         }
-        onSourceSubmitted: (connectorId, hostId, sourceId, name, values) => {
-            var error = home.saveSource(connectorId, sourceId, name, values);
+        onSourceSubmitted: (connectorId, hostId, sourceId, name, values, group) => {
+            var error = home.saveSource(connectorId, sourceId, name, values, group);
             if (error !== "") { addDialog.error = error; return; }
+            // A set-up (pairing) keeps the dialog open until it is done.
+            if (addDialog.setupShown) return;
             addDialog.close();
+        }
+        onSetupAsked: (setup, hostId) => home.askSourceSetup(setup)
+        onSetupCancelled: (setup, hostId) => {
+            bridge.bridgeCancelSetup(setup);
+            // It may have been done in that very moment: then the computer
+            // is there and gets its card.
+            home.refreshOwnComputers();
+            home.adoptOwnComputers();
         }
     }
 

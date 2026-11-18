@@ -17,6 +17,13 @@ QtObject {
     property bool fileTransfer: true
     // Send this device's game controllers to the remote computer.
     property bool gamepad: true
+    // Key combinations this computer's desktop keeps for itself (Alt+Tab,
+    // the Super key, ...) go to the remote computer: "off" never,
+    // "fullscreen" in full screen, "always" while the pointer is over the
+    // picture. The first two are moonlight-qt's modes (its default is off,
+    // streamingpreferences.cpp 155-156); "always" is how RustDesk works, and
+    // the default here, as for a remote desktop.
+    property string systemKeys: "always"
 
     readonly property var displayModes: [
         { value: "fit", label: "Fit window" },
@@ -27,7 +34,8 @@ QtObject {
 
     function toJson() {
         return JSON.stringify({ displayMode: displayMode, audioEnabled: audioEnabled, volume: volume,
-                                recordMicrophone: recordMicrophone, clipboardSync: clipboardSync, fileTransfer: fileTransfer, gamepad: gamepad });
+                                recordMicrophone: recordMicrophone, clipboardSync: clipboardSync, fileTransfer: fileTransfer, gamepad: gamepad,
+                                systemKeys: systemKeys });
     }
     function fromJson(text) {
         if (!text) return;
@@ -40,6 +48,7 @@ QtObject {
             if (typeof p.clipboardSync === "boolean") clipboardSync = p.clipboardSync;
             if (typeof p.fileTransfer === "boolean") fileTransfer = p.fileTransfer;
             if (typeof p.gamepad === "boolean") gamepad = p.gamepad;
+            if (["off", "fullscreen", "always"].indexOf(p.systemKeys) !== -1) systemKeys = p.systemKeys;
         } catch (e) { console.log("view_prefs: " + e); }
     }
 }

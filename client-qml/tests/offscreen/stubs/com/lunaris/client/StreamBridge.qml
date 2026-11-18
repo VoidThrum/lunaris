@@ -16,6 +16,7 @@ StubBridge {
     signal statsUpdated(real ping, real decode, real frames, real bit, string requestedCodec, string negotiatedCodec, string decodeBackend, string presentBackend, bool gpuDecodeEnabled, string fallbackReason, int packetLossEvents, int packetsLost, int queueLagEvents, int maxQueueLag, string connectionType)
     signal hostCursorUpdated(int x, int y, bool visible, string kind, bool inWindowMoveSize)
     signal pointerInPictureUpdated(bool maybe, bool found)
+    signal pointerAlwaysInPictureUpdated(bool always)
     signal hostCursorImageUpdated(string kind, string source, int width, int height, int hotspotX, int hotspotY)
     signal hostOsUpdated(string hostOs)
     signal hostInfoUpdated(string gpuInfo, string hostOs)
@@ -50,9 +51,19 @@ StubBridge {
     function sendMouseMove(x, y, w, h, rx, ry, locked) {}
     function sendMouseClick(button, down) {}
     function sendMouseWheel(x, y) {}
-    function sendKeyEvent(key, modifiers, down) {}
+    // The key events sent by Qt key code, newest last: [key, down].
+    property var keyEvents: []
+    function sendKeyEvent(key, modifiers, down) { stub.keyEvents = stub.keyEvents.concat([[key, down]]); }
+    function sendKeyEventAt(key, modifiers, nativeScanCode, down, autoRepeat) {}
+    // How often the held keys were let go on the remote computer.
+    property int keysReleased: 0
+    function releaseAllKeys() { stub.keysReleased += 1; }
+    // What was asked of the window system, newest last (true: the system's shortcuts).
+    property var keyboardGrabs: []
+    property string systemKeys: "grab"
+    function systemKeysSupport() { return stub.systemKeys; }
     function warpCursor(x, y) {}
-    function setKeyboardGrab(grab) {}
+    function setKeyboardGrab(grab) { stub.keyboardGrabs = stub.keyboardGrabs.concat([grab]); }
     function setPointerLocked(locked) {}
     function setAudio(on, volume) {}
     function setRecordMicrophone(on) {}

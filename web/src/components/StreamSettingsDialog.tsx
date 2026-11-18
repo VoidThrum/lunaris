@@ -6,6 +6,7 @@ import {
 import { t } from '../i18n';
 import { readClipboardSync, readFileTransfer } from '../share';
 import { readGamepadEnabled } from '../gamepad';
+import { readSystemKeys } from '../keyboard';
 import GamepadTester from './GamepadTester';
 
 /** The settings the dialog edits (same names as the stored settings). */
@@ -138,6 +139,8 @@ export default function StreamSettingsDialog({
   const canvasSupported = typeof (window as any).MediaStreamTrackProcessor !== 'undefined';
   const webTransportSupported = typeof (window as any).WebTransport !== 'undefined';
   const [gamepadOn, setGamepadOn] = useState<boolean>(readGamepadEnabled);
+  const [systemKeysOn, setSystemKeysOn] = useState<boolean>(readSystemKeys);
+  const keyboardLockSupported = typeof navigator !== 'undefined' && !!(navigator as any).keyboard?.lock;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCancel(); };
@@ -339,6 +342,9 @@ export default function StreamSettingsDialog({
                     <select value={values.mouseQueueLimit} onChange={(e) => onChange('mouseQueueLimit', Number(e.target.value))}>
                       {MOUSE_QUEUES.map(q => <option key={q} value={q}>{mouseQueueLabel(q)}{q === 256 ? ' ' + t('(recommended)') : ''}</option>)}
                     </select>
+                  </Row>
+                  <Row title={t('System shortcuts in full screen')} hint={t('In full screen, send the key combinations the browser and this computer keep for themselves (Alt+Tab, the Windows key, Ctrl+W and others) to the remote computer. Hold Esc to leave full screen. Works in Chrome and Edge; other browsers do not allow it. Applies right away.') + (keyboardLockSupported ? '' : ' ' + t('(not supported by this browser)'))}>
+                    <Switch label={t('System shortcuts in full screen')} checked={systemKeysOn} onChange={(v) => { setSystemKeysOn(v); localStorage.setItem('lunaris_system_keys', String(v)); }} />
                   </Row>
                 </div>
               </>

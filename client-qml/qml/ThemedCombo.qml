@@ -38,6 +38,7 @@ ComboBox {
     contentItem: Text {
         leftPadding: 14
         rightPadding: 34
+        textFormat: Text.PlainText
         text: combo.currentIndex >= 0 ? combo.displayText : "—"
         color: Theme.textStrong
         font.pixelSize: 13
@@ -56,6 +57,7 @@ ComboBox {
         height: 34
         highlighted: combo.highlightedIndex === index
         contentItem: Text {
+            textFormat: Text.PlainText
             text: modelData
             color: index === combo.currentIndex ? Theme.accentFg : Theme.text
             font.pixelSize: 13

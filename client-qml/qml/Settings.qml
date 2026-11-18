@@ -234,8 +234,8 @@ Rectangle {
             anchors.rightMargin: 24
             anchors.verticalCenter: parent.verticalCenter
             spacing: 4
-            Text { text: settingRow.title; color: Theme.textStrong; font.pixelSize: 14; font.weight: Font.Medium; Layout.fillWidth: true; wrapMode: Text.WordWrap }
-            Text { visible: settingRow.hint !== ""; text: settingRow.hint; color: Theme.textMuted; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap; lineHeight: 1.15 }
+            Text { textFormat: Text.PlainText; text: settingRow.title; color: Theme.textStrong; font.pixelSize: 14; font.weight: Font.Medium; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+            Text { textFormat: Text.PlainText; visible: settingRow.hint !== ""; text: settingRow.hint; color: Theme.textMuted; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap; lineHeight: 1.15 }
         }
         Item {
             id: controlSlot
@@ -279,7 +279,7 @@ Rectangle {
                 radius: 12
                 color: Theme.surface2
                 border.color: Theme.border
-                Text { id: hostLabel; anchors.centerIn: parent; text: settingsRoot.hostName; color: Theme.textMuted; font.pixelSize: 12 }
+                Text { textFormat: Text.PlainText; id: hostLabel; anchors.centerIn: parent; text: settingsRoot.hostName; color: Theme.textMuted; font.pixelSize: 12 }
             }
         }
         IconButton {
@@ -621,6 +621,28 @@ Rectangle {
                         onPicked: (v) => settingsRoot.queueLimit = v
                     }
                 }
+                SettingRow {
+                    id: systemKeysRow
+                    // How this computer's window system gives a window the
+                    // system's shortcuts (main.qml systemKeysKind). "window":
+                    // it cannot (Windows, macOS), so there is nothing to choose.
+                    readonly property string kind: typeof bridge.systemKeysSupport === "function" ? bridge.systemKeysSupport() : "grab"
+                    visible: kind !== "window"
+                    title: I18n.t("System shortcuts")
+                    hint: I18n.t("Send the key combinations this computer keeps for itself (Alt+Tab, the Windows or Super key and others) to the remote computer. Ctrl+Alt+Esc gives them back to this computer. Some desktops ask for permission first, and some do not allow it. Applies right away.")
+                        + (kind === "no" ? " " + I18n.t("This desktop does not allow it.") : "")
+                    ThemedCombo {
+                        objectName: "systemKeysCombo"
+                        width: parent.width
+                        options: [
+                            { value: "always", label: I18n.t("While the pointer is over the picture") },
+                            { value: "fullscreen", label: I18n.t("In full screen only") },
+                            { value: "off", label: I18n.t("Never") }
+                        ]
+                        value: ViewPrefs.systemKeys
+                        onPicked: (v) => ViewPrefs.systemKeys = v
+                    }
+                }
             }
 
             // ===== Controllers (this device, applied right away) =====
@@ -661,6 +683,7 @@ Rectangle {
             anchors.left: parent.left
             anchors.leftMargin: 22
             anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
             text: I18n.t("Used when you connect to %1.").arg(settingsRoot.hostName || I18n.t("this computer"))
             color: Theme.textSubtle
             font.pixelSize: 12

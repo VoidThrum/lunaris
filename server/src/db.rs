@@ -142,6 +142,17 @@ pub async fn init_db(
     .execute(&pool)
     .await?;
 
+    // Which computer a source is, when that computer is listed in other
+    // ways too (sources.rs): an opaque word its agent announced.
+    let source_columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('host_sources')")
+        .fetch_all(&pool)
+        .await?;
+    if !source_columns.iter().any(|c| c == "source_group") {
+        sqlx::query("ALTER TABLE host_sources ADD COLUMN source_group TEXT;")
+            .execute(&pool)
+            .await?;
+    }
+
     // Perform migrations for hosts table if columns don't exist
     let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('hosts')")
         .fetch_all(&pool)

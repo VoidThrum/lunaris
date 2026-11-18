@@ -6,7 +6,9 @@ import QtTest
 // pointer into the picture. Either the host says so (a Windows host while a
 // window is moved), or the client found the pointer in the decoded picture
 // (pointerInPictureUpdated with found). The host's "maybe" alone hides
-// nothing.
+// nothing. A host whose pointer is part of its picture for the whole session
+// (pointerAlwaysInPictureUpdated: a Sunshine source) gets no pointer at all
+// over the picture, button or not, pointer locked or not.
 Item {
     id: root
     width: 200
@@ -80,6 +82,86 @@ Item {
             bridge.hostOsUpdated("linux");
             bridge.hostCursorUpdated(100, 100, true, "arrow", true);
             verify(!app.shouldHidePredictedCursor());
+        }
+
+        // What the stream view shows as a pointer: the system's pointer in
+        // the host's shape (HostCursor, blank while `hidden`), the mouse
+        // area's own cursor shape when HostCursor is not driving it, and the
+        // pointer drawn while the pointer is locked.
+        function pointers() {
+            var hostCursor = findChild(app, "hostCursor");
+            var area = findChild(app, "streamMouseArea");
+            var overlay = findChild(app, "hostCursorOverlay");
+            verify(hostCursor !== null && area !== null && overlay !== null);
+            return {
+                // The system pointer over the picture is blank.
+                systemBlank: hostCursor.active ? hostCursor.hidden : area.cursorShape === Qt.BlankCursor,
+                drawn: overlay.visible
+            };
+        }
+
+        function test_always_in_the_picture_shows_no_pointer_data() {
+            // Whatever the host's system is said to be (a Sunshine host does not say).
+            return [{ tag: "unknown" }, { tag: "windows" }, { tag: "linux" }];
+        }
+
+        function test_always_in_the_picture_shows_no_pointer(data) {
+            bridge.hostOsUpdated(data.tag);
+            app.isStreamMode = true;
+            // The person's mouse is over the picture: an ordinary host gets a pointer.
+            app.updateLocalCursorPrediction(10, 10);
+            verify(app.localCursorVisible);
+            verify(!app.shouldHidePredictedCursor());
+            verify(!pointers().systemBlank, "an ordinary host: the host-shaped pointer");
+
+            bridge.pointerAlwaysInPictureUpdated(true);
+            verify(app.pointerAlwaysInPicture);
+            // No button held, and neither of the other two flags.
+            verify(!app.hostCursorMouseDown && !app.hostCursorInWindowMoveSize && !app.pointerFoundInPicture);
+            verify(app.shouldHidePredictedCursor());
+            verify(pointers().systemBlank, "absolute mode: no system pointer");
+            verify(!pointers().drawn);
+
+            // A cursor message that says "visible", a move, a button: still none.
+            bridge.hostCursorUpdated(100, 100, true, "arrow", false);
+            app.updateLocalCursorPrediction(20, 20);
+            app.hostCursorMouseDown = true;
+            verify(pointers().systemBlank);
+            verify(!pointers().drawn);
+            app.hostCursorMouseDown = false;
+            verify(pointers().systemBlank);
+
+            // "Show local cursor": still none over the picture.
+            app.hideLocalCursor = false;
+            verify(pointers().systemBlank, "show local cursor: no system pointer either");
+            verify(!pointers().drawn);
+            app.hideLocalCursor = true;
+
+            // Pointer locked (relative mode): none drawn.
+            app.isPointerLocked = true;
+            verify(pointers().systemBlank, "pointer locked: no system pointer");
+            verify(!pointers().drawn, "pointer locked: no drawn pointer");
+            app.isPointerLocked = false;
+
+            // The session ends: the next one starts as an ordinary host's.
+            app.isStreamMode = false;
+            verify(!app.pointerAlwaysInPicture);
+            verify(!app.shouldHidePredictedCursor());
+        }
+
+        function test_an_ordinary_host_keeps_its_pointers() {
+            bridge.hostOsUpdated("linux");
+            app.isStreamMode = true;
+            bridge.pointerAlwaysInPictureUpdated(false);
+            bridge.hostCursorUpdated(100, 100, true, "arrow", false);
+            app.updateLocalCursorPrediction(10, 10);
+            verify(!app.pointerAlwaysInPicture);
+            verify(!pointers().systemBlank, "the host-shaped system pointer");
+            // Pointer locked: the pointer is drawn.
+            app.isPointerLocked = true;
+            verify(pointers().drawn, "pointer locked: the drawn pointer");
+            app.isPointerLocked = false;
+            app.isStreamMode = false;
         }
     }
 }

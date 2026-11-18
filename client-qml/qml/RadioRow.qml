@@ -16,6 +16,7 @@ RadioButton {
         Rectangle { anchors.centerIn: parent; width: 8; height: 8; radius: 4; color: Theme.accent; visible: rb.checked }
     }
     contentItem: Text {
+        textFormat: Text.PlainText
         leftPadding: rb.indicator.width + rb.spacing
         text: rb.text
         color: Theme.text

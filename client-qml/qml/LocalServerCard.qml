@@ -123,6 +123,7 @@ Rectangle {
         Text {
             Layout.fillWidth: true
             visible: homeView && homeView.serverError !== ""
+            textFormat: Text.PlainText
             text: homeView ? homeView.serverError : ""
             color: Theme.danger
             font.pixelSize: 12

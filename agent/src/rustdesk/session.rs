@@ -3416,12 +3416,35 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), session.events.recv()).await.expect("an event in time").expect("the session is open")
     }
 
+    /// The delay the viewer adds to its ping, against this agent's own
+    /// RustDesk host on the loopback: told within the first probes, and a
+    /// fraction of a millisecond there (on Linux the connection's own round
+    /// trip; elsewhere the host's figure, 0 or 1 ms).
+    #[tokio::test]
+    async fn the_connector_tells_the_round_trip_to_a_rustdesk_host() {
+        use crate::connector::{Codec as Wanted, Connector, Event, Viewer};
+        let (addr, _screen) = start_host_with("password", true, FakeScreen::default()).await;
+        let connector = crate::connector::rustdesk::RustdeskConnector;
+        let viewer = Viewer { codecs: vec![Wanted::H264], fps: 60, width: 0, height: 0, bitrate_kbps: 0 };
+        let mut session = connector.connect(&connector_target(addr, PASSWORD), &viewer).await.expect("logged in");
+        let started = Instant::now();
+        let mut told = Vec::new();
+        while started.elapsed() < Duration::from_millis(3_500) {
+            if let Ok(Some(Event::Latency { ms })) = tokio::time::timeout(Duration::from_millis(200), session.events.recv()).await {
+                told.push(ms);
+            }
+        }
+        println!("round trips to the RustDesk host on the loopback: {:?} ms", told);
+        assert!(!told.is_empty());
+        assert!(told.iter().all(|ms| (0.0..5.0).contains(ms)), "{told:?}");
+    }
+
     #[tokio::test]
     async fn the_connector_gets_the_picture_and_the_sound_of_a_rustdesk_host() {
         use crate::connector::{Codec as Wanted, Command, Connector, Event, Viewer};
         let (addr, screen) = start_host_with("password", true, FakeScreen { h265: true, ..Default::default() }).await;
         let connector = crate::connector::rustdesk::RustdeskConnector;
-        let viewer = Viewer { codecs: vec![Wanted::H265, Wanted::H264], fps: 60 };
+        let viewer = Viewer { codecs: vec![Wanted::H265, Wanted::H264], fps: 60, width: 0, height: 0, bitrate_kbps: 0 };
         let mut session = connector.connect(&connector_target(addr, PASSWORD), &viewer).await.expect("logged in");
 
         // What kind of computer it is, then the displays of the PeerInfo.
@@ -3453,6 +3476,8 @@ mod tests {
                     video.push((key, data.to_vec()));
                 }
                 Event::Audio { channels, data } => sound.push((channels, data.to_vec())),
+                // Whenever the host's second delay probe happens to come.
+                Event::Latency { .. } => {}
                 other => panic!("unexpected {:?}", other),
             }
         }
@@ -3513,6 +3538,12 @@ mod tests {
                 Event::Clipboard { text } => clipboard_text = Some(text),
                 Event::CursorShape { width, height, hot_x, hot_y, rgba } => shape = Some((width, height, hot_x, hot_y, rgba.to_vec())),
                 Event::CursorPosition { .. } => {}
+                // The host's delay probes, answered: the round trip it
+                // measured (under a millisecond on the loopback).
+                Event::Latency { ms } => {
+                    println!("round trip to the RustDesk host on the loopback: {} ms", ms);
+                    assert!((0.0..50.0).contains(&ms), "{} ms", ms)
+                }
                 other => panic!("unexpected {:?}", other),
             }
         }
@@ -3544,7 +3575,7 @@ mod tests {
         // The host does not share its clipboard (it says so before its LoginResponse).
         let (addr, screen) = start_host_with("password", false, FakeScreen::default()).await;
         let connector = crate::connector::rustdesk::RustdeskConnector;
-        let viewer = Viewer { codecs: vec![Wanted::H264], fps: 60 };
+        let viewer = Viewer { codecs: vec![Wanted::H264], fps: 60, width: 0, height: 0, bitrate_kbps: 0 };
         let mut session = connector.connect(&connector_target(addr, PASSWORD), &viewer).await.expect("logged in");
         session.commands.send(Command::Clipboard { text: "first".into() }).await.unwrap();
         session.commands.send(Command::Clipboard { text: "second".into() }).await.unwrap();
@@ -3573,7 +3604,7 @@ mod tests {
         use crate::connector::{Codec as Wanted, Connector, Viewer};
         let (addr, _screen) = start_host("password").await;
         let connector = crate::connector::rustdesk::RustdeskConnector;
-        let viewer = Viewer { codecs: vec![Wanted::H264], fps: 60 };
+        let viewer = Viewer { codecs: vec![Wanted::H264], fps: 60, width: 0, height: 0, bitrate_kbps: 0 };
         let error = connector.connect(&connector_target(addr, "not the password"), &viewer).await.err().expect("refused");
         assert_eq!(error.to_string(), "Wrong password for the RustDesk computer");
 

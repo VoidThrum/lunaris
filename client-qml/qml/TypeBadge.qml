@@ -24,6 +24,8 @@ Rectangle {
         id: label
         anchors.centerIn: parent
         width: Math.min(implicitWidth, badge.maxWidth - 14)
+        // (A connector's name comes from another computer.)
+        textFormat: Text.PlainText
         text: badge.shortName
         color: badge.onColor ? "#ffffff" : Theme.accentFg
         font.pixelSize: 10

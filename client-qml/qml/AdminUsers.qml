@@ -57,6 +57,7 @@ Item {
         anchors.left: parent.left
         anchors.right: parent.right
         visible: page.error !== ""
+        textFormat: Text.PlainText
         text: page.error
         color: Theme.danger
         font.pixelSize: 13
@@ -133,7 +134,7 @@ Item {
                         Layout.maximumWidth: table.wName
                         spacing: 8
                         Icon { name: "user"; size: 15; color: Theme.textSubtle }
-                        Text { Layout.fillWidth: true; Layout.preferredWidth: 10; text: modelData.username; color: Theme.textStrong; font.pixelSize: 14; font.weight: Font.DemiBold; elide: Text.ElideRight }
+                        Text { textFormat: Text.PlainText; Layout.fillWidth: true; Layout.preferredWidth: 10; text: modelData.username; color: Theme.textStrong; font.pixelSize: 14; font.weight: Font.DemiBold; elide: Text.ElideRight }
                     }
                     Item {
                         Layout.preferredWidth: table.wRole
@@ -157,6 +158,7 @@ Item {
                     Text {
                         Layout.preferredWidth: table.wGroups
                         Layout.maximumWidth: table.wGroups
+                        textFormat: Text.PlainText
                         text: (modelData.groups && modelData.groups.length) ? modelData.groups.map(function (g) { return g.name; }).join(", ") : "—"
                         color: (modelData.groups && modelData.groups.length) ? Theme.text : Theme.textSubtle
                         font.pixelSize: 13
@@ -214,7 +216,7 @@ Item {
         contentItem: ColumnLayout {
             spacing: 12
             Text { text: I18n.t("New user"); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
-            Text { visible: createDialog.err !== ""; text: createDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Text { textFormat: Text.PlainText; visible: createDialog.err !== ""; text: createDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             Text { text: I18n.t("Username"); color: Theme.textMuted; font.pixelSize: 12 }
             InputField { id: cUser; placeholder: I18n.t("Username"); onAccepted: cPass.input.forceActiveFocus() }
             Text { text: I18n.t("Password"); color: Theme.textMuted; font.pixelSize: 12 }
@@ -271,8 +273,8 @@ Item {
         }
         contentItem: ColumnLayout {
             spacing: 12
-            Text { text: editDialog.user ? I18n.t("Edit user %1").arg(editDialog.user.username) : ""; color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideRight }
-            Text { visible: editDialog.err !== ""; text: editDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Text { textFormat: Text.PlainText; text: editDialog.user ? I18n.t("Edit user %1").arg(editDialog.user.username) : ""; color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideRight }
+            Text { textFormat: Text.PlainText; visible: editDialog.err !== ""; text: editDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             Text { text: I18n.t("Role"); color: Theme.textMuted; font.pixelSize: 12 }
             ThemedCombo {
                 Layout.fillWidth: true
@@ -334,12 +336,13 @@ Item {
             Text { text: I18n.t("Delete user?"); color: Theme.textStrong; font.pixelSize: 16; font.weight: Font.DemiBold }
             Text {
                 Layout.fillWidth: true
+                textFormat: Text.PlainText
                 text: deleteDialog.user ? I18n.t("The account %1 will be deleted. This cannot be undone.").arg(deleteDialog.user.username) : ""
                 color: Theme.textMuted
                 font.pixelSize: 13
                 wrapMode: Text.WordWrap
             }
-            Text { visible: deleteDialog.err !== ""; text: deleteDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Text { textFormat: Text.PlainText; visible: deleteDialog.err !== ""; text: deleteDialog.err; color: Theme.danger; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 8
