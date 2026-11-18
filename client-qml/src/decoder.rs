@@ -773,7 +773,7 @@ impl HardwareDecoder {
             if av1_unit_has_sequence_header(data) {
                 self.key_frame_failures += 1;
             }
-            let no_hwaccel = self.last_error_code == ffi::AVERROR(libc::ENOSYS);
+            let no_hwaccel = self.last_error_code == ffi::AVERROR(ffmpeg_next::util::error::ENOSYS);
             if hardware_decoder_gives_up(no_hwaccel, self.key_frame_failures) {
                 if no_hwaccel {
                     AV1_HARDWARE_UNUSABLE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1714,7 +1714,7 @@ mod av1_offline_tests {
         assert!(decoder.hardware_only);
         // The key frame fails on the device ...
         let first = decoder.decode_guarded(&units[0], inspect);
-        println!("the key frame on CUDA: {:?} (FFmpeg error {}, ENOSYS is {})", first.as_ref().map(|f| f.len()), decoder.last_error_code, ffi::AVERROR(libc::ENOSYS));
+        println!("the key frame on CUDA: {:?} (FFmpeg error {}, ENOSYS is {})", first.as_ref().map(|f| f.len()), decoder.last_error_code, ffi::AVERROR(ffmpeg_next::util::error::ENOSYS));
         assert!(first.is_err());
         // ... and the decoder is the software one from then on.
         assert!(!decoder.hardware_only);
