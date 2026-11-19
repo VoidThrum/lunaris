@@ -26,6 +26,7 @@ mod service;
 mod sources;
 mod tls;
 mod turn;
+pub mod update_notice;
 mod web;
 
 pub mod signaling;
@@ -207,8 +208,11 @@ pub(crate) fn init_logging(log_file: Option<&std::path::Path>) {
 fn run_foreground() -> Result<(), String> {
     init_logging(None);
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    rt.block_on(run_server(shutdown_signal()))
-        .map_err(|e| e.to_string())
+    rt.block_on(async {
+        update_notice::spawn();
+        run_server(shutdown_signal()).await
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Ctrl+C, or SIGTERM from systemd / docker stop.

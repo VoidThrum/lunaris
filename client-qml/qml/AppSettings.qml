@@ -252,10 +252,9 @@ Rectangle {
             Card {
                 visible: settings.section === "general"
                 title: I18n.t("Updates")
-                SettingRow {
-                    label: "Lunaris " + bridge.appVersion()
-                    hint: I18n.t("Checks GitHub for a newer release.")
-                    SecondaryButton { text: I18n.t("Check now"); onClicked: bridge.checkForUpdates() }
+                UpdatesPanel {
+                    Layout.fillWidth: true
+                    status: window.updateStatus
                 }
             }
 

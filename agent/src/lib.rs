@@ -384,6 +384,15 @@ where
         }
     }
 
+    // A package upgrade or a new AppImage does not restart this headless
+    // agent (started at login, `--cli`): it starts the new program itself
+    // once its file was replaced. Not the app's own agent (approval on
+    // stdio): the app restarts that one.
+    #[cfg(target_os = "linux")]
+    if !args.approval_stdio {
+        updater::restart::watch_executable(std::time::Duration::from_secs(30));
+    }
+
     run_agent(config, name).await
 }
 

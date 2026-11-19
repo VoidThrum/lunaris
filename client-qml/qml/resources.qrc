@@ -32,6 +32,8 @@
     <file>ApiClient.qml</file>
     <file>AddComputerDialog.qml</file>
     <file>MfaDialog.qml</file>
+    <file>UpdateBanner.qml</file>
+    <file>UpdatesPanel.qml</file>
     <file>TypeBadge.qml</file>
     <file>Cards.js</file>
     <file>OptionCard.qml</file>

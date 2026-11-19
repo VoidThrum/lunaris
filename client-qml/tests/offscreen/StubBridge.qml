@@ -162,7 +162,20 @@ QtObject {
     function getLocalHostname() { return "this-pc"; }
     function isAutostartEnabled() { return false; }
     function setAutostartEnabled(on) {}
-    function checkForUpdates() {}
+    // The updater (updater/src/service.rs): the tests set `updateState`
+    // and count what the pages ask for.
+    property var updateState: ({ state: "idle", current: "0.5.0", latest: "", notes: "", releaseUrl: "",
+                                 canInstall: false, manualReason: "", manualMessage: "", progress: 0,
+                                 error: "", errorKind: "", autoCheck: true, lastChecked: 0, installKind: "deb" })
+    property int updateChecks: 0
+    property int updateInstalls: 0
+    property var updateAutoChecks: []
+    function checkForUpdates() { stub.updateChecks += 1; }
+    function updateStatus() { return JSON.stringify(stub.updateState); }
+    function updateInstall() { stub.updateInstalls += 1; }
+    function updateRestart() { return false; }
+    function updateAutoCheck() { return stub.updateState.autoCheck; }
+    function setUpdateAutoCheck(on) { stub.updateAutoChecks = stub.updateAutoChecks.concat([on]); }
     function hostStatus() {
         return JSON.stringify({ enabled: true, running: true, port: 8091, password: "k7m2p9qd", addresses: ["192.168.1.10"],
             hostname: "this-pc", input_ready: true, allow_clipboard: true, allow_file_transfer: true, full_disk_access: false,

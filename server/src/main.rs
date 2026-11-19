@@ -10,5 +10,8 @@ pub extern "C" fn __cpu_indicator_init() -> i32 {
 }
 
 fn main() -> std::process::ExitCode {
+    // The standalone server says in its log when a newer release exists
+    // (the app's `lunaris server` child does not: the app has its updater).
+    server::update_notice::enable();
     server::run(std::env::args().skip(1).collect())
 }

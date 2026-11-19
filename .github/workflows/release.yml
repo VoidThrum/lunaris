@@ -13,6 +13,7 @@ on:
       - 'agent-app/**'
       - 'client-qml/**'
       - 'client-desktop/**'
+      - 'updater/**'
     tags:
       - 'v*'
   workflow_dispatch:
@@ -598,7 +599,52 @@ jobs:
           mv ./artifacts/windows-agent-installer/lunaris-agent-installer.exe ./release-files/lunaris-agent-installer-windows.exe
           mv ./artifacts/windows-client-desktop-installer/lunaris-client-installer.exe ./release-files/lunaris-client-installer-windows.exe
 
+      # SHA256SUMS over every release file, and SHA256SUMS.sig: an Ed25519
+      # signature over its exact bytes. The app and the agent install an
+      # update only when both check out against the public key built into
+      # them (updater/src/verify.rs, docs/release-signing.md). No release is
+      # published unsigned: a missing secret or a key that does not match the
+      # one in the source fails this step.
+      - name: Checksums and signature
+        env:
+          LUNARIS_RELEASE_SIGNING_KEY: ${{ secrets.LUNARIS_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LUNARIS_RELEASE_SIGNING_KEY:-}" ]; then
+            echo "::error::The LUNARIS_RELEASE_SIGNING_KEY secret is not set: refusing to publish an unsigned release (docs/release-signing.md)."
+            exit 1
+          fi
+          cd release-files
+          rm -f SHA256SUMS SHA256SUMS.sig
+          sums="$(mktemp)"
+          # First line binds the signed list to this version (updater/src/verify.rs).
+          printf '# lunaris %s\n' "${GITHUB_REF_NAME#v}" > "$sums"
+          find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort | xargs -d '\n' sha256sum -- >> "$sums"
+          mv "$sums" SHA256SUMS
+          chmod 644 SHA256SUMS
+          cat SHA256SUMS
 
+          umask 077
+          keydir="$(mktemp -d)"
+          trap 'rm -rf "$keydir"' EXIT
+          printf '%s\n' "$LUNARIS_RELEASE_SIGNING_KEY" > "$keydir/key.pem"
+          chmod 600 "$keydir/key.pem"
+          openssl pkeyutl -sign -rawin -inkey "$keydir/key.pem" -in SHA256SUMS -out SHA256SUMS.sig
+          openssl pkey -in "$keydir/key.pem" -pubout -out "$keydir/pub.pem"
+          openssl pkeyutl -verify -pubin -inkey "$keydir/pub.pem" -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
+          public_key="$(openssl pkey -pubin -in "$keydir/pub.pem" -outform DER | tail -c 32 | base64)"
+          rm -rf "$keydir"
+          trap - EXIT
+
+          test "$(stat -c %s SHA256SUMS.sig)" -eq 64
+          # The key built into this release's app must be the signing key,
+          # otherwise no copy could ever check its updates.
+          embedded="$(sed -n 's/^pub const RELEASE_SIGNING_PUBLIC_KEY_B64: &str = "\(.*\)";$/\1/p' ../updater/src/verify.rs)"
+          echo "Signing public key: $public_key"
+          if [ "$embedded" != "$public_key" ]; then
+            echo "::error::RELEASE_SIGNING_PUBLIC_KEY_B64 in updater/src/verify.rs ($embedded) is not the public key of LUNARIS_RELEASE_SIGNING_KEY ($public_key)."
+            exit 1
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
@@ -622,6 +668,8 @@ jobs:
             release-files/lunaris-agent-windows.zip
             release-files/lunaris-agent-installer-windows.exe
             release-files/lunaris-client-installer-windows.exe
+            release-files/SHA256SUMS
+            release-files/SHA256SUMS.sig
 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

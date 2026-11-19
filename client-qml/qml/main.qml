@@ -123,9 +123,9 @@ ApplicationWindow {
     property bool useCuda: true
     property string renderBackend: "auto_gpu"
     property bool nativeVideoActive: gpuVideoItem.cudaActive || d3d11VideoItem.d3d11Active || vaapiDmabufVideoItem.dmabufActive
-    property string latestVersion: ""
-    property string releaseUrl: ""
-    property bool showUpdateBanner: false
+    // The updater's state (bridge.updateStatus(), updater/src/service.rs);
+    // the banner and Settings → Updates show it.
+    property var updateStatus: ({ state: "idle", current: "", latest: "", autoCheck: true })
     property int hostCursorX: streamWidth / 2
     property int hostCursorY: streamHeight / 2
     property bool hostCursorVisible: false
@@ -632,12 +632,6 @@ ApplicationWindow {
 
         onLocalCursorDelta: (rx, ry) => {
             window.updateLocalCursorDelta(rx, ry)
-        }
-
-        onNewVersionAvailable: (version, url) => {
-            window.latestVersion = version
-            window.releaseUrl = url
-            window.showUpdateBanner = true
         }
 
         onSettingsLoaded: (res, fps, codec, bitrate, queueLimit, hostName, disableCuda, inputProtocol, renderBackend) => {
@@ -1366,73 +1360,15 @@ ApplicationWindow {
     }
     }
 
-    // Update Banner
-    Rectangle {
+    // Update notice above Home (UpdateBanner.qml), from the updater's state.
+    UpdateBanner {
         id: updateBanner
-        visible: window.showUpdateBanner && !window.isStreamMode
+        status: window.updateStatus
+        visible: shown && !window.isStreamMode
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
-        height: 40
-        color: Theme.live.surfaceA(0.95)
-        border.color: Theme.live.accentA(0.3)
-        border.width: 1
         z: 9999
-
-        Row {
-            anchors.centerIn: parent
-            spacing: 12
-            
-            Text {
-                textFormat: Text.PlainText
-                text: "A new version of Lunaris Client (" + window.latestVersion + ") is available!"
-                color: Theme.live.textStrong
-                font.pixelSize: 13
-                font.bold: true
-                anchors.verticalCenter: parent.verticalCenter
-            }
-
-            Rectangle {
-                width: 90
-                height: 26
-                color: Theme.live.accent
-                radius: 4
-                anchors.verticalCenter: parent.verticalCenter
-                
-                Text {
-                    text: "Update Now"
-                    color: Theme.live.bg
-                    font.pixelSize: 11
-                    font.bold: true
-                    anchors.centerIn: parent
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                        Qt.openUrlExternally(window.releaseUrl)
-                    }
-                }
-            }
-
-            // Close button
-            Text {
-                text: "✕"
-                color: Theme.live.textMuted
-                font.pixelSize: 14
-                anchors.verticalCenter: parent.verticalCenter
-                
-                MouseArea {
-                    anchors.fill: parent
-                    anchors.margins: -4
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                        window.showUpdateBanner = false
-                    }
-                }
-            }
-        }
     }
 
     // Home: this computer, remote computers, settings
@@ -1523,7 +1459,27 @@ ApplicationWindow {
             window.isStreamMode = false;
             linkDialog.openIfPending();
         }
-        bridge.checkForUpdates();
+    }
+
+    // The updater checks by itself (shortly after the start, then daily,
+    // unless turned off); this shows its state. Once an update is
+    // installed the app quits and starts again with its agent and server.
+    function pollUpdate() {
+        var s;
+        try { s = JSON.parse(bridge.updateStatus()); } catch (e) { return; }
+        window.updateStatus = s;
+        if (s.state === "restart" && bridge.updateRestart()) {
+            window.exitRequested = true;
+            bridge.stopLocalAgent();
+            Qt.quit();
+        }
+    }
+    Timer {
+        interval: 1000
+        running: true
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: window.pollUpdate()
     }
 
 

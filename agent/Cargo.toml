@@ -10,6 +10,9 @@ static-ffmpeg = ["dep:ffmpeg-sys-next", "ffmpeg-sys-next/static"]
 
 [dependencies]
 common = { path = "../common" }
+# restart.rs: the headless agent re-executes itself when its program file is
+# replaced by an update (updater::restart::watch_executable).
+updater = { path = "../updater" }
 lunaris-media = { git = "https://github.com/collyn/lunaris-media.git" }
 ffmpeg-sys-next = { version = "8.1", optional = true, default-features = false }
 bitflags = "2"
