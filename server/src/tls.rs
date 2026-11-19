@@ -25,6 +25,30 @@ use crate::signaling::ConnAddrs;
 
 pub const DEFAULT_HTTPS_PORT: u16 = 8443;
 
+/// In the extensions of every request that came in on this HTTPS listener
+/// (not through a reverse proxy): install.rs tells agents to use it.
+#[derive(Clone, Copy, Debug)]
+pub struct ViaTls;
+
+/// SHA-256 (lowercase hex) of the certificate this listener serves, as the
+/// agent computes it for pinning (lib.rs `server_tls::fingerprint`).
+static SERVED_CERT_SHA256: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn served_cert_sha256() -> Option<&'static str> {
+    SERVED_CERT_SHA256.get().map(String::as_str)
+}
+
+/// Whether HTTPS is on with the server's own self-signed certificate (no
+/// LUNARIS_TLS_CERT): browsers, curl and PowerShell don't trust it.
+pub fn self_signed() -> bool {
+    https_port().is_some() && cert_paths().2
+}
+
+pub fn cert_sha256(der: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(der))
+}
+
 /// The HTTPS port, or None when turned off.
 pub fn https_port() -> Option<u16> {
     match std::env::var("LUNARIS_HTTPS_PORT") {
@@ -87,6 +111,9 @@ fn load_config() -> Result<rustls::ServerConfig, String> {
     ))
     .collect::<Result<Vec<_>, _>>()
     .map_err(|e| format!("{}: {}", cert_path.display(), e))?;
+    if let Some(leaf) = certs.first() {
+        let _ = SERVED_CERT_SHA256.set(cert_sha256(leaf.as_ref()));
+    }
     let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
         std::fs::File::open(&key_path).map_err(|e| format!("{}: {}", key_path.display(), e))?,
     ))
@@ -146,6 +173,7 @@ pub async fn serve(app: Router, port: u16) {
             };
             let service = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                 req.extensions_mut().insert(ConnectInfo(ConnAddrs { local, remote }));
+                req.extensions_mut().insert(ViaTls);
                 app.clone().oneshot(req)
             });
             if let Err(e) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())

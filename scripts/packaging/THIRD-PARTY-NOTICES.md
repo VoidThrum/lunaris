@@ -117,6 +117,35 @@ Libraries the connector links into the agent (all packages):
 | rusty_enet (Rust port of ENet, Copyright (c) Lee Salzman and contributors) | MIT | https://github.com/jabuwu/rusty_enet |
 | rsa, aes, aes-gcm, cbc (RustCrypto) | MIT OR Apache-2.0 | https://github.com/RustCrypto |
 
+## RDP and VNC connectors
+
+`agent/src/connector/rdp/` is the client's side of the Remote Desktop
+Protocol, built on IronRDP; its connection sequence and session loop follow
+IronRDP's own client (`crates/ironrdp-client/src/rdp.rs`), and the server
+used in its tests (`fake_server.rs`, not part of any package) is cut down
+from IronRDP's `ironrdp-server` (capability sets, planar bitmap and pointer
+updates). `agent/src/connector/vnc/` is the client's side of RFB 3.8,
+written from RFC 6143; its key table holds X keysym values from X.Org's
+`keysymdef.h` and `XF86keysym.h` (xorgproto, MIT). The VNC Authentication
+key rule (bits of each password byte reversed) was read in libvncserver and
+TigerVNC (GPL) for behaviour only; nothing was copied from them.
+
+Libraries the connectors link into the agent (all packages):
+
+| Component | Licence | Source |
+|-----------|---------|--------|
+| IronRDP: ironrdp-connector, -session, -pdu, -core, -graphics, -tokio, -async, -cliprdr, -displaycontrol, -input, -svc, -dvc, -bulk, -egfx, -rdpei, -error (Copyright (c) Devolutions Inc.) | MIT OR Apache-2.0 | https://github.com/Devolutions/IronRDP |
+| sspi, picky, picky-asn1, picky-asn1-der, picky-asn1-x509, picky-krb, winscard (Devolutions; CredSSP / NTLM) | MIT OR Apache-2.0 | https://github.com/Devolutions/sspi-rs, https://github.com/Devolutions/picky-rs |
+| cryptoki, cryptoki-sys (PKCS#11 bindings, used by sspi's smart card code) | Apache-2.0 | https://github.com/parallaxsecond/rust-cryptoki |
+| des, md4, rc2, x509-cert, der_derive, ecdsa, elliptic-curve, p256, p384, p521, primefield, primeorder, sec1, rfc6979, sha3, keccak, pbkdf2, aes-kw, crypto-mac (RustCrypto) | MIT OR Apache-2.0 | https://github.com/RustCrypto |
+| curve25519-dalek, ed25519-dalek, x25519-dalek (dalek-cryptography) | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek |
+| fiat-crypto | MIT OR Apache-2.0 OR BSD-1-Clause | https://github.com/mit-plv/fiat-crypto |
+| yuv | BSD-3-Clause OR Apache-2.0 | https://github.com/awxkee/yuvutils-rs |
+| wide, safe_arch, bytemuck | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor |
+| flate2 with libz-sys (zlib, Copyright (c) Jean-loup Gailly and Mark Adler) | MIT OR Apache-2.0 (crates), Zlib (zlib) | https://github.com/rust-lang/flate2-rs, https://github.com/rust-lang/libz-sys |
+| iso7816-tlv | ISC | https://github.com/dimhoff/iso7816-tlv |
+| tls_codec, oid, flagset, heapless, hash32, serde_bytes, async-recursion, sponge-cursor, bit_field, ff, group, wnaf, fs_extra, dunce, iso7816 | MIT and/or Apache-2.0 (dunce also CC0-1.0 / MIT-0; fs_extra MIT; flagset Apache-2.0) | crates.io |
+
 ## Other ported code
 
 - `agent/src/connector/keys.rs`: the key table is generated from rdev, the

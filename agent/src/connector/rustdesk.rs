@@ -410,9 +410,11 @@ struct Remote {
 /// waits behind pictures in the host's send queue nor the time the two
 /// programs take is in it. Elsewhere `None` (Windows has `SIO_TCP_INFO`;
 /// it is not read here, and the host's figure is used there).
+///
+/// Any socket of a TCP connection will do (the RDP connector passes a
+/// duplicate of its socket's descriptor, rdp/session.rs).
 #[cfg(target_os = "linux")]
-fn tcp_round_trip_us(stream: &TcpStream) -> Option<u32> {
-    use std::os::fd::AsRawFd;
+pub(crate) fn tcp_round_trip_us<S: std::os::fd::AsRawFd + ?Sized>(stream: &S) -> Option<u32> {
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
     let result = unsafe {
@@ -422,7 +424,7 @@ fn tcp_round_trip_us(stream: &TcpStream) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn tcp_round_trip_us(_stream: &TcpStream) -> Option<u32> {
+pub(crate) fn tcp_round_trip_us<S: ?Sized>(_stream: &S) -> Option<u32> {
     None
 }
 

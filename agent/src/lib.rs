@@ -29,6 +29,8 @@ mod share;
 mod video;
 #[cfg(target_os = "windows")]
 pub mod win_service;
+#[cfg(target_os = "linux")]
+mod capture_service;
 
 
 pub static CONNECTED_TO_SERVER: std::sync::atomic::AtomicBool =
@@ -78,6 +80,25 @@ struct Args {
 
     #[arg(long)]
     import_config: Option<String>,
+
+    /// Join a Lunaris server with an install token and exit (what the
+    /// one-line installer runs): saves --server, the token (from
+    /// --install-token or LUNARIS_INSTALL_TOKEN), a new agent key and
+    /// --name in the config, and starts the agent at login (Linux; on
+    /// Windows the service does). The token is used once, at the first
+    /// connection.
+    #[arg(long, requires = "server")]
+    enroll: bool,
+
+    /// With --enroll: the install token. LUNARIS_INSTALL_TOKEN is better
+    /// (a command line is visible to other users).
+    #[arg(long, requires = "enroll")]
+    install_token: Option<String>,
+
+    /// With --enroll: SHA-256 (hex) of the server's TLS certificate, trusted
+    /// for it (a self-signed certificate, pinned without asking)
+    #[arg(long, requires = "enroll", value_name = "HEX")]
+    server_cert_sha256: Option<String>,
 
     #[arg(long)]
     minimized: bool,
@@ -175,6 +196,12 @@ where
     T: Into<std::ffi::OsString> + Clone,
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
+    let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    // The root capture service (Linux, see capture_service.rs).
+    #[cfg(target_os = "linux")]
+    if let Some(code) = capture_service::dispatch(&args) {
+        return code;
+    }
     let args = match Args::try_parse_from(args) {
         Ok(args) => args,
         Err(e) => e.exit(),
@@ -249,6 +276,10 @@ where
         info!("Configuration imported and merged successfully!");
     }
 
+    if args.enroll {
+        return enroll(&args, &config_path);
+    }
+
     if let Some(gui) = gui {
         if !args.cli && !args.pair {
             // Log output goes to the window.
@@ -298,7 +329,9 @@ where
 
     info!("Launching Lunaris Agent in CLI mode...");
 
-    let name = args.name.clone().unwrap_or_else(|| {
+    // --name, else the name saved by --enroll, else the host name.
+    let saved_name = crate::pairing::load_config(&config_path).map(|c| c.name).unwrap_or_default();
+    let name = args.name.clone().or_else(|| Some(saved_name.trim().to_string()).filter(|n| !n.is_empty())).unwrap_or_else(|| {
         hostname::get()
             .map(|h| h.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "LunarisHost".to_string())
@@ -352,6 +385,131 @@ where
     }
 
     run_agent(config, name).await
+}
+
+/// `ws://`/`wss://` address of a server as given (`http(s)://` and a bare
+/// `host:port` accepted), checked: Err when it isn't one.
+fn normalize_server_url(given: &str) -> Result<(String, String), String> {
+    let given = given.trim().trim_end_matches('/');
+    let url = if let Some(rest) = given.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if let Some(rest) = given.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if given.starts_with("ws://") || given.starts_with("wss://") {
+        given.to_string()
+    } else {
+        format!("ws://{given}")
+    };
+    let uri: tokio_tungstenite::tungstenite::http::Uri =
+        url.parse().map_err(|e| format!("not a server address: {given} ({e})"))?;
+    let tls = uri.scheme_str() == Some("wss");
+    let host = uri
+        .host()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| format!("no host in the server address {given}"))?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    if uri.path() != "/" && !uri.path().is_empty() || uri.query().is_some() {
+        return Err(format!("the server address has a path or query: {given}"));
+    }
+    // As server_stream says it (the key of a pinned certificate).
+    let host_port = format!("{}:{}", host, uri.port_u16().unwrap_or(if tls { 443 } else { 80 }));
+    Ok((url, host_port))
+}
+
+/// `--enroll`: joins this computer to a server with an install token (see
+/// the flag). Never prints the token.
+fn enroll(args: &Args, config_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let server_url = enroll_config(args, config_path)?;
+    println!("Saved the server {} in {}.", server_url, config_path);
+    #[cfg(target_os = "linux")]
+    match crate::pairing::enable_cli_autostart(config_path) {
+        Ok((entry, true)) => println!(
+            "The Lunaris Agent app already starts at login with these settings ({}); it joins the server then. Left as it is.",
+            entry.display()
+        ),
+        Ok((entry, false)) => println!("The agent starts at login ({}).", entry.display()),
+        Err(e) => eprintln!("warning: could not set up the start at login: {e}"),
+    }
+    #[cfg(target_os = "macos")]
+    crate::pairing::set_autostart_enabled_impl(true);
+    println!("This computer joins the server the next time the agent starts (the install token is used then).");
+    Ok(())
+}
+
+/// The config part of `--enroll`; returns the server address saved.
+fn enroll_config(args: &Args, config_path: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let (server_url, host_port) = normalize_server_url(args.server.as_deref().unwrap_or_default())?;
+    let token = args
+        .install_token
+        .clone()
+        .or_else(|| std::env::var("LUNARIS_INSTALL_TOKEN").ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or("no install token: set LUNARIS_INSTALL_TOKEN (or --install-token)")?;
+    let token_ok = token.strip_prefix("lit_").is_some_and(|rest| {
+        (16..=128).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    });
+    if !token_ok {
+        return Err("this is not an install token (they start with lit_)".into());
+    }
+    let pin = match args.server_cert_sha256.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) if p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit()) => Some(p.to_ascii_lowercase()),
+        Some(_) => return Err("--server-cert-sha256 takes 64 hex characters".into()),
+        None => None,
+    };
+    if let Some(name) = &args.name {
+        if name.trim().is_empty() || name.len() > 128 {
+            return Err("--name must be 1 to 128 bytes".into());
+        }
+    }
+
+    let path = std::path::Path::new(config_path);
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        #[cfg(target_os = "windows")]
+        {
+            // The service's folder: made for SYSTEM and administrators only
+            // before the config with the token and key goes in.
+            let service_dir = win_service::data_dir();
+            if dir.to_string_lossy().eq_ignore_ascii_case(&service_dir.to_string_lossy()) {
+                win_service::secure_data_dir()?;
+            }
+        }
+        std::fs::create_dir_all(dir)?;
+    }
+    // An existing config keeps its id, key and settings; one that can't be
+    // read is not overwritten.
+    let mut config = if path.exists() {
+        crate::pairing::load_config(config_path).map_err(|e| format!("cannot read {config_path}: {e}"))?
+    } else {
+        crate::pairing::new_config()
+    };
+    if config.client_unique_id.trim().is_empty() {
+        config.client_unique_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    }
+    let same_server = normalize_server_url(&config.server_url).map(|(u, _)| u == server_url).unwrap_or(false);
+    if !same_server {
+        // A certificate pinned for another server says nothing about this one.
+        config.server_cert_sha256.clear();
+        config.server_cert_host.clear();
+    }
+    if let Some(pin) = pin {
+        config.server_cert_sha256 = pin;
+        config.server_cert_host = host_port;
+    }
+    config.server_url = server_url.clone();
+    // The install token replaces the server's agent token: this computer
+    // signs in with its own key once joined.
+    config.server_token.clear();
+    config.install_token = token;
+    crate::pairing::ensure_agent_key(&mut config);
+    if let Some(name) = &args.name {
+        config.name = name.trim().to_string();
+    }
+    config.autostart = true;
+    crate::pairing::save_config(&config, config_path)?;
+    Ok(server_url)
 }
 
 pub async fn run_agent(
@@ -502,7 +660,45 @@ fn probe_codec_support() -> u32 {
     bits
 }
 
-/// Keeps a connection to the signaling server, reconnecting every 3 s.
+/// The server refused the agent's WebSocket handshake with this HTTP status.
+#[derive(Debug)]
+struct ServerRefused {
+    status: u16,
+    message: String,
+}
+
+impl std::fmt::Display for ServerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ServerRefused {}
+
+const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(3);
+/// Refused (401/403/429): every refusal counts toward the server's limit
+/// for the address, which all agents behind it share.
+const RETRY_MAX_REFUSED: std::time::Duration = std::time::Duration::from_secs(300);
+/// Unreachable: the server comes back on its own, so not too slow.
+const RETRY_MAX_UNREACHABLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait before attempt `failures + 1` after `failures` failed attempts in a
+/// row: 3 s doubling up to the cap (5 min when refused, 30 s otherwise), ±20 %
+/// with `jitter` (0..1) so agents behind one address don't retry in step.
+fn retry_delay(failures: u32, refused: bool, jitter: f64) -> std::time::Duration {
+    let cap = if refused { RETRY_MAX_REFUSED } else { RETRY_MAX_UNREACHABLE };
+    let doubled = RETRY_FIRST.as_secs_f64() * 2f64.powi(failures.saturating_sub(1).min(20) as i32);
+    let base = doubled.min(cap.as_secs_f64());
+    std::time::Duration::from_secs_f64(base * (0.8 + 0.4 * jitter.clamp(0.0, 1.0)))
+}
+
+fn random_unit() -> f64 {
+    let b = crate::pairing::random_bytes(2);
+    f64::from(u16::from_le_bytes([b[0], b[1]])) / f64::from(u16::MAX)
+}
+
+/// Keeps a connection to the signaling server, reconnecting after 3 s, and
+/// backing off while the server refuses this agent or can't be reached.
 async fn run_server_connection(
     mut config: AgentConfig,
     name: String,
@@ -510,29 +706,38 @@ async fn run_server_connection(
     inbound_tx: mpsc::UnboundedSender<SignalingMessage>,
 ) {
     let mut last_error = String::new();
+    let mut failures: u32 = 0;
     loop {
-        match connect_server_once(&mut config, &name, &hub, &inbound_tx).await {
+        let wait = match connect_server_once(&mut config, &name, &hub, &inbound_tx).await {
             Ok(()) => {
                 info!("Disconnected from the signaling server. Reconnecting in 3 seconds...");
                 last_error.clear();
+                failures = 0;
+                RETRY_FIRST
             }
             Err(e) => {
+                failures = failures.saturating_add(1);
+                let refused = e
+                    .downcast_ref::<ServerRefused>()
+                    .is_some_and(|r| matches!(r.status, 401 | 403 | 429));
+                let wait = retry_delay(failures, refused, random_unit());
                 let msg = format!("Signaling server connection failed: {}", e);
-                // Report each new error once instead of every 3 seconds.
+                // Report each new error once instead of on every attempt.
                 if msg != last_error {
-                    error!("{}. Retrying every 3 seconds...", msg);
+                    error!("{}. Retrying in {} s (longer each time it fails)...", msg, wait.as_secs());
                     if let Ok(mut last) = LAST_ERROR.lock() {
                         *last = Some(msg.clone());
                     }
                     last_error = msg;
                 } else {
-                    debug!("{}", msg);
+                    debug!("{} (retrying in {} s)", msg, wait.as_secs());
                 }
+                wait
             }
-        }
+        };
         hub.set_server(None);
         CONNECTED_TO_SERVER.store(false, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -553,6 +758,11 @@ async fn connect_server_once(
         base_ws_url = format!("ws://{}", base_ws_url);
     }
 
+    // Joining with an install token (`--enroll`): sent instead of the
+    // server's agent token, until the server has taken it once.
+    let install_token = config.install_token.trim().to_string();
+    let token = if install_token.is_empty() { config.server_token.clone() } else { String::new() };
+
     // Connect to Signaling Server
     let mut server_ws_url = if let Some(support) = codec_support {
         format!(
@@ -561,7 +771,7 @@ async fn connect_server_once(
             config.client_unique_id,
             urlencoding::encode(name),
             support,
-            urlencoding::encode(&config.server_token)
+            urlencoding::encode(&token)
         )
     } else {
         format!(
@@ -569,9 +779,13 @@ async fn connect_server_once(
             base_ws_url.trim_end_matches('/'),
             config.client_unique_id,
             urlencoding::encode(name),
-            urlencoding::encode(&config.server_token)
+            urlencoding::encode(&token)
         )
     };
+    if !install_token.is_empty() {
+        server_ws_url.push_str("&install_token=");
+        server_ws_url.push_str(&urlencoding::encode(&install_token));
+    }
 
     // The agent's own key (servers that don't know it ignore it).
     if !config.agent_key.is_empty() {
@@ -584,11 +798,33 @@ async fn connect_server_once(
     // TLS first (the certificate is checked or pinned before the token is
     // sent), then the WebSocket handshake over it.
     let stream = server_stream(config, &base_ws_url).await?;
-    let (ws_stream, _) = tokio_tungstenite::client_async(server_ws_url, stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("WebSocket handshake with {} failed: {}", base_ws_url, e))?;
+    let (ws_stream, _) = tokio_tungstenite::client_async(server_ws_url, stream).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            let status = match &e {
+                tokio_tungstenite::tungstenite::Error::Http(resp) => Some(resp.status().as_u16()),
+                _ => None,
+            };
+            let hint = refusal_hint(status, !install_token.is_empty(), !token.is_empty());
+            let message = format!("WebSocket handshake with {} failed: {}{}", base_ws_url, e, hint);
+            match status {
+                // The retry loop backs off on refusals.
+                Some(status) => Box::new(ServerRefused { status, message }),
+                None => anyhow::anyhow!(message).into(),
+            }
+        },
+    )?;
     info!("Connected to signaling server!");
     CONNECTED_TO_SERVER.store(true, std::sync::atomic::Ordering::SeqCst);
+    if !install_token.is_empty() {
+        // Joined: from now on the key alone signs in.
+        info!("Joined the server with the install token; it is no longer needed");
+        config.install_token.clear();
+        if let Err(e) = crate::pairing::update_config_file(crate::pairing::config_path(), config, |c| c.install_token.clear()) {
+            // Harmless: the server accepts the token again for this key
+            // without counting a use.
+            warn!("Could not remove the used install token from {}: {}", crate::pairing::config_path(), e);
+        }
+    }
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (server_tx, mut server_rx) = mpsc::unbounded_channel::<AgentMessage>();
@@ -793,6 +1029,24 @@ impl Drop for ServerGate {
             cancel.notify_one();
         }
         self.accepted.lock().unwrap().clear();
+    }
+}
+
+/// What a refused registration means, from what was sent (the server only
+/// answers 401/429; its log has the reason).
+fn refusal_hint(status: Option<u16>, sent_install_token: bool, sent_server_token: bool) -> &'static str {
+    match status {
+        Some(401) if sent_install_token => {
+            " (the server refused the install token: it is expired, revoked, used up or not from this server, \
+             or this computer's id is taken. Ask for a new install token and run the installer again)"
+        }
+        Some(401) if sent_server_token => " (wrong agent connection token, or another key is registered for this computer's id)",
+        Some(401) => {
+            " (the server does not accept this computer's key: it was removed from the server or its key was reset. \
+             Run the installer again with a new install token)"
+        }
+        Some(429) => " (too many refused attempts from this address: the server waits a few minutes)",
+        _ => "",
     }
 }
 
@@ -1514,7 +1768,7 @@ async fn run_session_logic(
                         // (Not their groups: a viewer picks one by its name.)
                         sources: crate::connector::configured_sources()
                             .into_iter()
-                            .map(|s| common::SourceInfoMsg { id: s.id, name: s.name, connector: s.target.connector, group: None })
+                            .map(|s| common::SourceInfoMsg { id: s.id, name: s.name, connector: s.target.connector, group: None, online: None })
                             .collect(),
                     },
                 );
@@ -1577,6 +1831,83 @@ mod stream_limit_tests {
             (Some(64), Some(8192), Some(1), Some(500_000))
         );
         assert_eq!(clamp_stream_request(Some(1365), Some(767), Some(100_000), Some(0)), (Some(1364), Some(766), Some(240), Some(500)));
+    }
+}
+
+#[cfg(test)]
+mod enroll_tests {
+    use super::*;
+
+    const TOKEN: &str = "lit_00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn args(extra: &[&str]) -> Args {
+        let mut v = vec!["agent", "--enroll", "--server", "https://srv.lan:8443/", "--install-token", TOKEN];
+        v.extend_from_slice(extra);
+        Args::try_parse_from(v).unwrap()
+    }
+
+    #[test]
+    fn refusals_are_explained() {
+        assert!(refusal_hint(Some(401), true, false).contains("install token"));
+        assert!(refusal_hint(Some(401), false, true).contains("connection token"));
+        assert!(refusal_hint(Some(401), false, false).contains("key"));
+        assert!(refusal_hint(Some(429), true, false).contains("too many"));
+        assert_eq!(refusal_hint(Some(500), true, false), "");
+        assert_eq!(refusal_hint(None, true, false), "");
+    }
+
+    #[test]
+    fn server_addresses() {
+        assert_eq!(normalize_server_url("https://srv.lan:8443/").unwrap(), ("wss://srv.lan:8443".into(), "srv.lan:8443".into()));
+        assert_eq!(normalize_server_url("srv.lan:8090").unwrap().0, "ws://srv.lan:8090");
+        assert_eq!(normalize_server_url("wss://example.com").unwrap().1, "example.com:443");
+        assert_eq!(normalize_server_url("ws://[::1]:8090").unwrap().1, "::1:8090");
+        assert!(normalize_server_url("").is_err());
+        assert!(normalize_server_url("ws://srv/ws/agent?token=x").is_err());
+    }
+
+    #[test]
+    fn enroll_writes_the_config_and_keeps_the_identity() {
+        let dir = std::env::temp_dir().join(format!("lunaris-enroll-{}", crate::pairing::to_hex(&crate::pairing::random_bytes(6))));
+        let path = dir.join("sub").join("agent_config.json");
+        let path_s = path.to_string_lossy().to_string();
+        // An existing config with a token for another server and a pin.
+        let mut old = crate::pairing::new_config();
+        old.server_url = "ws://other:8090".into();
+        old.server_token = "main-token".into();
+        old.server_cert_sha256 = "aa".repeat(32);
+        old.direct_enabled = true;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::pairing::save_config(&old, &path_s).unwrap();
+
+        let pin = "AB".repeat(32);
+        let url = enroll_config(&args(&["--name", "Lab 1", "--server-cert-sha256", &pin]), &path_s).unwrap();
+        assert_eq!(url, "wss://srv.lan:8443");
+        let c = crate::pairing::load_config(&path_s).unwrap();
+        assert_eq!(c.client_unique_id, old.client_unique_id);
+        assert_eq!(c.server_url, "wss://srv.lan:8443");
+        assert_eq!(c.install_token, TOKEN);
+        assert!(c.server_token.is_empty(), "the main token is not kept");
+        assert_eq!(c.agent_key.len(), 64);
+        assert_eq!(c.name, "Lab 1");
+        assert_eq!(c.server_cert_sha256, "ab".repeat(32));
+        assert_eq!(c.server_cert_host, "srv.lan:8443");
+        assert!(c.autostart && c.direct_enabled);
+
+        // Again (the installer run twice): same id and key.
+        enroll_config(&args(&[]), &path_s).unwrap();
+        let again = crate::pairing::load_config(&path_s).unwrap();
+        assert_eq!((again.client_unique_id, again.agent_key), (c.client_unique_id, c.agent_key));
+        // Same server: the pin stays.
+        assert_eq!(again.server_cert_sha256, "ab".repeat(32));
+        assert_eq!(again.name, "Lab 1");
+
+        // Bad input changes nothing.
+        let bad = Args::try_parse_from(["agent", "--enroll", "--server", "srv", "--install-token", "nope"]).unwrap();
+        assert!(enroll_config(&bad, &path_s).is_err());
+        assert!(enroll_config(&args(&["--server-cert-sha256", "xyz"]), &path_s).is_err());
+        assert!(Args::try_parse_from(["agent", "--enroll"]).is_err(), "--enroll needs --server");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1708,5 +2039,57 @@ mod server_gate_tests {
 
     fn answer_msg(client: &str) -> SignalingMessage {
         answer(client)
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn secs(failures: u32, refused: bool, jitter: f64) -> f64 {
+        retry_delay(failures, refused, jitter).as_secs_f64()
+    }
+
+    #[test]
+    fn refused_agents_back_off_to_five_minutes() {
+        // Without jitter (0.5 is the middle): 3, 6, 12, ... capped at 300 s.
+        let seq: Vec<f64> = (1..=9).map(|n| secs(n, true, 0.5)).collect();
+        assert_eq!(seq, vec![3.0, 6.0, 12.0, 24.0, 48.0, 96.0, 192.0, 300.0, 300.0]);
+        assert_eq!(secs(u32::MAX, true, 0.5), 300.0);
+        // Unreachable servers: the same start, capped at 30 s.
+        let seq: Vec<f64> = (1..=6).map(|n| secs(n, false, 0.5)).collect();
+        assert_eq!(seq, vec![3.0, 6.0, 12.0, 24.0, 30.0, 30.0]);
+        // Jitter: ±20 %, never past it even for odd input.
+        assert!((secs(1, true, 0.0) - 2.4).abs() < 1e-9);
+        assert!((secs(1, true, 1.0) - 3.6).abs() < 1e-9);
+        assert!(retry_delay(20, true, 7.0) <= Duration::from_secs(360));
+        assert!(retry_delay(20, true, -1.0) >= Duration::from_secs(240));
+        let j = random_unit();
+        assert!((0.0..=1.0).contains(&j));
+    }
+
+    /// A refused agent stays well under the server's per-address limit
+    /// (300 refusals in 5 minutes): after the first few, about one a 5 min.
+    #[test]
+    fn refusals_per_five_minutes_stay_low() {
+        let mut t = 0.0;
+        let mut attempts = 0;
+        let mut n = 0;
+        while t < 3600.0 {
+            n += 1;
+            t += secs(n, true, 0.0);
+            attempts += 1;
+        }
+        assert!(attempts < 30, "{attempts} attempts in an hour");
+    }
+
+    #[test]
+    fn refusals_are_told_apart_from_network_errors() {
+        let refused: Box<dyn std::error::Error + Send + Sync> = Box::new(ServerRefused { status: 401, message: "no".into() });
+        assert!(refused.downcast_ref::<ServerRefused>().is_some_and(|r| r.status == 401));
+        assert_eq!(refused.to_string(), "no");
+        let other: Box<dyn std::error::Error + Send + Sync> = anyhow::anyhow!("connection refused").into();
+        assert!(other.downcast_ref::<ServerRefused>().is_none());
     }
 }

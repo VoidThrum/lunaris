@@ -9,10 +9,21 @@ import {
   newGroup,
   rememberMethod,
   layoutFields,
+  choiceAsList,
   shortTypeName,
   typeShortName,
   validGroup,
   METHODS_STORE,
+  cardTypes,
+  effectiveType,
+  filterCards,
+  foldText,
+  loadTypeFilter,
+  loadView,
+  matchesSearch,
+  saveTypeFilter,
+  saveView,
+  typesOf,
   type CardHost,
   type CardSource,
 } from '../src/computerCards.ts';
@@ -200,10 +211,33 @@ test('which fields of a form share a row', () => {
     rows([f('host'), f('port', 'port', '47989'), f('app', 'text', 'Desktop'), f('resolution', 'text', '1920x1080'), f('bitrate', 'text', '20'), f('pointer', 'choice', 'picture')]),
     'host:4 port:2 app:2 resolution:2 bitrate:2 pointer:6',
   );
-  // Long or empty usual values, secrets and choices have a row of their own.
+  // Long or empty usual values, secrets and choices are alone, and fields
+  // alone one after another share rows two to a row.
   assert.equal(rows([f('station'), f('gateway', 'text', 'gw.example.net'), f('gateway_port', 'port', '7400'), f('token', 'secret'), f('pin', 'secret')]),
-    'station:6 gateway:4 gateway_port:2 token:6 pin:6');
-  assert.equal(rows([f('a', 'choice', 'x'), f('p', 'port', '1')]), 'a:6 p:6');
+    'station:6 gateway:4 gateway_port:2 token:3 pin:3');
+  assert.equal(rows([f('a', 'choice', 'x'), f('p', 'port', '1')]), 'a:3 p:3');
+  assert.equal(rows([f('a'), f('b'), f('c')]), 'a:3 b:3 c:6');
+  const opts = (...labels: string[]) => labels.map((label, i) => ({ value: String(i), label }));
+  const choice = (key: string, def: string, options: { value: string; label: string }[]) => ({ key, kind: 'choice', default: def, options });
+  // RDP: the user and the password, the domain and the security (a list to
+  // open, its labels are long) share rows; the resolution is alone.
+  const rdp = [f('host'), f('port', 'port', '3389'), f('username'), f('password', 'secret'), f('domain'),
+    choice('security', 'nla', opts('NLA (recommended)', "TLS (sign in on the computer's screen)", 'Either')),
+    f('resolution', 'text', 'auto')];
+  assert.equal(rows(rdp), 'host:4 port:2 username:3 password:3 domain:3 security:3 resolution:6');
+  // VNC: the password beside a short choice.
+  assert.equal(rows([f('host'), f('port', 'port', '5900'), f('password', 'secret'), choice('view_only', 'false', opts('Control', 'View only'))]),
+    'host:4 port:2 password:3 view_only:3');
+  // Options to press with long labels: a row of their own.
+  const pointer = choice('pointer', 'picture', opts("In the picture (host's pointer)", 'Drawn here (no lag; arrow only)'));
+  assert.equal(rows([f('a'), pointer, f('b')]), 'a:6 pointer:6 b:6');
+  // Which choices are a list to open.
+  assert.equal(choiceAsList(pointer), false);
+  assert.equal(choiceAsList(rdp[5]), true);
+  assert.equal(choiceAsList(choice('n', '', opts('a', 'b', 'c', 'd'))), true);
+  assert.equal(choiceAsList(choice('n', '', opts('a', 'b', 'c'))), false);
+  assert.equal(choiceAsList(choice('n', '', [])), false);
+  assert.equal(choiceAsList(f('t', 'text', 'x'.repeat(40))), false);
   assert.equal(rows([]), '');
   // Short ones in a row: three across, and never one left alone.
   const short = (n: number) => Array.from({ length: n }, (_, i) => f('s' + i, 'text', 'v'));
@@ -218,4 +252,71 @@ test('which fields of a form share a row', () => {
   // Every field once, in its order.
   const many = [f('a', 'text', '1'), f('b', 'text', '2'), f('c', 'text', '3'), f('d'), f('e', 'port', '5')];
   assert.deepEqual(layoutFields(many).map((p) => p.field.key), ['a', 'b', 'c', 'd', 'e']);
+});
+
+// ---- Search and the type filter (the same cases as tst_computers.qml's test_find) ----
+
+const findCards = () => buildCards(
+  [{ ...host('h1', 'Máy văn phòng'), address: '192.168.1.20:8091' } as CardHost, host('h2', 'Lab PC', 'Offline')],
+  [
+    source('rd-1', 'Đức laptop', 'rustdesk', { group: 'host:h1' }),
+    source('sun-1', 'Den PC', 'sunshine', { host_name: 'Gateway' }),
+    source('vnc-1', 'Kiosk', 'vnc', { connector_name: 'VNC (screen sharing)' }),
+    source('odd-1', 'Press room', 'acme-view', { connector_name: 'Acme Viewer' }),
+  ],
+);
+
+test('folding: case and accents aside, đ is d', () => {
+  assert.equal(foldText('Máy Đức ổ'), 'may duc o');
+  assert.equal(foldText(undefined), '');
+});
+
+test('search finds by name, address and source names, accents aside', () => {
+  const cards = findCards();
+  const titles = (q: string, type = '') => filterCards(cards, q, type).map((c) => c.title);
+  assert.deepEqual(titles('may'), ['Máy văn phòng']);
+  assert.deepEqual(titles('MÁY VĂN'), ['Máy văn phòng']);
+  assert.deepEqual(titles('duc'), ['Máy văn phòng'], 'a source on the card is found');
+  assert.deepEqual(titles('192.168.1.20'), ['Máy văn phòng']);
+  assert.deepEqual(titles('gateway'), ['Den PC'], 'the computer a source is reached through');
+  assert.deepEqual(titles('kiosk vnc'), ['Kiosk'], 'every word must be found');
+  assert.deepEqual(titles('kiosk rustdesk'), []);
+  assert.deepEqual(titles('   ').length, 5, 'an empty query finds all');
+  assert.equal(matchesSearch(cards[0], 'nothing here'), false);
+});
+
+test('types: one per type in the cards, known ones first, unknown ones kept', () => {
+  const cards = findCards();
+  assert.deepEqual(typesOf(cards).map((t) => t.id), ['lunaris', 'rustdesk', 'sunshine', 'acme-view', 'vnc']);
+  assert.deepEqual(typesOf(cards).map((t) => t.name), ['Lunaris', 'RustDesk', 'Sunshine', 'Acme Viewer', 'VNC']);
+  assert.deepEqual(cardTypes(cards[0]), ['lunaris', 'rustdesk']);
+  assert.deepEqual(typesOf([]), []);
+});
+
+test('filter: a grouped card matches if any of its ways is of the type', () => {
+  const cards = findCards();
+  const titles = (type: string, q = '') => filterCards(cards, q, type).map((c) => c.title);
+  assert.deepEqual(titles('rustdesk'), ['Máy văn phòng']);
+  assert.deepEqual(titles('lunaris'), ['Máy văn phòng', 'Lab PC']);
+  assert.deepEqual(titles('acme-view'), ['Press room']);
+  assert.deepEqual(titles('sunshine', 'may'), [], 'search and filter together');
+  assert.deepEqual(titles('rdp'), [], 'a type no card has finds nothing');
+  assert.equal(effectiveType(typesOf(cards), 'rdp'), '', 'a remembered type that is gone is All');
+  assert.equal(effectiveType(typesOf(cards), 'vnc'), 'vnc');
+});
+
+test('view and type are remembered, nonsense and broken storage are the defaults', () => {
+  const data = new Map<string, string>();
+  const store = { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v); } };
+  assert.equal(loadView(store), 'grid');
+  saveView(store, 'list');
+  assert.equal(loadView(store), 'list');
+  saveTypeFilter(store, 'rustdesk');
+  assert.equal(loadTypeFilter(store), 'rustdesk');
+  data.set('lunaris_computer_type', '<b>');
+  assert.equal(loadTypeFilter(store), '');
+  const broken = { getItem: () => { throw new Error('denied'); }, setItem: () => { throw new Error('denied'); } };
+  assert.equal(loadView(broken), 'grid');
+  assert.equal(loadTypeFilter(broken), '');
+  saveView(broken, 'list');
 });

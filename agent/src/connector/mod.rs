@@ -41,10 +41,14 @@ pub mod files;
 pub mod keys;
 pub mod media;
 pub mod process;
+pub mod raw_video;
+pub mod rdp;
+pub mod reachability;
 pub mod rustdesk;
 pub mod rustdesk_files;
 pub mod sources;
 pub mod sunshine;
+pub mod vnc;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -334,7 +338,12 @@ pub trait Connector: Send + Sync {
 
 /// The connectors built into the agent.
 pub fn builtin() -> Vec<Arc<dyn Connector>> {
-    vec![Arc::new(rustdesk::RustdeskConnector), Arc::new(sunshine::SunshineConnector::new())]
+    vec![
+        Arc::new(rustdesk::RustdeskConnector),
+        Arc::new(sunshine::SunshineConnector::new()),
+        Arc::new(rdp::RdpConnector::new()),
+        Arc::new(vnc::VncConnector::new()),
+    ]
 }
 
 /// Where external connectors live: `connectors/` beside the agent's config.

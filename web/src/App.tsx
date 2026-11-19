@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { LANGUAGES, getLang, setLang, t, type Lang } from './i18n';
 import StreamSettingsDialog from './components/StreamSettingsDialog';
 import { DEFAULT_BITRATE, DEFAULT_CODEC, resolutionString } from './streamOptions';
@@ -6,8 +6,14 @@ import { StreamPlayer } from './components/StreamPlayer';
 import { AdminUsers } from './components/AdminUsers';
 import { AdminGroups } from './components/AdminGroups';
 import { AdminTurnServers } from './components/AdminTurnServers';
+import { AdminInstallAgents } from './components/AdminInstallAgents';
+import { AccountSecurity } from './components/AccountSecurity';
+import { isCompleteTotp, isPlausibleRecoveryCode, normalizeRecoveryInput, normalizeTotpInput, parseLoginAnswer, type LoginAnswer } from './mfa';
 import FileManager from './components/FileManager';
-import { buildCards, currentMethod, layoutFields, loadMethods, newGroup, rememberMethod, typeShortName, type Card, type Method } from './computerCards';
+import {
+  browserStore, buildCards, choiceAsList, currentMethod, effectiveType, filterCards, layoutFields, loadMethods, loadTypeFilter, loadView, methodType,
+  newGroup, rememberMethod, saveTypeFilter, saveView, typeShortName, typesOf, type Card, type ComputerView, type Method,
+} from './computerCards';
 import { typeLogo } from './typeLogos';
 import './App.css';
 
@@ -367,6 +373,14 @@ function App() {
   const [authServerHost, setAuthServerHost] = useState<string>(() => getCurrentBrowserServerUrl());
   const [authError, setAuthError] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(false);
+  // Two-factor sign-in: the password was right, the code from the app is next.
+  const [mfaStep, setMfaStep] = useState<{ token: string; username: string } | null>(null);
+  const [mfaCode, setMfaCode] = useState('');
+  const [mfaUseRecovery, setMfaUseRecovery] = useState(false);
+  const [mfaRecovery, setMfaRecovery] = useState('');
+  const mfaInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (mfaStep) mfaInputRef.current?.focus(); }, [mfaStep, mfaUseRecovery]);
+  const [showAccountSecurity, setShowAccountSecurity] = useState(false);
   const [theme, setTheme] = useState<ThemeChoice>(readThemeChoice);
   useEffect(() => {
     applyTheme(theme);
@@ -377,7 +391,7 @@ function App() {
 
   // Admin State
   const [userRole, setUserRole] = useState<string | null>(localStorage.getItem('lunaris_role'));
-  const [activeTab, setActiveTab] = useState<'devices' | 'users' | 'groups' | 'turn_servers'>('devices');
+  const [activeTab, setActiveTab] = useState<'devices' | 'users' | 'groups' | 'turn_servers' | 'install_agents'>('devices');
 
   // Dashboard State
   const [hosts, setHosts] = useState<Host[]>([]);
@@ -697,30 +711,87 @@ function App() {
         })
       });
 
-      const data = await response.json();
-
-      if (response.ok) {
-        // Success
-        localStorage.setItem('lunaris_token', data.token);
-        localStorage.setItem('lunaris_username', data.username);
-        localStorage.setItem('lunaris_server_host', authServerHost);
-        if (data.role) {
-          localStorage.setItem('lunaris_role', data.role);
-          setUserRole(data.role);
-        }
-        setToken(data.token);
-        setUsername(data.username);
-        // Clear fields
-        setAuthUsername('');
+      const data = await response.json().catch(() => ({}));
+      const answer = parseLoginAnswer(response.ok, data);
+      if (answer.kind === 'mfa') {
+        // No session yet: ask for the code from the authenticator app.
+        setMfaStep({ token: answer.mfaToken, username: answer.username || authUsername });
+        setMfaCode('');
+        setMfaRecovery('');
+        setMfaUseRecovery(false);
         setAuthPassword('');
       } else {
-        setAuthError(data.error || "Authentication failed");
+        finishSignIn(answer);
       }
     } catch (err) {
       setAuthError("Connection to authentication server failed");
     } finally {
       setAuthLoading(false);
     }
+  };
+
+  /** A sign-in answer: keep the session, or show the error. */
+  const finishSignIn = (answer: LoginAnswer) => {
+    if (answer.kind === 'session') {
+      localStorage.setItem('lunaris_token', answer.token);
+      localStorage.setItem('lunaris_username', answer.username);
+      localStorage.setItem('lunaris_server_host', authServerHost);
+      if (answer.role) {
+        localStorage.setItem('lunaris_role', answer.role);
+        setUserRole(answer.role);
+      }
+      setToken(answer.token);
+      setUsername(answer.username);
+      // Clear fields
+      setAuthUsername('');
+      setAuthPassword('');
+      setMfaStep(null);
+      setMfaCode('');
+      setMfaRecovery('');
+    } else if (answer.kind === 'error') {
+      setAuthError(t(answer.error));
+    }
+  };
+
+  // The second step: the code from the app, or a recovery code.
+  const handleMfa = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!mfaStep) return;
+    setAuthError(null);
+    if (mfaUseRecovery ? !isPlausibleRecoveryCode(mfaRecovery) : !isCompleteTotp(mfaCode)) {
+      setAuthError(mfaUseRecovery ? t('Enter one of your recovery codes') : t('Enter the 6-digit code from your app'));
+      return;
+    }
+    setAuthLoading(true);
+    try {
+      const response = await fetch(`${getBackendProtocol().http}//${getBackendHost()}/api/auth/login/mfa`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(mfaUseRecovery
+          ? { mfa_token: mfaStep.token, recovery_code: normalizeRecoveryInput(mfaRecovery) }
+          : { mfa_token: mfaStep.token, code: mfaCode }),
+      });
+      const data = await response.json().catch(() => ({}));
+      const answer = parseLoginAnswer(response.ok, data, 'Wrong code');
+      if (answer.kind === 'error' && answer.error === 'This sign-in has expired. Sign in again.') {
+        // Back to the password.
+        setMfaStep(null);
+      }
+      if (answer.kind === 'error') setMfaCode('');
+      finishSignIn(answer);
+    } catch {
+      setAuthError(t('Connection to authentication server failed'));
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const cancelMfa = () => {
+    setMfaStep(null);
+    setMfaCode('');
+    setMfaRecovery('');
+    setMfaUseRecovery(false);
+    setAuthError(null);
   };
 
   const handleLogout = () => {
@@ -730,6 +801,7 @@ function App() {
     setToken(null);
     setUsername(null);
     setUserRole(null);
+    setShowAccountSecurity(false);
     setActiveTab('devices');
     setHosts([]);
     setSelectedHost(null);
@@ -858,7 +930,28 @@ function App() {
   }));
   // One card for each computer (computerCards.ts). A source's method is
   // named by its type, in the person's language.
-  const cards: ComputerCard[] = buildCards(hosts, sources, (source) => typeShortName(source.connector, t(source.connector_name || source.connector)));
+  const uiLang = getLang();
+  const cards: ComputerCard[] = useMemo(
+    () => buildCards(hosts, sources, (source) => typeShortName(source.connector, t(source.connector_name || source.connector))),
+    // (The names are in the person's language.)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [hosts, sources, uiLang],
+  );
+  // Finding a computer (computerCards.ts, as the desktop app does): the
+  // search, the types among the cards with the one filtered by, and grid or
+  // list. The view and the type are remembered in this browser.
+  const [computerSearch, setComputerSearch] = useState('');
+  const [computerView, setComputerView] = useState<ComputerView>(() => loadView(browserStore()));
+  const [typeChoice, setTypeChoice] = useState<string>(() => loadTypeFilter(browserStore()));
+  const cardTypeList = useMemo(
+    () => typesOf(cards, (id, source) => (id === 'lunaris' ? 'Lunaris' : typeShortName(id, t(source?.connector_name || id)))),
+    [cards],
+  );
+  const typeFilter = effectiveType(cardTypeList, typeChoice);
+  const shownCards = useMemo(() => filterCards(cards, computerSearch, typeFilter), [cards, computerSearch, typeFilter]);
+  const chooseView = (view: ComputerView) => { setComputerView(view); saveView(browserStore(), view); };
+  const chooseType = (type: string) => { setTypeChoice(type); saveTypeFilter(browserStore(), type); };
+  const clearFinding = () => { setComputerSearch(''); chooseType(''); };
   const methodOf = (card: ComputerCard): ComputerMethod | undefined =>
     card.methods.find(m => m.key === pickedMethods[card.key]) || currentMethod(card.methods, cardMethods[card.key]);
   const pickMethod = (card: ComputerCard, method: ComputerMethod) => {
@@ -921,6 +1014,9 @@ function App() {
   // The name and the Lunaris computer to go through share a row when there
   // are one or two of those to choose from.
   const throughBesideName = dialogHosts.length <= 2;
+  // The types as a list beside the form (a wide window) or above it (a narrow
+  // one): when a computer is being added and there is more than one type.
+  const hasTypeRail = !sourceSetup && !editSource && dialogTypes.length > 1;
 
   const defaultsOf = (connector: Connector | null | undefined): Record<string, string> => {
     const values: Record<string, string> = {};
@@ -1425,6 +1521,19 @@ function App() {
                   {localStorage.getItem('lunaris_server_host') || getCurrentBrowserServerUrl()}
                 </span>
               </div>
+              <button
+                type="button"
+                className="icon-btn"
+                onClick={() => setShowAccountSecurity(true)}
+                title={t('Account security')}
+                aria-label={t('Account security')}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" />
+                  <rect x="9" y="11" width="6" height="5" rx="1" />
+                  <path d="M10 11V9.5a2 2 0 0 1 4 0V11" />
+                </svg>
+              </button>
               <button onClick={handleLogout} className="btn-logout" title="Log Out">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
@@ -1443,8 +1552,19 @@ function App() {
             <div className="auth-card">
               <div className="auth-header">
                 <img className="auth-logo" src="/favicon.svg" alt="Lunaris" width={48} height={48} />
-                <h2>Welcome Back</h2>
-                <p>Access your remote desktop network</p>
+                {mfaStep ? (
+                  <>
+                    <h2>{t('Two-factor sign-in')}</h2>
+                    <p>{mfaUseRecovery
+                      ? t('Enter one of the recovery codes you saved when you turned on two-factor sign-in.')
+                      : t('Enter the 6-digit code from your authenticator app for %1.', mfaStep.username)}</p>
+                  </>
+                ) : (
+                  <>
+                    <h2>Welcome Back</h2>
+                    <p>Access your remote desktop network</p>
+                  </>
+                )}
               </div>
 
               {authError && (
@@ -1454,6 +1574,58 @@ function App() {
                 </div>
               )}
 
+              {mfaStep ? (
+              <form onSubmit={handleMfa} className="auth-form mfa-login-form">
+                {mfaUseRecovery ? (
+                  <div className="form-group">
+                    <label htmlFor="mfaRecovery">{t('Recovery code')}</label>
+                    <input
+                      ref={mfaInputRef}
+                      type="text"
+                      id="mfaRecovery"
+                      className="mfa-recovery-input"
+                      value={mfaRecovery}
+                      onChange={(e) => setMfaRecovery(e.target.value)}
+                      placeholder="xxxx-xxxx-xxxx"
+                      autoComplete="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                      disabled={authLoading}
+                    />
+                  </div>
+                ) : (
+                  <div className="form-group">
+                    <label htmlFor="mfaCode">{t('Code from the app')}</label>
+                    <input
+                      ref={mfaInputRef}
+                      type="text"
+                      id="mfaCode"
+                      className="mfa-code-input"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      pattern="[0-9]*"
+                      maxLength={7}
+                      value={mfaCode}
+                      onChange={(e) => setMfaCode(normalizeTotpInput(e.target.value))}
+                      placeholder="123456"
+                      disabled={authLoading}
+                    />
+                  </div>
+                )}
+
+                <button type="submit" disabled={authLoading} className="btn-primary auth-submit-btn">
+                  {authLoading ? <div className="inline-loader"></div> : t('Verify')}
+                </button>
+                <div className="mfa-login-links">
+                  <button type="button" className="btn-link" onClick={() => { setMfaUseRecovery(u => !u); setAuthError(null); }} disabled={authLoading}>
+                    {mfaUseRecovery ? t('Use a code from the app') : t('Use a recovery code')}
+                  </button>
+                  <button type="button" className="btn-link mfa-back-link" onClick={cancelMfa} disabled={authLoading}>
+                    {t('Back')}
+                  </button>
+                </div>
+              </form>
+              ) : (
               <form onSubmit={handleAuth} className="auth-form">
                 <div className="form-group">
                   <label htmlFor="serverHost">Server URL</label>
@@ -1501,6 +1673,7 @@ function App() {
                   )}
                 </button>
               </form>
+              )}
             </div>
           </div>
         ) : (
@@ -1553,6 +1726,17 @@ function App() {
                       <polyline points="2 12 12 17 22 12" />
                     </svg>
                     {t('TURN Servers')}
+                  </button>
+                  <button
+                    className={`nav-tab ${activeTab === 'install_agents' ? 'active' : ''}`}
+                    onClick={() => setActiveTab('install_agents')}
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                      <polyline points="7 10 12 15 17 10" />
+                      <line x1="12" y1="15" x2="12" y2="3" />
+                    </svg>
+                    {t('Install agents')}
                   </button>
                 </div>
               )}
@@ -1853,6 +2037,12 @@ function App() {
                             </div>
                           </div>
                         </div>
+                        {userRole === 'admin' && (
+                          <div className="setup-panel-install">
+                            <span>{t('Installing many computers? Create an install token and paste one command on each.')}</span>
+                            <button type="button" className="btn-secondary" onClick={() => setActiveTab('install_agents')}>{t('Install agents')}</button>
+                          </div>
+                        )}
                       </details>
 
                       {hostsError && (
@@ -1876,8 +2066,81 @@ function App() {
                           <p className="empty-hint">{t('Agents will appear here automatically once they connect.')}</p>
                         </div>
                       ) : (
-                        <div className="hosts-card-grid">
-                          {cards.map((card) => {
+                        <>
+                        {/* Search, the type of computer, how many, grid or list. */}
+                        <div className="computer-finder">
+                          <div className="finder-search">
+                            {cardIcon(<><circle cx="11" cy="11" r="7" /><path d="M20 20l-4-4" /></>, 15)}
+                            <input
+                              type="search"
+                              value={computerSearch}
+                              placeholder={t('Search by name or address')}
+                              aria-label={t('Search computers')}
+                              onChange={(e) => setComputerSearch(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Escape' && computerSearch) { e.preventDefault(); e.stopPropagation(); setComputerSearch(''); }
+                              }}
+                            />
+                            {computerSearch && (
+                              <button type="button" className="finder-clear" title={t('Clear search')} aria-label={t('Clear search')} onClick={() => setComputerSearch('')}>
+                                {cardIcon(<path d="M6 6l12 12M18 6L6 18" />, 14)}
+                              </button>
+                            )}
+                          </div>
+                          {cardTypeList.length > 1 && (
+                            <div className="type-chips" role="radiogroup" aria-label={t('Type of computer')}>
+                              {[{ id: '', name: t('All') }, ...cardTypeList].map((type) => (
+                                <button
+                                  key={type.id || '*'}
+                                  type="button"
+                                  role="radio"
+                                  aria-checked={type.id === typeFilter}
+                                  className={`type-chip${type.id === typeFilter ? ' selected' : ''}`}
+                                  onClick={() => chooseType(type.id)}
+                                >
+                                  {type.id && <TypeMark id={type.id} name={type.name} small />}
+                                  <span>{type.name}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          <div className="finder-end">
+                            <span className="computer-count" aria-live="polite">
+                              {shownCards.length === cards.length
+                                ? (cards.length === 1 ? t('1 computer') : t('%1 computers', cards.length))
+                                : t('%1 of %2 computers', shownCards.length, cards.length)}
+                            </span>
+                            <div className="view-toggle" role="radiogroup" aria-label={t('View')}>
+                              {(['grid', 'list'] as const).map((view) => (
+                                <button
+                                  key={view}
+                                  type="button"
+                                  role="radio"
+                                  aria-checked={computerView === view}
+                                  className={computerView === view ? 'selected' : ''}
+                                  title={t(view === 'grid' ? 'Grid' : 'List')}
+                                  aria-label={t(view === 'grid' ? 'Grid' : 'List')}
+                                  onClick={() => chooseView(view)}
+                                >
+                                  {view === 'grid'
+                                    ? cardIcon(<><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></>)
+                                    : cardIcon(<><path d="M9 6h11M9 12h11M9 18h11" /><path d="M4.5 6h.01M4.5 12h.01M4.5 18h.01" /></>)}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+
+                        {shownCards.length === 0 ? (
+                          <div className="empty-card no-match">
+                            <div className="empty-icon" aria-hidden="true">{cardIcon(<><circle cx="11" cy="11" r="7" /><path d="M20 20l-4-4" /></>, 30)}</div>
+                            <h3>{t('No computer matches')}</h3>
+                            <p>{t('Try other words, or show every type.')}</p>
+                            <button type="button" className="btn-secondary" onClick={clearFinding}>{t('Clear search and filter')}</button>
+                          </div>
+                        ) : (
+                        <div className={computerView === 'list' ? 'hosts-card-grid hosts-card-list' : 'hosts-card-grid'}>
+                          {shownCards.map((card) => {
                             const method = methodOf(card);
                             if (!method) return null;
                             const host = method.host;
@@ -1897,6 +2160,8 @@ function App() {
                                 className={`host-card ${card.host ? '' : 'source-card '}${status.toLowerCase()} ${isOnline ? 'clickable-host-card' : ''}`}
                                 onClick={() => connectWith(card, method)}
                               >
+                                {/* (The list's row starts with the type of the way chosen.) */}
+                                <span className="host-card-lead"><TypeMark id={methodType(method)} name={method.label} /></span>
                                 <div className="host-card-header">
                                   <div className="source-card-title">
                                     <h3 className="host-name">{card.title}</h3>
@@ -2097,6 +2362,8 @@ function App() {
                             );
                           })}
                         </div>
+                        )}
+                        </>
                       )}
                     </>
                   )}
@@ -2110,6 +2377,9 @@ function App() {
               )}
               {activeTab === 'turn_servers' && (
                 <AdminTurnServers token={token!} getBackendHost={getBackendHost} getBackendProtocol={getBackendProtocol} />
+              )}
+              {activeTab === 'install_agents' && userRole === 'admin' && (
+                <AdminInstallAgents token={token!} getBackendHost={getBackendHost} getBackendProtocol={getBackendProtocol} />
               )}
             </div>
           </div>
@@ -2130,6 +2400,17 @@ function App() {
           hostName={filesSource.name}
           wsUrl={`${getBackendProtocol().ws}//${getBackendHost()}/ws/client?token=${encodeURIComponent(token)}`}
           onClose={() => setFilesSource(null)}
+        />
+      )}
+      {showAccountSecurity && token && (
+        <AccountSecurity
+          token={token}
+          username={username || ''}
+          server={localStorage.getItem('lunaris_server_host') || getCurrentBrowserServerUrl()}
+          apiBase={() => `${getBackendProtocol().http}//${getBackendHost()}`}
+          onClose={() => setShowAccountSecurity(false)}
+          onToken={(next) => { localStorage.setItem('lunaris_token', next); setToken(next); }}
+          onSessionEnded={() => { setShowAccountSecurity(false); handleLogout(); }}
         />
       )}
       {linkRequest && (
@@ -2221,7 +2502,7 @@ function App() {
       {addHostOpen && (
         <div className="host-confirm-overlay add-host-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget && !addHostBusy && !sourceSetup) closeAddHost(); }}>
           <form
-            className="host-confirm-card add-host-card"
+            className={`host-confirm-card add-host-card${hasTypeRail ? ' has-rail' : ''}`}
             role="dialog"
             aria-modal="true"
             aria-labelledby="addHostTitle"
@@ -2257,12 +2538,12 @@ function App() {
                 )}
               </div>
             )}
-            {!sourceSetup && !editSource && (
-              <div className="form-group">
-                {dialogTypes.length > 1 && (
-                  <>
+            {!sourceSetup && (
+              <div className="add-host-main">
+                {hasTypeRail && (
+                  <div className="form-group type-rail">
                     <span className="option-group-label" id="addHostTypeLabel">{t('Type')}</span>
-                    {/* Every type in sight, side by side: its logo and its short name. */}
+                    {/* Every type in sight: its logo and its short name, a list beside the form on a wide window. */}
                     <div className="type-tiles" id="addHostType" role="radiogroup" aria-labelledby="addHostTypeLabel">
                       {dialogTypes.map(type => (
                         <button
@@ -2281,175 +2562,193 @@ function App() {
                         </button>
                       ))}
                     </div>
-                  </>
-                )}
-                {/* What the chosen type is and says about itself (in its connector's words), once. */}
-                {dialogType && (
-                  <p className="type-note" id="addHostTypeNote">
-                    <strong>{t(dialogType.name)}</strong>
-                    {dialogType.note ? <span>{t(dialogType.note)}</span> : null}
-                  </p>
-                )}
-              </div>
-            )}
-            {!sourceSetup && !sourceDialog && (
-              <div className="form-grid">
-                <div className="form-group span-3">
-                  <label htmlFor="addHostAddress">{t('Address')}</label>
-                  <input
-                    id="addHostAddress"
-                    autoFocus
-                    placeholder={t('e.g. 192.168.1.20')}
-                    value={addHostAddress}
-                    onChange={(e) => setAddHostAddress(e.target.value)}
-                    autoComplete="off"
-                  />
-                </div>
-                <div className="form-group span-3">
-                  <label htmlFor="addHostPassword">{t('Password (optional)')}</label>
-                  <input
-                    id="addHostPassword"
-                    type="password"
-                    value={addHostPassword}
-                    onChange={(e) => setAddHostPassword(e.target.value)}
-                    autoComplete="new-password"
-                  />
-                </div>
-                <span className="form-hint span-6">{t('Without the password, the person at that computer is asked to accept each connection.')}</span>
-              </div>
-            )}
-            {!sourceSetup && sourceDialog && (
-              <div className="form-grid">
-                <div className={`form-group ${!editSource && throughBesideName ? 'span-3' : 'span-6'}`}>
-                  <label htmlFor="sourceName">{t('Name')}</label>
-                  <input
-                    id="sourceName"
-                    value={sourceName}
-                    onChange={(e) => setSourceName(e.target.value)}
-                    autoComplete="off"
-                    maxLength={100}
-                  />
-                </div>
-                {!editSource && (
-                  <div className={`form-group ${throughBesideName ? 'span-3' : 'span-6'}`}>
-                    {/* A few to choose from: all in sight. Many: a list to open. */}
-                    {dialogHosts.length <= MAX_OPTION_CARDS ? (
-                      <>
-                        <span className="option-group-label" id="sourceHostLabel">{t('Through which Lunaris computer')}</span>
-                        <div className="option-cards compact" id="sourceHost" role="radiogroup" aria-labelledby="sourceHostLabel">
-                          {dialogHosts.map(h => (
-                            <button
-                              key={h.host_id}
-                              type="button"
-                              role="radio"
-                              aria-checked={sourceHostId === h.host_id}
-                              className={`option-card${sourceHostId === h.host_id ? ' selected' : ''}`}
-                              onClick={() => chooseSourceHost(h.host_id)}
-                            >
-                              <span className="option-card-name">{h.host_name}</span>
-                            </button>
-                          ))}
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <label htmlFor="sourceHost">{t('Through which Lunaris computer')}</label>
-                        <select id="sourceHost" value={sourceHostId} onChange={(e) => chooseSourceHost(e.target.value)}>
-                          {dialogHosts.map(h => <option key={h.host_id} value={h.host_id}>{h.host_name}</option>)}
-                        </select>
-                      </>
-                    )}
                   </div>
                 )}
-                {!editSource && (
-                  <span className="form-hint span-6">{t('That computer must be on the same network as the computer being added.')}</span>
-                )}
-                {editSource && (
-                  <span className="form-hint span-6">
-                    {dialogConnector
-                      ? t('Leave a field empty to keep it.')
-                      : t('Only the name can be changed while %1 is offline.', editSource.host_name)}
-                  </span>
-                )}
-                {layoutFields(dialogConnector?.fields || []).map(({ field, span }) => {
-                  const choices = choicesOf(field);
-                  const label = (
-                    <>
-                      {t(field.label || field.key)}
-                      {!editSource && !field.required && !field.default ? ` ${t('(optional)')}` : ''}
-                    </>
-                  );
-                  // One of a few: options to press, not a box to type in.
-                  if (choices.length > 0) {
-                    return (
-                      <div className={`form-group span-${span}`} key={field.key}>
-                        <span className="option-group-label" id={`sourceFieldLabel-${field.key}`}>{label}</span>
-                        <div className="option-cards compact" id={`sourceField-${field.key}`} role="radiogroup" aria-labelledby={`sourceFieldLabel-${field.key}`}>
-                          {choices.map(choice => (
-                            <button
-                              key={choice.value}
-                              type="button"
-                              role="radio"
-                              aria-checked={(sourceValues[field.key] ?? '') === choice.value}
-                              data-value={choice.value}
-                              className={`option-card${(sourceValues[field.key] ?? '') === choice.value ? ' selected' : ''}`}
-                              onClick={() => setSourceValues((current) => ({ ...current, [field.key]: choice.value }))}
-                            >
-                              <span className="option-card-name">{t(choice.label)}</span>
-                            </button>
-                          ))}
-                        </div>
+                <div className="add-host-body">
+                  {/* What the chosen type is and says about itself (in its connector's words), once. */}
+                  {!editSource && dialogType && (
+                    <p className="type-note" id="addHostTypeNote">
+                      <strong>{t(dialogType.name)}</strong>
+                      {dialogType.note ? <span>{t(dialogType.note)}</span> : null}
+                    </p>
+                  )}
+                  {!sourceDialog && (
+                    <div className="form-grid">
+                      <div className="form-group span-3">
+                        <label htmlFor="addHostAddress">{t('Address')}</label>
+                        <input
+                          id="addHostAddress"
+                          autoFocus
+                          placeholder={t('e.g. 192.168.1.20')}
+                          value={addHostAddress}
+                          onChange={(e) => setAddHostAddress(e.target.value)}
+                          autoComplete="off"
+                        />
                       </div>
-                    );
-                  }
-                  return (
-                    <div className={`form-group span-${span}`} key={field.key}>
-                      <label htmlFor={`sourceField-${field.key}`}>{label}</label>
-                      <input
-                        id={`sourceField-${field.key}`}
-                        type={field.kind === 'secret' ? 'password' : field.kind === 'port' ? 'number' : 'text'}
-                        inputMode={field.kind === 'port' ? 'numeric' : undefined}
-                        min={field.kind === 'port' ? 1 : undefined}
-                        max={field.kind === 'port' ? 65535 : undefined}
-                        value={sourceValues[field.key] ?? ''}
-                        onChange={(e) => setSourceValues((current) => ({ ...current, [field.key]: e.target.value }))}
-                        autoComplete={field.kind === 'secret' ? 'new-password' : 'off'}
-                      />
+                      <div className="form-group span-3">
+                        <label htmlFor="addHostPassword">{t('Password (optional)')}</label>
+                        <input
+                          id="addHostPassword"
+                          type="password"
+                          value={addHostPassword}
+                          onChange={(e) => setAddHostPassword(e.target.value)}
+                          autoComplete="new-password"
+                        />
+                      </div>
+                      <span className="form-hint span-6">{t('Without the password, the person at that computer is asked to accept each connection.')}</span>
                     </div>
-                  );
-                })}
-              </div>
-            )}
-            {!sourceSetup && editSource && (sameChoices.length > 0 || editSameWas) && (
-              <div className="form-group">
-                <span className="option-group-label" id="sourceSameLabel">{t('Same computer as')}</span>
-                <div className="option-cards compact scroll" id="sourceSame" role="radiogroup" aria-labelledby="sourceSameLabel">
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={editSame === ''}
-                    className={`option-card${editSame === '' ? ' selected' : ''}`}
-                    onClick={() => setEditSame('')}
-                  >
-                    <span className="option-card-name">{t('A computer of its own')}</span>
-                  </button>
-                  {sameChoices.map(card => (
-                    <button
-                      key={card.key}
-                      type="button"
-                      role="radio"
-                      aria-checked={editSame === card.key}
-                      className={`option-card${editSame === card.key ? ' selected' : ''}`}
-                      onClick={() => setEditSame(card.key)}
-                    >
-                      <span className="option-card-name">{card.title}</span>
-                    </button>
-                  ))}
+                  )}
+                  {sourceDialog && (
+                    <div className="form-grid">
+                      <div className={`form-group ${!editSource && throughBesideName ? 'span-3' : 'span-6'}`}>
+                        <label htmlFor="sourceName">{t('Name')}</label>
+                        <input
+                          id="sourceName"
+                          value={sourceName}
+                          onChange={(e) => setSourceName(e.target.value)}
+                          autoComplete="off"
+                          maxLength={100}
+                        />
+                      </div>
+                      {!editSource && (
+                        <div className={`form-group ${throughBesideName ? 'span-3' : 'span-6'}`}>
+                          {/* A few to choose from: all in sight. Many: a list to open. */}
+                          {dialogHosts.length <= MAX_OPTION_CARDS ? (
+                            <>
+                              <span className="option-group-label" id="sourceHostLabel">{t('Through which Lunaris computer')}</span>
+                              <div className="option-cards compact" id="sourceHost" role="radiogroup" aria-labelledby="sourceHostLabel">
+                                {dialogHosts.map(h => (
+                                  <button
+                                    key={h.host_id}
+                                    type="button"
+                                    role="radio"
+                                    aria-checked={sourceHostId === h.host_id}
+                                    className={`option-card${sourceHostId === h.host_id ? ' selected' : ''}`}
+                                    onClick={() => chooseSourceHost(h.host_id)}
+                                  >
+                                    <span className="option-card-name">{h.host_name}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <label htmlFor="sourceHost">{t('Through which Lunaris computer')}</label>
+                              <select id="sourceHost" value={sourceHostId} onChange={(e) => chooseSourceHost(e.target.value)}>
+                                {dialogHosts.map(h => <option key={h.host_id} value={h.host_id}>{h.host_name}</option>)}
+                              </select>
+                            </>
+                          )}
+                        </div>
+                      )}
+                      {!editSource && (
+                        <span className="form-hint span-6">{t('That computer must be on the same network as the computer being added.')}</span>
+                      )}
+                      {editSource && (
+                        <span className="form-hint span-6">
+                          {dialogConnector
+                            ? t('Leave a field empty to keep it.')
+                            : t('Only the name can be changed while %1 is offline.', editSource.host_name)}
+                        </span>
+                      )}
+                      {layoutFields(dialogConnector?.fields || []).map(({ field, span }) => {
+                        const choices = choicesOf(field);
+                        const label = (
+                          <>
+                            {t(field.label || field.key)}
+                            {!editSource && !field.required && !field.default ? ` ${t('(optional)')}` : ''}
+                          </>
+                        );
+                        // Many, or long ones: a list to open, like the boxes around it.
+                        if (choices.length > 0 && choiceAsList(field)) {
+                          return (
+                            <div className={`form-group span-${span}`} key={field.key}>
+                              <label htmlFor={`sourceField-${field.key}`}>{label}</label>
+                              <select
+                                id={`sourceField-${field.key}`}
+                                value={sourceValues[field.key] ?? ''}
+                                onChange={(e) => setSourceValues((current) => ({ ...current, [field.key]: e.target.value }))}
+                              >
+                                {!choices.some(choice => choice.value === (sourceValues[field.key] ?? '')) && <option value={sourceValues[field.key] ?? ''} disabled hidden />}
+                                {choices.map(choice => <option key={choice.value} value={choice.value}>{t(choice.label)}</option>)}
+                              </select>
+                            </div>
+                          );
+                        }
+                        // One of a few: options to press, not a box to type in.
+                        if (choices.length > 0) {
+                          return (
+                            <div className={`form-group span-${span}`} key={field.key}>
+                              <span className="option-group-label" id={`sourceFieldLabel-${field.key}`}>{label}</span>
+                              <div className="option-cards compact" id={`sourceField-${field.key}`} role="radiogroup" aria-labelledby={`sourceFieldLabel-${field.key}`}>
+                                {choices.map(choice => (
+                                  <button
+                                    key={choice.value}
+                                    type="button"
+                                    role="radio"
+                                    aria-checked={(sourceValues[field.key] ?? '') === choice.value}
+                                    data-value={choice.value}
+                                    className={`option-card${(sourceValues[field.key] ?? '') === choice.value ? ' selected' : ''}`}
+                                    onClick={() => setSourceValues((current) => ({ ...current, [field.key]: choice.value }))}
+                                  >
+                                    <span className="option-card-name">{t(choice.label)}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        }
+                        return (
+                          <div className={`form-group span-${span}`} key={field.key}>
+                            <label htmlFor={`sourceField-${field.key}`}>{label}</label>
+                            <input
+                              id={`sourceField-${field.key}`}
+                              type={field.kind === 'secret' ? 'password' : field.kind === 'port' ? 'number' : 'text'}
+                              inputMode={field.kind === 'port' ? 'numeric' : undefined}
+                              min={field.kind === 'port' ? 1 : undefined}
+                              max={field.kind === 'port' ? 65535 : undefined}
+                              value={sourceValues[field.key] ?? ''}
+                              onChange={(e) => setSourceValues((current) => ({ ...current, [field.key]: e.target.value }))}
+                              autoComplete={field.kind === 'secret' ? 'new-password' : 'off'}
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {editSource && (sameChoices.length > 0 || editSameWas) && (
+                    <div className="form-group">
+                      <span className="option-group-label" id="sourceSameLabel">{t('Same computer as')}</span>
+                      <div className="option-cards compact scroll" id="sourceSame" role="radiogroup" aria-labelledby="sourceSameLabel">
+                        <button
+                          type="button"
+                          role="radio"
+                          aria-checked={editSame === ''}
+                          className={`option-card${editSame === '' ? ' selected' : ''}`}
+                          onClick={() => setEditSame('')}
+                        >
+                          <span className="option-card-name">{t('A computer of its own')}</span>
+                        </button>
+                        {sameChoices.map(card => (
+                          <button
+                            key={card.key}
+                            type="button"
+                            role="radio"
+                            aria-checked={editSame === card.key}
+                            className={`option-card${editSame === card.key ? ' selected' : ''}`}
+                            onClick={() => setEditSame(card.key)}
+                          >
+                            <span className="option-card-name">{card.title}</span>
+                          </button>
+                        ))}
+                      </div>
+                      <span className="form-hint">{t('Computers that are the same machine are shown as one, with a way to connect for each.')}</span>
+                    </div>
+                  )}
+                  {addHostError && <div className="add-host-error" role="alert" ref={addHostErrorRef}>{addHostError}</div>}
                 </div>
-                <span className="form-hint">{t('Computers that are the same machine are shown as one, with a way to connect for each.')}</span>
               </div>
             )}
-            {!sourceSetup && addHostError && <div className="add-host-error" role="alert" ref={addHostErrorRef}>{addHostError}</div>}
             {sourceSetup ? (
               <div className="host-confirm-actions">
                 {sourceSetup.failed && (

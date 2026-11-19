@@ -61,6 +61,10 @@ const MAX_ANNOUNCED: usize = 200;
 pub struct Announced {
     pub connectors: Vec<ConnectorInfoMsg>,
     pub manageable: bool,
+    /// source id -> whether that computer answered its agent's last check
+    /// (`SourceInfoMsg::online`). A source that is not in it is not known
+    /// to be away: it is listed as online while its agent is.
+    pub reachable: HashMap<String, bool>,
 }
 
 /// How long a set-up is known here: longer than an agent keeps one (5
@@ -146,7 +150,8 @@ pub(crate) async fn announced(
         // A host that is not in the list (yet) has no sources either.
         warn!("The sources of {} could not be saved: {}", agent_id, e);
     }
-    state.sources.announced.write().unwrap().insert(agent_id.to_string(), Announced { connectors, manageable });
+    let reachable = sources.iter().filter_map(|source| Some((source.id.clone(), source.online?))).collect();
+    state.sources.announced.write().unwrap().insert(agent_id.to_string(), Announced { connectors, manageable, reachable });
 }
 
 /// An agent answered a change. Only the agent that was asked is believed.
@@ -187,7 +192,14 @@ struct SourceEntry {
     name: String,
     connector: String,
     connector_name: String,
+    /// Whether it can be connected to now: its agent is connected and has
+    /// not found the computer away (`reachable`).
     online: bool,
+    /// Whether the computer itself answered its agent's last check. Left
+    /// out when that is not known (the agent is away, has not checked yet,
+    /// cannot check it, or is from before the checks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reachable: Option<bool>,
     /// What its connector can do, as its agent says while it is connected.
     /// Left out when that is not known (the agent is away or from before
     /// this): a client then offers what it always offered.
@@ -240,16 +252,23 @@ pub async fn list_sources(user: crate::auth::AuthenticatedUser, State(state): St
     let entries: Vec<SourceEntry> = rows
         .into_iter()
         .filter(|row| access.allows(&row.0))
-        .map(|(host_id, host_name, id, name, connector, connector_name, group)| SourceEntry {
-            group: group_for(&access, group),
-            capabilities: announced.get(&host_id).and_then(|a| a.connectors.iter().find(|c| c.id == connector)).and_then(|c| c.capabilities),
-            online: online.contains_key(&host_id),
-            host_id,
-            host_name,
-            id,
-            name,
-            connector,
-            connector_name,
+        .map(|(host_id, host_name, id, name, connector, connector_name, group)| {
+            let agent_online = online.contains_key(&host_id);
+            let reachable = announced.get(&host_id).filter(|_| agent_online).and_then(|a| a.reachable.get(&id).copied());
+            SourceEntry {
+                group: group_for(&access, group),
+                capabilities: announced.get(&host_id).and_then(|a| a.connectors.iter().find(|c| c.id == connector)).and_then(|c| c.capabilities),
+                // The computer of the source, not only the one it is reached
+                // through: one that is shut down is offline.
+                online: agent_online && reachable != Some(false),
+                reachable,
+                host_id,
+                host_name,
+                id,
+                name,
+                connector,
+                connector_name,
+            }
         })
         .collect();
     Json(entries).into_response()
@@ -531,7 +550,7 @@ mod tests {
     }
 
     fn source(id: &str, name: &str) -> SourceInfoMsg {
-        SourceInfoMsg { id: id.into(), name: name.into(), connector: "rustdesk".into(), group: None }
+        SourceInfoMsg { id: id.into(), name: name.into(), connector: "rustdesk".into(), group: None, online: None }
     }
 
     async fn body(response: impl IntoResponse) -> (StatusCode, serde_json::Value) {
@@ -908,6 +927,61 @@ mod tests {
         assert_eq!(old_form.group, None);
     }
 
+    fn checked(id: &str, name: &str, online: Option<bool>) -> SourceInfoMsg {
+        SourceInfoMsg { online, ..source(id, name) }
+    }
+
+    /// A source whose computer is shut down is offline although the
+    /// Lunaris computer it is reached through is online.
+    #[tokio::test]
+    async fn a_source_is_online_only_when_its_computer_answers() {
+        let state = state().await;
+        let _h1 = connect(&state, "h1");
+        announced(&state, "h1", vec![checked("a-off", "A off", Some(false)), checked("b-on", "B on", Some(true)), checked("c-new", "C unknown", None)], vec![rustdesk()], true).await;
+        let status = |list: &serde_json::Value| -> Vec<(String, bool, Option<bool>)> {
+            list.as_array().unwrap().iter().map(|s| (s["id"].as_str().unwrap().to_string(), s["online"].as_bool().unwrap(), s["reachable"].as_bool())).collect()
+        };
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert_eq!(status(&list), [("a-off".into(), false, Some(false)), ("b-on".into(), true, Some(true)), ("c-new".into(), true, None)]);
+        // Not known is not said at all (as before the checks).
+        assert!(list[2].get("reachable").is_none());
+
+        // The next announcement (the agent's next check) changes it.
+        announced(&state, "h1", vec![checked("a-off", "A off", Some(true)), checked("b-on", "B on", Some(false)), checked("c-new", "C unknown", None)], vec![rustdesk()], true).await;
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert_eq!(status(&list), [("a-off".into(), true, Some(true)), ("b-on".into(), false, Some(false)), ("c-new".into(), true, None)]);
+
+        // Through the agent's connection, as the agent sends it.
+        crate::signaling::agent_message(&state, "h1", AgentMessage::Sources { sources: vec![checked("a-off", "A off", Some(false))], connectors: vec![rustdesk()], manageable: true }).await;
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert_eq!(status(&list), [("a-off".into(), false, Some(false))]);
+
+        // The agent goes away: all of its sources are offline, and what it
+        // last found is not told.
+        announced(&state, "h1", vec![checked("a-off", "A off", Some(true))], vec![rustdesk()], true).await;
+        state.agents.write().unwrap().remove("h1");
+        agent_gone(&state, "h1");
+        let (_, list) = body(list_sources(user("alice"), State(state.clone())).await).await;
+        assert_eq!(status(&list), [("a-off".into(), false, None)]);
+
+        // On the wire: an agent from before the checks says nothing (and is
+        // read as unknown), a new one says it only when it knows, and a
+        // server from before the checks reads a new agent's announcement.
+        let old: SourceInfoMsg = serde_json::from_str(r#"{"id":"a","name":"A","connector":"rustdesk"}"#).unwrap();
+        assert_eq!(old.online, None);
+        assert_eq!(serde_json::to_string(&checked("a", "A", None)).unwrap(), r#"{"id":"a","name":"A","connector":"rustdesk"}"#);
+        let told = serde_json::to_string(&checked("a", "A", Some(false))).unwrap();
+        assert_eq!(told, r#"{"id":"a","name":"A","connector":"rustdesk","online":false}"#);
+        #[derive(Deserialize)]
+        struct OldSource {
+            id: String,
+        }
+        assert_eq!(serde_json::from_str::<OldSource>(&told).unwrap().id, "a");
+        let announce: AgentMessage =
+            serde_json::from_str(r#"{"event":"Sources","data":{"sources":[{"id":"a","name":"A","connector":"rustdesk","online":true}],"connectors":[]}}"#).unwrap();
+        assert!(matches!(announce, AgentMessage::Sources { ref sources, .. } if sources[0].online == Some(true)));
+    }
+
     /// A database from before groups gets the column, and what it has stays.
     #[tokio::test]
     async fn an_older_database_gets_the_group_column() {
@@ -1011,7 +1085,7 @@ mod tests {
         let agent_state = state.clone();
         let agent = tokio::spawn(async move {
             let (request_id, _) = asked(&mut to_agent).await;
-            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::Sources { sources: vec![SourceInfoMsg { id: "den-pc-ab12".into(), name: "Den PC".into(), connector: "sunshine".into(), group: None }], connectors: vec![rustdesk()], manageable: true }).await;
+            crate::signaling::agent_message(&agent_state, "h1", AgentMessage::Sources { sources: vec![SourceInfoMsg { id: "den-pc-ab12".into(), name: "Den PC".into(), connector: "sunshine".into(), group: None, online: None }], connectors: vec![rustdesk()], manageable: true }).await;
             crate::signaling::agent_message(&agent_state, "h1", AgentMessage::SourceChanged { request_id, id: Some("den-pc-ab12".into()), error: None, setup: None }).await;
             to_agent
         });

@@ -49,6 +49,69 @@ pub enum PendingDashboardEvent {
         status: i32,
         body: String,
     },
+    /// The password was right and the account has two-factor sign-in on:
+    /// the code from the authenticator app is next (`login_mfa`).
+    MfaRequired {
+        server: String,
+        username: String,
+    },
+}
+
+/// The sign-in waiting for its two-factor code: server and mfa_token (kept
+/// here, out of QML; short-lived and single-use on the server).
+static PENDING_MFA: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// What POST /api/auth/login (or /api/auth/login/mfa) answered.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LoginAnswer {
+    Session { token: String, username: String },
+    Mfa { mfa_token: String, username: String },
+    Error(String),
+}
+
+pub(crate) fn parse_login_answer(ok: bool, text: &str, fallback_error: &str) -> LoginAnswer {
+    let value: serde_json::Value = serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
+    let field = |k: &str| value.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
+    if ok && value.get("mfa_required").and_then(|v| v.as_bool()) == Some(true) {
+        if let Some(mfa_token) = field("mfa_token") {
+            return LoginAnswer::Mfa { mfa_token, username: field("username").unwrap_or_default() };
+        }
+    }
+    if ok {
+        if let Some(token) = field("token") {
+            return LoginAnswer::Session { token, username: field("username").unwrap_or_default() };
+        }
+    }
+    LoginAnswer::Error(field("error").unwrap_or_else(|| fallback_error.to_string()))
+}
+
+/// Turns a sign-in answer into the events QML sees.
+fn finish_login(server: &str, answer: LoginAnswer) {
+    let event = match answer {
+        LoginAnswer::Session { token, username } => {
+            *PENDING_MFA.lock().unwrap() = None;
+            save_settings(server, &token, &username);
+            PendingDashboardEvent::LoginResult {
+                success: true,
+                error_msg: String::new(),
+                token,
+                username,
+                server: server.to_string(),
+            }
+        }
+        LoginAnswer::Mfa { mfa_token, username } => {
+            *PENDING_MFA.lock().unwrap() = Some((server.to_string(), mfa_token));
+            PendingDashboardEvent::MfaRequired { server: server.to_string(), username }
+        }
+        LoginAnswer::Error(error_msg) => PendingDashboardEvent::LoginResult {
+            success: false,
+            error_msg,
+            token: String::new(),
+            username: String::new(),
+            server: String::new(),
+        },
+    };
+    PENDING_EVENTS.lock().unwrap().push(event);
 }
 
 pub static PENDING_EVENTS: std::sync::Mutex<Vec<PendingDashboardEvent>> =
@@ -917,6 +980,11 @@ pub mod qobject {
             server: QString,
         );
 
+        /// The password was right; the account wants a code from its
+        /// authenticator app (answer with `login_mfa`).
+        #[qsignal]
+        fn mfa_required(self: Pin<&mut StreamBridge>, server: QString, username: QString);
+
         #[qsignal]
         fn hosts_result(
             self: Pin<&mut StreamBridge>,
@@ -1099,6 +1167,16 @@ pub mod qobject {
             password: QString,
         );
 
+        /// The second step of signing in: a code from the authenticator app,
+        /// or (`recovery`) one of the recovery codes. Answers with
+        /// `login_result`.
+        #[qinvokable]
+        fn login_mfa(self: Pin<&mut StreamBridge>, code: QString, recovery: bool);
+
+        /// Forgets a sign-in waiting for its code.
+        #[qinvokable]
+        fn cancel_mfa(self: Pin<&mut StreamBridge>);
+
         #[qinvokable]
         fn logout(self: Pin<&mut StreamBridge>);
 
@@ -1260,6 +1338,12 @@ pub mod qobject {
         /// the fields that are not secrets.
         #[qinvokable]
         fn bridge_sources(self: Pin<&mut StreamBridge>) -> QString;
+
+        /// Whether one of them answers (checked in the background, every
+        /// 15 seconds): 1 yes, 0 no (shut down, cannot be reached), -1 not
+        /// known (not checked yet, or nothing to check).
+        #[qinvokable]
+        fn bridge_source_online(self: Pin<&mut StreamBridge>, id: QString) -> i32;
 
         /// Adds one; `values_json` is `{"<field key>": "<value>"}`. Returns
         /// `{"id": ...}` or `{"error": ...}`, or, when its type has a set-up
@@ -2027,46 +2111,9 @@ impl qobject::StreamBridge {
 
             match res {
                 Ok(resp) => {
-                    let status = resp.status();
+                    let ok = resp.status().is_success();
                     let text = resp.text().await.unwrap_or_default();
-                    if status.is_success() {
-                        if let Ok(data) = serde_json::from_str::<common::AuthResponse>(&text) {
-                            save_settings(&server_str, &data.token, &data.username);
-
-                            PENDING_EVENTS.lock().unwrap().push(
-                                PendingDashboardEvent::LoginResult {
-                                    success: true,
-                                    error_msg: "".to_string(),
-                                    token: data.token,
-                                    username: data.username,
-                                    server: server_str,
-                                },
-                            );
-                            return;
-                        }
-                    }
-
-                    let err_msg =
-                        if let Ok(err_data) = serde_json::from_str::<serde_json::Value>(&text) {
-                            err_data
-                                .get("error")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Login failed")
-                                .to_string()
-                        } else {
-                            "Login failed".to_string()
-                        };
-
-                    PENDING_EVENTS
-                        .lock()
-                        .unwrap()
-                        .push(PendingDashboardEvent::LoginResult {
-                            success: false,
-                            error_msg: err_msg,
-                            token: "".to_string(),
-                            username: "".to_string(),
-                            server: "".to_string(),
-                        });
+                    finish_login(&server_str, parse_login_answer(ok, &text, "Login failed"));
                 }
                 Err(e) => {
                     let err_msg = format!("Connection failed: {}", e);
@@ -2085,7 +2132,47 @@ impl qobject::StreamBridge {
         });
     }
 
+    pub fn login_mfa(self: Pin<&mut Self>, code: QString, recovery: bool) {
+        let code = code.to_string().trim().to_string();
+        let Some((server_str, mfa_token)) = PENDING_MFA.lock().unwrap().clone() else {
+            finish_login("", LoginAnswer::Error("This sign-in has expired. Sign in again.".into()));
+            return;
+        };
+        let body = if recovery {
+            serde_json::json!({ "mfa_token": mfa_token, "recovery_code": code })
+        } else {
+            let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+            serde_json::json!({ "mfa_token": mfa_token, "code": digits })
+        };
+        let mut rust_obj = self.rust_mut();
+        let rt = rust_obj.get_or_init_runtime();
+        rt.spawn(async move {
+            let res = reqwest::Client::new()
+                .post(format!("{}/api/auth/login/mfa", server_str))
+                .json(&body)
+                .send()
+                .await;
+            let answer = match res {
+                Ok(resp) => {
+                    let ok = resp.status().is_success();
+                    let text = resp.text().await.unwrap_or_default();
+                    parse_login_answer(ok, &text, "Wrong code")
+                }
+                Err(e) => LoginAnswer::Error(format!("Connection failed: {}", e)),
+            };
+            if matches!(&answer, LoginAnswer::Error(e) if e.starts_with("This sign-in has expired")) {
+                *PENDING_MFA.lock().unwrap() = None;
+            }
+            finish_login(&server_str, answer);
+        });
+    }
+
+    pub fn cancel_mfa(self: Pin<&mut Self>) {
+        *PENDING_MFA.lock().unwrap() = None;
+    }
+
     pub fn logout(self: Pin<&mut Self>) {
+        *PENDING_MFA.lock().unwrap() = None;
         clear_settings();
     }
 
@@ -2789,6 +2876,11 @@ impl qobject::StreamBridge {
                         .login_result(success, err_qstr, tok_qstr, user_qstr, srv_qstr);
                 }
 
+                PendingDashboardEvent::MfaRequired { server, username } => {
+                    self.as_mut()
+                        .mfa_required(QString::from(&server), QString::from(&username));
+                }
+
                 PendingDashboardEvent::HostsResult {
                     success,
                     error_msg,
@@ -3075,6 +3167,10 @@ impl qobject::StreamBridge {
 
     pub fn bridge_sources(self: Pin<&mut Self>) -> QString {
         QString::from(&crate::own_computers::sources_json())
+    }
+
+    pub fn bridge_source_online(self: Pin<&mut Self>, id: QString) -> i32 {
+        crate::own_computers::source_online(&id.to_string())
     }
 
     pub fn bridge_add_source(self: Pin<&mut Self>, name: QString, connector: QString, values_json: QString) -> QString {
@@ -6048,5 +6144,33 @@ mod host_cursor_tests {
         let cursor = take(r#"{"type":"host_cursor","x":10,"y":20,"visible":true,"kind":"arrow","in_window_move_size":true,"pointer_maybe_in_picture":true}"#);
         assert!(!cursor.pointer_always_in_picture);
         assert!(cursor.in_window_move_size && cursor.pointer_maybe_in_picture);
+    }
+}
+
+#[cfg(test)]
+mod login_answer_tests {
+    use super::{parse_login_answer, LoginAnswer};
+
+    #[test]
+    fn session_mfa_and_errors() {
+        assert_eq!(
+            parse_login_answer(true, r#"{"token":"t","username":"alice","role":"user"}"#, "Login failed"),
+            LoginAnswer::Session { token: "t".into(), username: "alice".into() }
+        );
+        // Two-factor on: never a session, whatever else is in the answer.
+        assert_eq!(
+            parse_login_answer(true, r#"{"mfa_required":true,"mfa_token":"m","username":"alice","expires_in":300}"#, "x"),
+            LoginAnswer::Mfa { mfa_token: "m".into(), username: "alice".into() }
+        );
+        assert_eq!(
+            parse_login_answer(true, r#"{"mfa_required":true}"#, "Login failed"),
+            LoginAnswer::Error("Login failed".into())
+        );
+        assert_eq!(
+            parse_login_answer(false, r#"{"error":"Wrong code"}"#, "x"),
+            LoginAnswer::Error("Wrong code".into())
+        );
+        assert_eq!(parse_login_answer(false, r#"{"token":"t"}"#, "No"), LoginAnswer::Error("No".into()));
+        assert_eq!(parse_login_answer(true, "<html>", "Login failed"), LoginAnswer::Error("Login failed".into()));
     }
 }

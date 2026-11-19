@@ -12,7 +12,9 @@ AbstractButton {
     property bool chosen: false
     // No square with an initial (a plain list of names).
     property bool plain: false
-    implicitHeight: Math.max(36, column.implicitHeight + 14)
+    // As high as an InputField (40), so that the options and the boxes of a
+    // row of a form stand level.
+    implicitHeight: Math.max(40, column.implicitHeight + 14)
     implicitWidth: 200
     hoverEnabled: true
     activeFocusOnTab: true

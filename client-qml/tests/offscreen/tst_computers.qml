@@ -41,6 +41,9 @@ Item {
         function start(language, prepare, theme) {
             homeLoader.active = false;
             test.lang = language;
+            // (A singleton: back to how a first start has it.)
+            ViewPrefs.computerView = "grid";
+            ViewPrefs.computerType = "";
             bridge.startOver();
             bridge.stores = {
                 app_settings: JSON.stringify({ theme: theme || "dark", language: language }),
@@ -670,6 +673,201 @@ Item {
             ];
         }
 
+        // ---- Finding a computer: Cards.js, the same cases as the web
+        // client's tests (web/tests/computerCards.test.ts) ----
+        function findCards() {
+            var src = function (id, name, connector, over) {
+                return Object.assign({ host_id: "h1", host_name: "Office PC", id: id, name: name, connector: connector,
+                    connector_name: connector === "rustdesk" ? "RustDesk (by IP address)" : connector === "sunshine" ? "Sunshine / GameStream" : connector,
+                    online: true }, over || {});
+            };
+            return Cards.buildCards(
+                [{ id: "h1", name: "Máy văn phòng", status: "Online", address: "192.168.1.20:8091" }, { id: "h2", name: "Lab PC", status: "Offline" }],
+                [src("rd-1", "Đức laptop", "rustdesk", { group: "host:h1" }),
+                 src("sun-1", "Den PC", "sunshine", { host_name: "Gateway" }),
+                 src("vnc-1", "Kiosk", "vnc", { connector_name: "VNC (screen sharing)" }),
+                 src("odd-1", "Press room", "acme-view", { connector_name: "Acme Viewer" })]);
+        }
+
+        function test_find() {
+            compare(Cards.foldText("Máy Đức ổ"), "may duc o");
+            compare(Cards.foldText(undefined), "");
+            var cards = findCards();
+            var titles = function (q, type) { return Cards.filterCards(cards, q, type || "").map(function (c) { return c.title; }); };
+            // Search: names, addresses and the names of sources, accents aside
+            compare(titles("may"), ["Máy văn phòng"]);
+            compare(titles("MÁY VĂN"), ["Máy văn phòng"]);
+            compare(titles("duc"), ["Máy văn phòng"], "a source on the card is found");
+            compare(titles("192.168.1.20"), ["Máy văn phòng"]);
+            compare(titles("gateway"), ["Den PC"]);
+            compare(titles("kiosk vnc"), ["Kiosk"], "every word must be found");
+            compare(titles("kiosk rustdesk"), []);
+            compare(titles("   ").length, 5);
+            // Types: known ones first, unknown ones kept
+            compare(Cards.typesOf(cards).map(function (t) { return t.id; }), ["lunaris", "rustdesk", "sunshine", "acme-view", "vnc"]);
+            compare(Cards.typesOf(cards).map(function (t) { return t.name; }), ["Lunaris", "RustDesk", "Sunshine", "Acme Viewer", "VNC"]);
+            compare(Cards.cardTypes(cards[0]), ["lunaris", "rustdesk"]);
+            compare(Cards.typesOf([]), []);
+            // Filter: a grouped card matches if any of its ways is of the type
+            compare(titles("", "rustdesk"), ["Máy văn phòng"]);
+            compare(titles("", "lunaris"), ["Máy văn phòng", "Lab PC"]);
+            compare(titles("", "acme-view"), ["Press room"]);
+            compare(titles("may", "sunshine"), []);
+            compare(titles("", "rdp"), []);
+            compare(Cards.effectiveType(Cards.typesOf(cards), "rdp"), "", "a remembered type that is gone is All");
+            compare(Cards.effectiveType(Cards.typesOf(cards), "vnc"), "vnc");
+            // Logos: the new types have one, an unknown type has none (its letter)
+            compare(Cards.typeLogo("rdp"), "logos/rdp.svg");
+            compare(Cards.typeLogo("vnc"), "logos/vnc.svg");
+            compare(Cards.typeLogo("acme-view"), "");
+            // The view and the type are remembered with this device's view settings
+            ViewPrefs.computerView = "list";
+            ViewPrefs.computerType = "rustdesk";
+            var saved = ViewPrefs.toJson();
+            ViewPrefs.computerView = "grid";
+            ViewPrefs.computerType = "";
+            ViewPrefs.fromJson(saved);
+            compare(ViewPrefs.computerView, "list");
+            compare(ViewPrefs.computerType, "rustdesk");
+            ViewPrefs.fromJson(JSON.stringify({ computerView: "table", computerType: "<b>" }));
+            compare(ViewPrefs.computerView, "list", "nonsense changes nothing");
+            compare(ViewPrefs.computerType, "rustdesk");
+            ViewPrefs.computerView = "grid";
+            ViewPrefs.computerType = "";
+        }
+
+        // More types for the finder's pictures: RDP and VNC (the logos of
+        // our own), an unknown type and a Vietnamese name.
+        function finderHome(stub) {
+            groupedHome(stub);
+            stub.ownSources = stub.ownSources.concat([
+                { id: "acct-rdp", name: "Máy kế toán", connector: "rdp", connector_name: "Remote Desktop (RDP)", values: { host: "192.168.1.61" } },
+                { id: "kiosk-vnc", name: "Kiosk sảnh", connector: "vnc", connector_name: "VNC", values: { host: "192.168.1.70" } }
+            ]);
+            var peers = JSON.parse(stub.stores.peers).peers.concat([
+                { address: "source:acct-rdp", name: "Máy kế toán", type: "rdp", sourceId: "acct-rdp", favorite: true, lastUsed: 55 },
+                { address: "source:kiosk-vnc", name: "Kiosk sảnh", type: "vnc", sourceId: "kiosk-vnc", favorite: false, lastUsed: 5 }
+            ]);
+            stub.stores = Object.assign({}, stub.stores, { peers: JSON.stringify({ peers: peers }) });
+        }
+
+        function chipIds(finder) { return all(finder, "typeChip", []).map(function (c) { return c.typeId; }); }
+        function click(item) { mouseClick(item, item.width / 2, item.height / 2); }
+
+        function test_finder_data() {
+            return [{ tag: "en-dark", lang: "en", theme: "dark" }, { tag: "vi-light", lang: "vi", theme: "light" }];
+        }
+
+        function test_finder(data) {
+            start(data.lang, function (stub) { finderHome(stub); groupedServer(stub); }, data.theme);
+            var home = test.home;
+            var suffix = "-" + data.theme;
+            var finder = findChild(home, "peerFinder");
+            var grid = findChild(home, "peerGrid");
+            verify(finder.visible);
+            compare(grid.count, 6);
+            compare(chipIds(finder), ["", "lunaris", "rustdesk", "sunshine", "acme-view", "rdp", "vnc"]);
+            compare(findChild(finder, "computerCount").text, I18n.t("%1 computers").arg(6));
+            shot("finder-home-grid" + suffix);
+
+            // The RDP and VNC chips show their logos; the unknown type its letter.
+            var logos = all(finder, "typeLogoPicture", []).filter(function (l) { return l.visible; });
+            verify(logos.some(function (l) { return String(l.source).indexOf("logos/rdp.svg") !== -1 && l.status === Image.Ready; }), "the RDP logo is shown");
+            verify(logos.some(function (l) { return String(l.source).indexOf("logos/vnc.svg") !== -1 && l.status === Image.Ready; }), "the VNC logo is shown");
+            ["lunaris", "rustdesk", "sunshine", "rdp", "vnc"].forEach(function (id) {
+                verify(logos.some(function (l) { return String(l.source).indexOf("logos/" + id + ".svg") !== -1 && l.status === Image.Ready; }), "the " + id + " chip has its logo");
+            });
+            var acme = all(finder, "typeChip", []).filter(function (c) { return c.typeId === "acme-view"; })[0];
+            var letters = all(acme, "typeLogoLetter", []).filter(function (l) { return l.visible; });
+            compare(letters.length, 1, "a type without a logo has its letter");
+            compare(letters[0].text, "A");
+
+            // List: one row per computer, the same cards
+            click(findChild(finder, "view-list"));
+            compare(ViewPrefs.computerView, "list");
+            tryCompare(grid, "cellHeight", 62);
+            compare(grid.count, 6);
+            wait(50);
+            var rows = all(grid, "peerRow", []).filter(function (r) { return r.visible; });
+            compare(rows.length, 6);
+            shot("finder-home-list" + suffix);
+
+            // A type: the grouped Office card has RustDesk among its ways.
+            var rustdeskChip = all(finder, "typeChip", []).filter(function (c) { return c.typeId === "rustdesk"; })[0];
+            click(rustdeskChip);
+            compare(ViewPrefs.computerType, "rustdesk");
+            compare(home.shownCards.map(function (c) { return c.key; }).sort(),
+                    ["group:g-0000000000de", "host:192.168.1.20:8091", "source::workshop-9"]);
+            compare(findChild(finder, "computerCount").text, I18n.t("%1 of %2 computers").arg(3).arg(6));
+            shot("finder-home-filter" + suffix);
+
+            // Search: accents aside ("ke toan" finds "Máy kế toán"), with the filter: none.
+            var search = findChild(finder, "computerSearch");
+            search.forceActiveFocus();
+            keyClick(Qt.Key_K); keyClick(Qt.Key_E); keyClick(Qt.Key_Space); keyClick(Qt.Key_T); keyClick(Qt.Key_O);
+            compare(home.searchText, "ke to");
+            compare(grid.count, 0);
+            var noMatch = findChild(home, "peerNoMatch");
+            verify(noMatch.visible);
+            shot("finder-home-nomatch" + suffix);
+            ViewPrefs.computerType = "";
+            compare(home.shownCards.map(function (c) { return c.title; }), ["Máy kế toán"]);
+            // Esc clears the search
+            search.forceActiveFocus();
+            keyClick(Qt.Key_Escape);
+            compare(home.searchText, "");
+            compare(grid.count, 6);
+            // The empty state's button shows every computer again
+            home.searchText = "nothing like this";
+            ViewPrefs.computerType = "vnc";
+            compare(grid.count, 0);
+            click(findChild(noMatch, "clearFinding"));
+            compare(home.searchText, "");
+            compare(ViewPrefs.computerType, "");
+            compare(grid.count, 6);
+            // A remembered type no card has is All.
+            ViewPrefs.computerType = "gone-type";
+            compare(home.peerType, "");
+            compare(grid.count, 6);
+            ViewPrefs.computerType = "";
+
+            // Narrow window: the chips wrap, the rows keep Connect.
+            window.width = 820;
+            wait(100);
+            shot("finder-home-list-narrow" + suffix);
+            window.width = 1180;
+            wait(50);
+
+            // ---- Server tab: the same finder ----
+            home.peerTab = "server";
+            var dashboard = home.dashboard;
+            tryCompare(dashboard, "isAdmin", true);
+            tryVerify(function () { return dashboard.cards.length > 0; }, 3000);
+            wait(100);
+            var serverFinder = findChild(dashboard, "serverFinder");
+            verify(serverFinder !== null && serverFinder.visible);
+            compare(chipIds(serverFinder), ["", "lunaris", "rustdesk", "sunshine", "acme-view"]);
+            var serverGrid = findChild(dashboard, "serverGrid");
+            compare(serverGrid.count, dashboard.cards.length);
+            var serverRows = all(serverGrid, "serverRow", []).filter(function (r) { return r.visible; });
+            compare(serverRows.length, dashboard.cards.length);
+            shot("finder-server-list" + suffix);
+            dashboard.searchText = "den";
+            compare(dashboard.shownCards.map(function (c) { return c.key; }), ["group:g-0000000000de"]);
+            dashboard.searchText = "";
+            ViewPrefs.computerType = "acme-view";
+            compare(dashboard.shownCards.map(function (c) { return c.key; }), ["group:g-0000000000de"], "the Den card has Acme among its ways");
+            shot("finder-server-filter" + suffix);
+            ViewPrefs.computerType = "";
+            ViewPrefs.computerView = "grid";
+            wait(50);
+            shot("finder-server-grid" + suffix);
+            dashboard.searchText = "zzz";
+            verify(findChild(dashboard, "serverNoMatch").visible);
+            shot("finder-server-nomatch" + suffix);
+            dashboard.searchText = "";
+        }
+
         function test_groups_data() {
             return [{ tag: "en", theme: "dark" }, { tag: "vi", theme: "light" }];
         }
@@ -699,6 +897,26 @@ Item {
             verify(findChild(office, "peerChips").visible && findChild(den, "peerChips").visible);
             compare(all(findChild(office, "peerChips"), "methodChip").length, 3);
             shot("home-groups" + suffix);
+
+            // A computer of another type that does not answer (shut down) is
+            // offline; one not checked yet is not said to be.
+            compare(home.sourceOnline("workshop-9"), -1);
+            verify(cardByKey("source::workshop-9").cardData.methods[0].online, "not checked yet: as before");
+            bridge.sourceStatus = { "workshop-9": 0, "office-sun": 1 };
+            home.refreshSourceStatus();
+            wait(50);
+            compare(home.sourceOnline("workshop-9"), 0);
+            verify(!cardByKey("source::workshop-9").cardData.methods[0].online);
+            verify(!cardByKey("source::office-sun") && cardByKey("host:192.168.1.20:8091").cardData.methods.some(function (m) { return m.key === "source::office-sun" && m.online; }));
+            // Nothing changed: the cards are not made again.
+            var before = home.tabCards;
+            home.refreshSourceStatus();
+            verify(home.tabCards === before);
+            bridge.sourceStatus = {};
+            home.refreshSourceStatus();
+            wait(50);
+            workshop = cardByKey("source::workshop-9");
+            office = cardByKey("host:192.168.1.20:8091");
 
             // Nothing was chosen yet: the Lunaris computer itself; a click connects with it.
             compare(office.method.key, "lunaris");
@@ -1108,8 +1326,29 @@ Item {
             compare(rows([f("host"), f("port", "port", "47989"), f("app", "text", "Desktop"), f("resolution", "text", "1920x1080"), f("bitrate", "text", "20"), f("pointer", "choice", "picture")]),
                 "host:4 port:2 app:2 resolution:2 bitrate:2 pointer:6");
             compare(rows([f("station"), f("gateway", "text", "gw.example.net"), f("gateway_port", "port", "7400"), f("token", "secret"), f("pin", "secret")]),
-                "station:6 gateway:4 gateway_port:2 token:6 pin:6");
-            compare(rows([f("a", "choice", "x"), f("p", "port", "1")]), "a:6 p:6");
+                "station:6 gateway:4 gateway_port:2 token:3 pin:3");
+            compare(rows([f("a", "choice", "x"), f("p", "port", "1")]), "a:3 p:3");
+            // Fields left alone in a row share one, two by two, in order; options
+            // to click with long names (more than 20 characters together) do not.
+            var o = function (key, labels, def) {
+                var field = f(key, "choice", def);
+                field.options = labels.map(function (l, n) { return { value: "v" + n, label: l }; });
+                return field;
+            };
+            var rdp = [f("host"), f("port", "port", "3389"), f("username"), f("password", "secret"), f("domain"),
+                       o("security", ["NLA (recommended)", "TLS (sign in on the computer's screen)", "Either"], "nla"), f("resolution", "text", "auto")];
+            compare(rows(rdp), "host:4 port:2 username:3 password:3 domain:3 security:3 resolution:6");
+            compare(rows([f("host"), f("port", "port", "5900"), f("password", "secret"), o("view_only", ["Control", "View only"], "off")]),
+                "host:4 port:2 password:3 view_only:3");
+            compare(rows([f("a"), o("c", ["In the picture (host's pointer)", "Drawn here (no lag; arrow only)"]), f("b")]), "a:6 c:6 b:6");
+            compare(rows([f("a"), f("b"), f("c")]), "a:3 b:3 c:6");
+            // A drop-down: many options, or a long one; options to click otherwise.
+            verify(Cards.choiceAsList(rdp[5]));
+            verify(!Cards.choiceAsList(o("p", ["In the picture (host's pointer)", "Drawn here (no lag; arrow only)"])));
+            verify(!Cards.choiceAsList(o("m", ["Control", "View only"])));
+            verify(Cards.choiceAsList(o("m", ["a", "b", "c", "d"])));
+            verify(!Cards.choiceAsList(o("m", [])));
+            verify(!Cards.choiceAsList(f("t")));
             compare(rows([]), "");
             var several = function (n) { var all = []; for (var i = 0; i < n; i++) all.push(f("s" + i, "text", "v")); return all; };
             compare(rows(several(1)), "s0:6");
@@ -1128,7 +1367,7 @@ Item {
             compare(Cards.typeShortName("template", ""), "template");
             compare(Cards.typeShortName("constructor", "Odd"), "Odd");
             compare(Cards.typeLogo("constructor"), "");
-            compare(Cards.typeLogo("lunaris"), "icon.png");
+            compare(Cards.typeLogo("lunaris"), "logos/lunaris.svg");
             compare(Cards.methodType({ source: { connector: "sunshine" } }), "sunshine");
             compare(Cards.methodType({ host: {} }), "lunaris");
         }
@@ -1151,18 +1390,21 @@ Item {
             findChild(home, "addComputerButton").clicked();
             wait(100);
 
-            // Wider than it was, and never wider than the window.
-            verify(dialog.width >= 560 && dialog.width <= window.width - 40);
+            // Wider than it was, and never wider than the window: the types beside the form.
+            verify(dialog.width >= 760 && dialog.width <= window.width - 40);
             verify(dialog.wide);
+            verify(dialog.twoPane);
 
-            // The types in one row: the same top, the same width, left to right.
+            // The types in a list at the left: the same left, the same width, top to bottom.
             var tiles = tilesOf(dialog);
             compare(tiles.length, 4);
             for (var i = 1; i < tiles.length; i++) {
-                verify(nearly(tiles[i].y, tiles[0].y), "one row");
+                verify(nearly(tiles[i].x, tiles[0].x), "one column");
                 verify(nearly(tiles[i].width, tiles[0].width), "equal widths");
-                verify(tiles[i].x > tiles[i - 1].x);
+                verify(tiles[i].y > tiles[i - 1].y + tiles[i - 1].height - 1);
             }
+            verify(tiles[0].height <= 44, "compact rows");
+            verify(findChild(dialog.contentItem, "typeChips").visible === false);
             compare(tiles.map(function (t) { return t.text; }), ["Lunaris", "RustDesk", "Acme Viewer", "Sunshine"]);
             compare(tiles[3].fullName, "Sunshine / GameStream");
             compare(tiles[3].Accessible.name, "Sunshine / GameStream");
@@ -1189,7 +1431,11 @@ Item {
             var fullName = findChild(dialog.contentItem, "typeFullName");
             compare(fullName.text, "Lunaris");
             verify(about.visible && about.text.indexOf("Lunaris") !== -1);
-            verify(about.y > 0 && findChild(dialog.contentItem, "typeAbout").y > tiles[0].y + tiles[0].height - 1);
+            // ... at the right of the list, at the top of the form.
+            var aboutAt = findChild(dialog.contentItem, "typeAbout").mapToItem(dialog.contentItem, 0, 0);
+            var tileAt = tiles[0].mapToItem(dialog.contentItem, 0, 0);
+            verify(aboutAt.x > tileAt.x + tiles[0].width);
+            verify(nearly(aboutAt.y, findChild(dialog.contentItem, "typeRail").mapToItem(dialog.contentItem, 0, 0).y));
             findChild(dialog.contentItem, "addressField").text = "192.168.1.31";
             // The buttons are in sight, under the form.
             var buttons = findChild(dialog.contentItem, "buttonRow");
@@ -1259,7 +1505,7 @@ Item {
             shot("add-tiles-setup" + suffix);
             closeAll(dialog);
 
-            // Many types: as many rows of the same length as they need, each tile as wide as the others.
+            // Many types: a longer list, each row as wide as the others.
             var more = [];
             for (var n = 0; n < 5; n++) more.push(Object.assign({}, bridge.acme, { id: "acme-" + n, name: "Acme Viewer " + n + " (test)" }));
             bridge.extra = [bridge.sunshine].concat(more);
@@ -1268,10 +1514,11 @@ Item {
             wait(100);
             tiles = tilesOf(dialog);
             compare(tiles.length, 9);
-            var rows = {};
-            tiles.forEach(function (t) { rows[Math.round(t.y)] = (rows[Math.round(t.y)] || 0) + 1; verify(nearly(t.width, tiles[0].width)); });
-            verify(Object.keys(rows).length >= 2, "the row wraps");
-            tiles.forEach(function (t) { verify(t.x >= 0 && t.x + t.width <= findChild(dialog.contentItem, "typeOptions").width + 1, "no tile leaves the dialog"); });
+            tiles.forEach(function (t, k) {
+                verify(nearly(t.width, tiles[0].width) && nearly(t.x, tiles[0].x));
+                if (k > 0) verify(t.y > tiles[k - 1].y);
+                verify(t.x >= 0 && t.x + t.width <= findChild(dialog.contentItem, "typeOptions").width + 1, "no tile leaves the list");
+            });
             compare(tiles[4].text, "Acme Viewer 0");
             shot("add-tiles-many" + suffix);
             closeAll(dialog);
@@ -1291,18 +1538,29 @@ Item {
             shot("edit-tiles-sunshine" + suffix);
             closeAll(dialog);
 
-            // A narrow window: every field has its own row, the tiles still side by side.
+            // A narrow window: every field has its own row, the types are chips in rows above the form.
             var widthBefore = window.width;
             window.width = 420;
             dialog.openAdd();
             wait(100);
             verify(dialog.width <= 420 - 40 + 1);
             verify(!dialog.wide);
+            verify(!dialog.twoPane);
+            verify(!findChild(dialog.contentItem, "typeRail").visible);
             dialog.chooseType("rustdesk");
             wait(100);
             verify(item(dialog, "port").y > item(dialog, "host").y + 20, "one field to a row");
             tiles = tilesOf(dialog);
-            tiles.forEach(function (t) { verify(t.x + t.width <= findChild(dialog.contentItem, "typeOptions").width + 1); });
+            compare(tiles.length, 4);
+            var chips = findChild(dialog.contentItem, "typeChips");
+            verify(chips.visible);
+            tiles.forEach(function (t) {
+                verify(t.height <= 40, "a chip is low");
+                verify(t.width >= 120 - 1, "and not narrower than 120");
+                verify(t.x + t.width <= chips.width + 1);
+            });
+            verify(nearly(tiles[1].y, tiles[0].y) && tiles[1].x > tiles[0].x, "chips side by side");
+            verify(nearly(tiles[1].width, tiles[0].width));
             shot("add-tiles-narrow" + suffix);
             closeAll(dialog);
             window.width = widthBefore;
@@ -1317,7 +1575,8 @@ Item {
             wait(150);
             tiles = tilesOf(serverDialog);
             compare(tiles.length, 4);
-            for (i = 1; i < tiles.length; i++) verify(nearly(tiles[i].y, tiles[0].y) && nearly(tiles[i].width, tiles[0].width));
+            verify(serverDialog.twoPane);
+            for (i = 1; i < tiles.length; i++) verify(nearly(tiles[i].x, tiles[0].x) && tiles[i].y > tiles[i - 1].y && nearly(tiles[i].width, tiles[0].width));
             compare(findChild(serverDialog.contentItem, "typeNote").text,
                 I18n.t("The server connects to the Lunaris app on that computer (remote control turned on). Its address and password are shown under \"This computer\" there."));
             shot("server-add-tiles-lunaris" + suffix);
@@ -1363,6 +1622,99 @@ Item {
             verify(put !== undefined);
             verify(JSON.parse(put.body).values.pointer === undefined);
             closeAll(serverDialog);
+        }
+
+        // On a usual window (1280 x 800) no form of a type scrolls: the types
+        // beside the form, lone fields two to a row, RDP's security a drop-down.
+        function test_dialog_fits_data() {
+            return [{ tag: "en", theme: "dark" }, { tag: "vi", theme: "light" }];
+        }
+
+        function test_dialog_fits(data) {
+            var sizeBefore = [window.width, window.height];
+            window.width = 1280;
+            window.height = 800;
+            start(data.tag, function (stub) { stub.extra = [stub.sunshine, stub.rdp, stub.vnc]; }, data.theme);
+            var suffix = data.theme === "light" ? "-light" : "";
+            var dialog = findChild(test.home, "addComputerDialog");
+            findChild(test.home, "addComputerButton").clicked();
+            wait(100);
+            verify(dialog.twoPane);
+            compare(dialog.width, 820);
+            compare(tilesOf(dialog).length, 6);
+            var scroller = findChild(dialog.contentItem, "formScroller");
+            var item = function (key) { return findChild(dialog.contentItem, "fieldItem-" + key); };
+            var fits = function (what) {
+                verify(scroller.contentHeight <= scroller.height + 1, "nothing to scroll for " + what);
+                var rail = findChild(dialog.contentItem, "railScroller");
+                verify(rail.contentHeight <= rail.height + 1, "the list of types does not scroll");
+                var buttons = findChild(dialog.contentItem, "buttonRow");
+                verify(buttons.mapToItem(dialog.contentItem, 0, buttons.height).y <= dialog.contentItem.height + 1);
+                verify(dialog.y + dialog.height <= window.height);
+            };
+            fits("Lunaris");
+
+            dialog.chooseType("rdp");
+            wait(100);
+            fits("RDP");
+            // Host and port; user name and password; domain and security; the resolution alone.
+            verify(nearly(item("host").y, item("port").y));
+            verify(nearly(item("username").y, item("password").y) && nearly(item("username").width, item("password").width));
+            verify(nearly(item("domain").y, item("security").y) && nearly(item("domain").width, item("security").width));
+            verify(item("username").y > item("host").y + 20 && item("domain").y > item("username").y + 20);
+            verify(item("resolution").y > item("domain").y + 20);
+            verify(nearly(item("resolution").width, findChild(dialog.contentItem, "fieldGrid").width));
+            // Security: a drop-down with the usual one, translated; no options to click.
+            var combo = findChild(dialog.contentItem, "fieldCombo-security");
+            verify(combo.visible);
+            verify(findChild(dialog.contentItem, "choice-security").visible);
+            compare(combo.displayText, I18n.t("NLA (recommended)"));
+            verify(findChild(dialog.contentItem, "field-security-nla") === null);
+            compare(field(dialog, "resolution").text, "auto");
+            findChild(dialog.contentItem, "nameField").text = "Office desk";
+            field(dialog, "host").text = "192.168.1.80";
+            field(dialog, "username").text = "anna";
+            combo.currentIndex = 1;
+            combo.activated(1);
+            shot("add-fits-rdp" + suffix);
+            var given = null;
+            var took = function (connectorId, hostId, sourceId, name, values) { given = values; };
+            dialog.sourceSubmitted.connect(took);
+            findChild(dialog.contentItem, "submitButton").clicked();
+            dialog.sourceSubmitted.disconnect(took);
+            verify(given !== null);
+            compare(given.security, "tls");
+            compare(given.username, "anna");
+            closeAll(dialog);
+
+            dialog.openAdd();
+            dialog.chooseType("vnc");
+            wait(100);
+            fits("VNC");
+            // The password and the mode share a row; the mode is two options to click, side by side.
+            verify(nearly(item("password").y, item("view_only").y));
+            var control = findChild(dialog.contentItem, "field-view_only-off");
+            var viewOnly = findChild(dialog.contentItem, "field-view_only-on");
+            verify(control.visible && viewOnly.visible && control.chosen);
+            verify(nearly(control.y, viewOnly.y) && viewOnly.x > control.x);
+            verify(!findChild(dialog.contentItem, "fieldCombo-view_only").visible);
+            shot("add-fits-vnc" + suffix);
+
+            dialog.chooseType("sunshine");
+            wait(100);
+            fits("Sunshine");
+            shot("add-fits-sunshine" + suffix);
+            dialog.chooseType("rustdesk");
+            wait(100);
+            fits("RustDesk");
+            dialog.chooseType("lunaris");
+            wait(100);
+            fits("Lunaris");
+            closeAll(dialog);
+
+            window.width = sizeBefore[0];
+            window.height = sizeBefore[1];
+            wait(50);
         }
 
         function test_plain_text() {

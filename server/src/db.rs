@@ -190,6 +190,38 @@ pub async fn init_db(
             .await?;
     }
 
+    // Joined with an install token (install.rs): such a host signs in with
+    // its key alone, and only while it is in this table with that key.
+    if !columns.iter().any(|c| c == "enrolled") {
+        sqlx::query("ALTER TABLE hosts ADD COLUMN enrolled INTEGER NOT NULL DEFAULT 0;")
+            .execute(&pool)
+            .await?;
+    }
+    if !columns.iter().any(|c| c == "install_token_id") {
+        sqlx::query("ALTER TABLE hosts ADD COLUMN install_token_id TEXT;")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Install tokens (install.rs): the one-line agent installer joins
+    // computers with one of these, never with the server's agent token. Only
+    // the token's SHA-256 (hex) is kept. Times as datetime('now') (UTC).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS install_tokens (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT UNIQUE NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            created_by TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT NOT NULL,
+            max_uses INTEGER,
+            uses INTEGER NOT NULL DEFAULT 0,
+            revoked INTEGER NOT NULL DEFAULT 0
+        );",
+    )
+    .execute(&pool)
+    .await?;
+
     // Perform migrations for users table if columns don't exist
     let user_columns: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info('users')")
@@ -211,6 +243,41 @@ pub async fn init_db(
             .execute(&pool)
             .await?;
     }
+    // Sign-in tokens carry this number (auth.rs); raising it (new password,
+    // two-factor turned off) ends every session of the user.
+    if !user_columns.iter().any(|c| c == "token_version") {
+        sqlx::query("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0;")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Two-factor sign-in (mfa.rs): the authenticator secret, encrypted with
+    // the key in mfa_key.txt; enabled = 0 while it is being set up;
+    // last_step = the time step of the last code accepted (each is used once).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_mfa (
+            user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            secret TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            last_step INTEGER,
+            created_at TEXT,
+            enabled_at TEXT
+        );",
+    )
+    .execute(&pool)
+    .await?;
+    // One-time recovery codes, as HMAC-SHA-256 (keyed like the secret).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_recovery_codes (
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            code_hash TEXT NOT NULL,
+            created_at TEXT,
+            used_at TEXT,
+            PRIMARY KEY (user_id, code_hash)
+        );",
+    )
+    .execute(&pool)
+    .await?;
 
     // Bootstrap default admin user if no users exist
     let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")

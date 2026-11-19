@@ -1,0 +1,56 @@
+# Lunaris capture service: lets the Lunaris agent in the active desktop
+# session capture the screen without the Wayland portal prompt.
+#
+# Runs as root because reading the framebuffers the display scans out
+# (DRM GETFB2 handles) needs CAP_SYS_ADMIN. It only reads the screen: it
+# never encodes, never opens a network socket and never injects input. It
+# serves frames on /run/lunaris/capture.sock to the agent binary of the user
+# of the active graphical session on seat0 only.
+# See docs/linux-capture-service.md in the Lunaris sources.
+[Unit]
+Description=Lunaris capture service (unattended screen capture)
+Documentation=https://github.com/collyn/lunaris/blob/main/docs/linux-capture-service.md
+After=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lunaris-agent --capture-service --allow-exe /usr/bin/lunaris-client
+Restart=on-failure
+RestartSec=2
+
+# /run/lunaris (root, 0755) holds the socket.
+RuntimeDirectory=lunaris
+RuntimeDirectoryMode=0755
+
+# CAP_SYS_ADMIN: export scan-out framebuffers (DRM GETFB2 handles).
+# CAP_SYS_PTRACE: read /proc/<pid>/exe and environ of the connecting agent
+# (another user's process) to authorise it.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE
+AmbientCapabilities=
+NoNewPrivileges=yes
+# Only the DRM devices.
+DevicePolicy=closed
+DeviceAllow=char-drm rw
+# No network at all (the Unix socket is a file and keeps working).
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

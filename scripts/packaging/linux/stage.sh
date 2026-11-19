@@ -18,6 +18,9 @@ case "$KIND" in
         # Remote keyboard/mouse via /dev/uinput (same files as scripts/linux-host).
         install -Dm644 "$ROOT/scripts/linux-host/60-lunaris-input.rules" "$DEST/usr/lib/udev/rules.d/60-lunaris-input.rules"
         install -Dm644 "$ROOT/scripts/linux-host/60-lunaris.conf" "$DEST/usr/lib/modules-load.d/lunaris.conf"
+        # Unattended screen capture on Wayland (no portal prompt): the root
+        # capture service, see docs/linux-capture-service.md.
+        install -Dm644 "$ROOT/scripts/linux-host/lunaris-capture.service" "$DEST/usr/lib/systemd/system/lunaris-capture.service"
         ;;
     client)
         install -Dm644 "$ROOT/client-qml/qml/icon.png" "$DEST/usr/share/icons/hicolor/256x256/apps/$NAME.png"

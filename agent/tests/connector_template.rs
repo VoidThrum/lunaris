@@ -215,7 +215,7 @@ async fn only_what_is_installed_can_be_started() {
     // What there is to choose from: the built-in ones, then the installed ones
     // (the folder without a usable program is not one).
     let ids: Vec<String> = agent::connector::available(&dir).into_iter().map(|d| d.id).collect();
-    assert_eq!(ids, ["rustdesk", "sunshine", "template"]);
+    assert_eq!(ids, ["rustdesk", "sunshine", "rdp", "vnc", "template"]);
     let _ = std::fs::remove_dir_all(dir);
 }
 

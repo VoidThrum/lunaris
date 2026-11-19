@@ -6,6 +6,14 @@ picture and sound as that computer encodes them. The agent does not decode
 or encode anything; it packs the frames into its normal session with the
 viewer (browser or desktop client).
 
+The built-in connectors are `rustdesk`, `sunshine`, `rdp` and `vnc`; an
+external connector with one of these ids is never used (the built-in one is
+found first). The RDP and VNC connectors are the exception to "the agent
+encodes nothing": those protocols send pixels, not video, so they keep the
+picture and encode it with the agent's own encoders
+(`agent/src/connector/raw_video.rs`). An external connector always delivers
+encoded frames.
+
 This folder is a minimal **external** connector, to copy and start from. It
 connects to nothing: it plays `pattern.ivf` (a 320 x 180 VP8 test pattern)
 in a loop, sends silence, moves a cursor, and answers every command, so
@@ -70,6 +78,7 @@ cp target/release/connector-template connectors/template/connector.json \
 | `fields` | What a target is described by. `kind` is `text`, `port`, `secret` or `choice`; `default` and `required` are optional. A `secret` is never shown or written to a log. |
 | (a `choice` field) | Has `"options": [{"value": "picture", "label": "In the picture"}, ...]`: the person presses one of them instead of typing, and its `value` is what you get in `target`. A client from before choices shows a text box in its place, so take the same words typed by hand, and say what is wrong with any other in your error. The agent does not check the value against the options. |
 | (a field's `key`) | Not `id`, `name`, `connector` or `group`: those are the agent's own words for a target, and a field called so is left out of the form's values. A field with the key `host` or `address` is taken for where the computer is: when a computer is added at an address that another of the agent's computers (of any kind) has, the two are shown as one computer with a way to connect for each (the agent gives them a common `group`, an opaque word; the address itself still never leaves the agent). |
+| (whether it is there) | With a `host` (or `address`) field and a `port` field (its value, or the field's `default`), the agent checks every 15 seconds whether the computer is there: a TCP connection to that address and port, closed at once (nothing is sent, the connector is not started). One that does not answer is listed as offline. Without them it is listed as online while the agent is. |
 | `capabilities.video` | The codecs the connector can deliver: `h264`, `h265`, `vp8`, `vp9`, `av1`. |
 | `capabilities.audio`, `input`, `clipboard`, `cursor` | What else it does. |
 | `capabilities.setup` | Adding a computer has a set-up of its own, such as a pairing (see "Set-up" below). Left out or `false`: the connector is never started for one. |

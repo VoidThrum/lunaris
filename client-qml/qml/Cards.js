@@ -38,7 +38,7 @@ function shortTypeName(name) {
 }
 
 // The types whose short name is not their name without its brackets.
-var SHORT_NAMES = { lunaris: "Lunaris", rustdesk: "RustDesk", sunshine: "Sunshine" };
+var SHORT_NAMES = { lunaris: "Lunaris", rustdesk: "RustDesk", sunshine: "Sunshine", rdp: "RDP", vnc: "VNC" };
 
 // The name of a type where there is little room (a tile, a chip): by its
 // connector's id for the types that have a name of their own, else the
@@ -50,7 +50,8 @@ function typeShortName(connector, name) {
 }
 
 // The types that have a logo of their own (TypeLogo.qml), by connector id.
-var LOGOS = { lunaris: "icon.png", rustdesk: "logos/rustdesk.svg", sunshine: "logos/sunshine.svg" };
+var LOGOS = { lunaris: "logos/lunaris.svg", rustdesk: "logos/rustdesk.svg", sunshine: "logos/sunshine.svg",
+              rdp: "logos/rdp.svg", vnc: "logos/vnc.svg" };
 function typeLogo(connector) {
     var id = String(connector || "");
     return Object.prototype.hasOwnProperty.call(LOGOS, id) ? LOGOS[id] : "";
@@ -68,13 +69,46 @@ function shortField(field) {
     return field.kind === "port" || (field.kind === "text" && usual !== "" && usual.length <= 12);
 }
 
+// A choice shown as a drop-down rather than as options to click: many
+// options, or one with a long name.
+function choiceAsList(field) {
+    var options = field && field.kind === "choice" && field.options instanceof Array ? field.options : [];
+    if (options.length === 0) return false;
+    var longest = 0;
+    for (var i = 0; i < options.length; i++) longest = Math.max(longest, String(options[i].label || "").length);
+    return options.length > 3 || longest > 32;
+}
+
+// A field that may share its row with another: anything but options to
+// click whose names together are long (they want the whole row).
+function pairable(field) {
+    var options = field.kind === "choice" && field.options instanceof Array ? field.options : [];
+    if (options.length === 0 || choiceAsList(field)) return true;
+    var total = 0;
+    for (var i = 0; i < options.length; i++) total += String(options[i].label || "").length;
+    return total <= 20;
+}
+
 // The fields of a form on a wide window, in rows of 6 columns: a field and
 // the port after it share a row (4 + 2); short fields that follow one
 // another share rows, three to a row (2 + 2 + 2) and two (3 + 3) where three
-// would leave one alone; anything else has a row of its own.
-// [{ field, span }], in the fields' order. (On a narrow window every field
-// has its own row.)
+// would leave one alone; the fields left with a row of their own then share
+// one two by two (3 + 3), in their order (options to click with long names
+// keep a row of their own). [{ field, span }], in the fields' order. (On a
+// narrow window every field has its own row.)
 function layoutFields(fields) {
+    var placed = placeFields(fields);
+    for (var j = 0; j + 1 < placed.length; j++) {
+        if (placed[j].span === 6 && placed[j + 1].span === 6 && pairable(placed[j].field) && pairable(placed[j + 1].field)) {
+            placed[j].span = 3;
+            placed[j + 1].span = 3;
+            j++;
+        }
+    }
+    return placed;
+}
+
+function placeFields(fields) {
     var placed = [];
     fields = fields || [];
     // A field that takes the port after it onto its row.
@@ -213,4 +247,94 @@ function cardWithMethod(cards, key) {
         for (var k = 0; k < cards[i].methods.length; k++)
             if (cards[i].methods[k].key === key) return cards[i];
     return undefined;
+}
+
+// ---- Finding a computer: search and the type filter ----
+// (web/src/computerCards.ts has the same functions; change neither alone.)
+
+// `text` for comparing: lower case, without accents ("Máy Đức" -> "may duc").
+function foldText(text) {
+    var s = String(text === undefined || text === null ? "" : text);
+    if (typeof s.normalize === "function") s = s.normalize("NFD");
+    return s.replace(/[̀-ͯ]/g, "").replace(/[đĐ]/g, "d").toLowerCase();
+}
+
+// The types of a card's ways to connect ("lunaris" or a connector's id), each once.
+function cardTypes(card) {
+    var out = [];
+    var methods = (card && card.methods) || [];
+    for (var i = 0; i < methods.length; i++) {
+        var id = methodType(methods[i]);
+        if (id !== "" && out.indexOf(id) === -1) out.push(id);
+    }
+    return out;
+}
+
+// What a search looks in: the card's name, and for each way to connect its
+// name, address and the computer it is reached through. Folded (foldText).
+function cardSearchText(card) {
+    var parts = [card ? card.title : ""];
+    var methods = (card && card.methods) || [];
+    for (var i = 0; i < methods.length; i++) {
+        var m = methods[i];
+        parts.push(m.label);
+        var item = m.host || m.source || {};
+        parts.push(item.name, item.address, item.ip_address, item.host_name);
+        if (m.host && typeof item.address === "string") parts.push(item.address.replace(/:8091$/, ""));
+    }
+    return foldText(parts.filter(function (p) { return p !== undefined && p !== null && p !== ""; }).join("\n"));
+}
+
+// Whether a card is found by `query`: every word of it is somewhere in what
+// the search looks in (case and accents aside). An empty query finds all.
+function matchesSearch(card, query) {
+    var words = foldText(query).split(/\s+/).filter(function (w) { return w !== ""; });
+    if (words.length === 0) return true;
+    var text = cardSearchText(card);
+    for (var i = 0; i < words.length; i++) if (text.indexOf(words[i]) === -1) return false;
+    return true;
+}
+
+// The types to filter by, in the cards: [{ id, name }], Lunaris first, then
+// RustDesk and Sunshine, then any other by name. `nameOf(id, source)` names
+// one (left out: Lunaris, else the connector's short name).
+var TYPE_ORDER = ["lunaris", "rustdesk", "sunshine"];
+function typesOf(cards, nameOf) {
+    nameOf = nameOf || function (id, source) {
+        return id === "lunaris" ? "Lunaris" : typeShortName(id, source ? source.connector_name : id);
+    };
+    var found = [];
+    var seen = {};
+    for (var c = 0; c < (cards || []).length; c++) {
+        var methods = cards[c].methods || [];
+        for (var k = 0; k < methods.length; k++) {
+            var id = methodType(methods[k]);
+            if (id === "" || Object.prototype.hasOwnProperty.call(seen, id)) continue;
+            seen[id] = true;
+            found.push({ id: id, name: String(nameOf(id, methods[k].source) || id) });
+        }
+    }
+    found.sort(function (a, b) {
+        var ra = TYPE_ORDER.indexOf(a.id), rb = TYPE_ORDER.indexOf(b.id);
+        if (ra === -1) ra = TYPE_ORDER.length;
+        if (rb === -1) rb = TYPE_ORDER.length;
+        return ra - rb || a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+    });
+    return found;
+}
+
+// The type filtered by: `chosen` while some card has it, else "" (all).
+function effectiveType(types, chosen) {
+    chosen = String(chosen || "");
+    for (var i = 0; i < (types || []).length; i++) if (types[i].id === chosen) return chosen;
+    return "";
+}
+
+// The cards found by `query` that have a way to connect of type `type`
+// ("" = any), in their order.
+function filterCards(cards, query, type) {
+    type = String(type || "");
+    return (cards || []).filter(function (card) {
+        return (type === "" || cardTypes(card).indexOf(type) !== -1) && matchesSearch(card, query);
+    });
 }

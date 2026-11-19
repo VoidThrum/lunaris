@@ -1480,6 +1480,8 @@ ApplicationWindow {
         function onFileTransferChanged() { window.applySharing(); }
         function onGamepadChanged() { window.applySharing(); }
         function onSystemKeysChanged() { bridge.saveStore("view_prefs", ViewPrefs.toJson()); }
+        function onComputerViewChanged() { bridge.saveStore("view_prefs", ViewPrefs.toJson()); }
+        function onComputerTypeChanged() { bridge.saveStore("view_prefs", ViewPrefs.toJson()); }
     }
     function applySharing() {
         bridge.setShareOptions(ViewPrefs.clipboardSync, ViewPrefs.fileTransfer);

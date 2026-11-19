@@ -143,10 +143,14 @@ Rectangle {
             if (isSource(p)) {
                 var s = ownSource(p.sourceId || "");
                 sources.push({ host_id: "", host_name: "", id: String(p.sourceId || ""), name: p.name || (s ? s.name : ""),
-                               connector: String(p.type || ""), connector_name: typeName(p), online: true,
+                               connector: String(p.type || ""), connector_name: typeName(p),
+                               // Not known yet counts as there, as on a server's list.
+                               online: sourceOnline(p.sourceId || "") !== 0,
+                               address: sourceSummary(p),
                                group: s && s.group ? String(s.group) : "", peer: p });
             } else {
-                hosts.push({ id: p.address, name: p.name ? p.name : displayAddress(p.address || ""), status: "Online", peer: p });
+                hosts.push({ id: p.address, name: p.name ? p.name : displayAddress(p.address || ""), status: "Online",
+                             address: String(p.address || ""), peer: p });
             }
         }
         var cards = Cards.buildCards(hosts, sources,
@@ -650,17 +654,26 @@ Rectangle {
         savePeers();
     }
 
-    // The cards of the list: by tab and search, the one used last first.
-    function visiblePeers() {
-        var q = home.searchText.trim().toLowerCase();
-        var list = peerCards().filter(function (card) {
-            if (home.peerTab === "favorites" && !card.favorite) return false;
-            if (q === "") return true;
-            return card.peers.some(function (p) { return (p.address + " " + (p.name || "")).toLowerCase().indexOf(q) !== -1; })
-                || String(card.title).toLowerCase().indexOf(q) !== -1;
-        });
+    // The cards of the tab, the one used last first; the types among them
+    // (for the filter); and those the search and the type filter find
+    // (Cards.js: names, addresses and types, case and accents aside). Made
+    // again only when the computers, the tab, the search or the filter change.
+    readonly property var tabCards: {
+        var list = peerCards().filter(function (card) { return home.peerTab !== "favorites" || card.favorite; });
         list.sort(function (a, b) { return (b.lastUsed || 0) - (a.lastUsed || 0); });
         return list;
+    }
+    readonly property var peerTypes: Cards.typesOf(tabCards, function (id, source) {
+        return id === "lunaris" ? "Lunaris" : Cards.typeShortName(id, source ? source.connector_name : id);
+    })
+    readonly property string peerType: Cards.effectiveType(peerTypes, ViewPrefs.computerType)
+    readonly property var shownCards: Cards.filterCards(tabCards, home.searchText, home.peerType)
+    readonly property bool listView: ViewPrefs.computerView === "list"
+    function visiblePeers() { return home.shownCards; }
+    // Every card of the tab again.
+    function clearFinding() {
+        home.searchText = "";
+        ViewPrefs.computerType = "";
     }
 
     // Connect to a computer by address; asks for the password unless saved.
@@ -778,19 +791,38 @@ Rectangle {
         onlineTick; // re-evaluate when the checks come back
         return bridge.peerOnline(address);
     }
+    // The computers of other types: the app checks them in the background
+    // (a connection to their address and port). source id -> 1 there, 0
+    // not, -1 not known yet; replaced only when one of them changes, so
+    // that the cards are made again only then.
+    property var sourceStatus: ({})
+    function sourceOnline(sourceId) {
+        var known = home.sourceStatus[String(sourceId || "")];
+        return known === undefined ? -1 : known;
+    }
+    function refreshSourceStatus() {
+        var next = {};
+        for (var i = 0; i < home.peers.length; i++) {
+            var id = String(home.peers[i].sourceId || "");
+            if (home.isSource(home.peers[i]) && id !== "") next[id] = bridge.bridgeSourceOnline(id);
+        }
+        if (JSON.stringify(next) !== JSON.stringify(home.sourceStatus)) home.sourceStatus = next;
+    }
     Timer {
         interval: 10000
         running: home.visible && home.peerTab !== "server"
         repeat: true
         triggeredOnStart: true
         onTriggered: {
-            // Only Lunaris computers have a port of their own to check.
+            // Lunaris computers are checked here; the others are checked
+            // all the time in the background (refreshSourceStatus).
             for (var i = 0; i < home.peers.length; i++)
                 if (!home.isSource(home.peers[i])) bridge.probePeer(home.peers[i].address);
+            home.refreshSourceStatus();
             onlineRefresh.restart();
         }
     }
-    Timer { id: onlineRefresh; interval: 1700; onTriggered: home.onlineTick++ }
+    Timer { id: onlineRefresh; interval: 1700; onTriggered: { home.onlineTick++; home.refreshSourceStatus(); } }
 
     function copyText(text) { clipboardHelper.copy(text); }
 
@@ -1399,9 +1431,9 @@ Rectangle {
                         id: addComputerButton
                         objectName: "addComputerButton"
                         visible: home.peerTab !== "server"
-                        anchors.right: searchBox.left
-                        anchors.rightMargin: 10
-                        anchors.verticalCenter: searchBox.verticalCenter
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.verticalCenterOffset: -3
                         implicitHeight: 30
                         leftPadding: 12
                         rightPadding: 14
@@ -1420,62 +1452,61 @@ Rectangle {
                         }
                         onClicked: { home.refreshOwnComputers(); addDialog.openAdd(); }
                     }
+                }
 
-                    Rectangle {
-                        id: searchBox
-                        visible: home.peerTab !== "server"
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        anchors.verticalCenterOffset: -3
-                        width: 200
-                        height: 30
-                        radius: Theme.radiusSm
-                        color: Theme.surface
-                        border.color: searchInput.activeFocus ? Theme.accent : Theme.border
-                        Icon { id: searchIcon; name: "search"; size: 14; color: Theme.textSubtle; anchors.left: parent.left; anchors.leftMargin: 9; anchors.verticalCenter: parent.verticalCenter }
-                        TextInput {
-                            id: searchInput
-                            anchors.left: searchIcon.right
-                            anchors.leftMargin: 7
-                            anchors.right: parent.right
-                            anchors.rightMargin: 8
-                            anchors.verticalCenter: parent.verticalCenter
-                            color: Theme.text
-                            font.pixelSize: 12
-                            clip: true
-                            onTextChanged: home.searchText = text
-                            Accessible.name: "Search computers"
-                            Text { visible: searchInput.text.length === 0; text: I18n.t("Search"); color: Theme.textSubtle; font.pixelSize: 12; anchors.verticalCenter: parent.verticalCenter }
-                        }
-                    }
+                // Search, the type of computer, how many, grid or list
+                // (ComputerFinder.qml). Not on an empty tab: nothing to find.
+                ComputerFinder {
+                    id: peerFinder
+                    objectName: "peerFinder"
+                    visible: home.peerTab !== "server" && home.tabCards.length > 0
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: peerBar.bottom
+                    anchors.topMargin: visible ? 14 : 0
+                    anchors.leftMargin: 24
+                    anchors.rightMargin: 24
+                    height: visible ? implicitHeight : 0
+                    searchText: home.searchText
+                    types: home.peerTypes
+                    typeFilter: home.peerType
+                    total: home.tabCards.length
+                    shown: home.shownCards.length
+                    view: ViewPrefs.computerView
+                    onSearchEdited: (text) => home.searchText = text
+                    onTypeChosen: (id) => ViewPrefs.computerType = id
+                    onViewChosen: (view) => ViewPrefs.computerView = view
                 }
 
                 // Saved computers
                 Item {
                     anchors.left: parent.left
                     anchors.right: parent.right
-                    anchors.top: peerBar.bottom
+                    anchors.top: peerFinder.bottom
                     anchors.bottom: parent.bottom
                     visible: home.peerTab !== "server"
 
+                    // Cards in a grid, or one row per computer (a grid of
+                    // one column: the same cards, laid out in a row).
                     GridView {
                         id: peerGrid
                         objectName: "peerGrid"
                         anchors.fill: parent
                         anchors.leftMargin: 24
-                        anchors.topMargin: 16
+                        anchors.topMargin: 14
                         clip: true
-                        cellWidth: 232
-                        cellHeight: 168
-                        model: home.visiblePeers()
+                        cellWidth: home.listView ? Math.max(0, width - 8) : 232
+                        cellHeight: home.listView ? 62 : 168
+                        model: home.shownCards
                         boundsBehavior: Flickable.StopAtBounds
                         delegate: Item {
                             width: peerGrid.cellWidth
                             height: peerGrid.cellHeight
                             PeerCard {
                                 anchors.fill: parent
-                                anchors.rightMargin: 16
-                                anchors.bottomMargin: 16
+                                anchors.rightMargin: home.listView ? 16 : 16
+                                anchors.bottomMargin: home.listView ? 8 : 16
+                                row: home.listView
                                 cardData: modelData
                             }
                         }
@@ -1483,7 +1514,7 @@ Rectangle {
 
                     Column {
                         anchors.centerIn: parent
-                        visible: peerGrid.count === 0
+                        visible: peerGrid.count === 0 && home.tabCards.length === 0
                         spacing: 10
                         Icon {
                             anchors.horizontalCenter: parent.horizontalCenter
@@ -1493,20 +1524,26 @@ Rectangle {
                         }
                         Text {
                             anchors.horizontalCenter: parent.horizontalCenter
-                            text: home.searchText !== "" ? I18n.t("No computer matches \"%1\"").arg(home.searchText)
-                                : (home.peerTab === "favorites" ? I18n.t("No favorites yet") : I18n.t("No recent connections"))
+                            text: home.peerTab === "favorites" ? I18n.t("No favorites yet") : I18n.t("No recent connections")
                             color: Theme.textMuted
                             font.pixelSize: 14
                             font.weight: Font.Medium
                         }
                         Text {
                             anchors.horizontalCenter: parent.horizontalCenter
-                            visible: home.searchText === ""
                             text: home.peerTab === "favorites" ? I18n.t("Add a computer to favorites from its ⋮ menu.")
                                                               : I18n.t("Computers you add or connect to will show up here.")
                             color: Theme.textSubtle
                             font.pixelSize: 12
                         }
+                    }
+                    // Computers there are, but the search and the filter find none.
+                    NoMatch {
+                        objectName: "peerNoMatch"
+                        anchors.centerIn: parent
+                        visible: peerGrid.count === 0 && home.tabCards.length > 0
+                        width: Math.min(parent.width - 48, 420)
+                        onCleared: home.clearFinding()
                     }
                 }
 
@@ -1573,6 +1610,8 @@ Rectangle {
         // chosen for it. Everything on the card acts on that way: `peer` is
         // its entry in the list of saved computers.
         property var cardData: ({ key: "", title: "", methods: [], peers: [] })
+        // One row of the list instead of a card of the grid.
+        property bool row: false
         readonly property bool multi: cardData.methods.length > 1
         readonly property var method: home.methodOf(cardData)
         readonly property var peer: method ? home.methodPeer(method) : ({})
@@ -1606,6 +1645,7 @@ Rectangle {
 
         Rectangle {
             id: cardTop
+            visible: !card.row
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: parent.top
@@ -1674,7 +1714,105 @@ Rectangle {
             }
         }
 
+        // The list's row: the type's logo, the name and where it is, the
+        // ways to connect, the buttons of the card and Connect.
+        // (Made only for the list.)
+        Loader {
+            anchors.fill: parent
+            anchors.leftMargin: 10
+            anchors.rightMargin: 8
+            active: card.row
+            sourceComponent: RowLayout {
+                objectName: "peerRow"
+                spacing: 8
+                TypeLogo {
+                    typeId: card.method ? Cards.methodType(card.method) : "lunaris"
+                    name: card.method ? String(card.method.label) : ""
+                    size: 34
+                }
+                Column {
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 60
+                    spacing: 2
+                    Row {
+                        width: parent.width
+                        spacing: 6
+                        Text {
+                            objectName: "peerRowName"
+                            width: Math.min(implicitWidth, parent.width - (rowStar.visible ? rowStar.width + 6 : 0))
+                            textFormat: Text.PlainText
+                            text: card.title
+                            color: Theme.textStrong
+                            font.pixelSize: 14
+                            font.weight: Font.DemiBold
+                            elide: Text.ElideRight
+                        }
+                        Icon { id: rowStar; visible: !!card.firstPeer.favorite; name: "star"; size: 13; color: "#f5b301"; anchors.verticalCenter: parent.verticalCenter }
+                    }
+                    Row {
+                        width: parent.width
+                        spacing: 6
+                        Rectangle {
+                            readonly property int online: card.isSource ? home.sourceOnline(card.peer.sourceId || "") : home.peerOnline(card.peer.address || "")
+                            visible: online >= 0
+                            width: 7; height: 7; radius: 3.5
+                            anchors.verticalCenter: parent.verticalCenter
+                            color: online === 1 ? "#22c55e" : Theme.textMuted
+                        }
+                        Text {
+                            width: parent.width - 13
+                            textFormat: Text.PlainText
+                            text: card.isSource ? home.sourceSummary(card.peer) : home.displayAddress(card.peer.address || "")
+                            color: Theme.textMuted
+                            font.pixelSize: 12
+                            elide: Text.ElideRight
+                        }
+                    }
+                }
+                MethodChips {
+                    objectName: "peerRowChips"
+                    visible: card.multi && card.width > 560
+                    Layout.preferredWidth: Math.min(260, card.width * 0.3)
+                    Layout.preferredHeight: 20
+                    Layout.alignment: Qt.AlignVCenter
+                    clip: true
+                    oneRow: true
+                    dots: false
+                    methods: card.multi ? card.cardData.methods : []
+                    current: card.method ? card.method.key : ""
+                    onChosen: (key) => home.chooseMethod(card.cardData, key)
+                }
+                IconButton {
+                    visible: card.width > 420 && (!card.isSource || home.sourceHasFiles(card.peer))
+                    iconName: "folder"
+                    tip: I18n.t("Files")
+                    onClicked: home.openPeerFiles(card.peer.address)
+                }
+                IconButton {
+                    visible: card.width > 380
+                    iconName: "settings"
+                    tip: I18n.t("Stream settings")
+                    onClicked: home.openPeerSettings(card.peer.address)
+                }
+                IconButton {
+                    id: rowMoreBtn
+                    iconName: "more"
+                    tip: I18n.t("More")
+                    onClicked: peerMenu.popup(rowMoreBtn, 0, rowMoreBtn.height)
+                }
+                PrimaryButton {
+                    objectName: "peerRowConnect"
+                    text: I18n.t("Connect")
+                    implicitHeight: 30
+                    leftPadding: 14
+                    rightPadding: 14
+                    onClicked: home.connectMethod(card.cardData, card.method)
+                }
+            }
+        }
+
         RowLayout {
+            visible: !card.row
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: parent.bottom
@@ -1683,7 +1821,7 @@ Rectangle {
             anchors.rightMargin: 6
             spacing: 6
             Rectangle {
-                readonly property int online: card.isSource ? -1 : home.peerOnline(card.peer.address || "")
+                readonly property int online: card.isSource ? home.sourceOnline(card.peer.sourceId || "") : home.peerOnline(card.peer.address || "")
                 visible: online >= 0
                 width: 8; height: 8; radius: 4
                 color: online === 1 ? "#22c55e" : Theme.textMuted

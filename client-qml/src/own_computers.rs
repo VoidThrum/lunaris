@@ -180,6 +180,43 @@ pub fn remove_source(id: &str) -> String {
     remove_at(&sources::bridge_config_path(), id).err().unwrap_or_default()
 }
 
+// ---- Whether they are there ----
+
+fn load_sources(path: &Path) -> Vec<connector::SourceConfig> {
+    pairing::load_config(&path.to_string_lossy()).map(|config| config.sources).unwrap_or_default()
+}
+
+/// Checks the app's own computers of other types as an agent checks its
+/// sources (`agent::connector::reachability`): in the background, from the
+/// first time it is asked about one. The helper is not running most of the
+/// time, so the app does it itself.
+fn monitor() -> &'static connector::reachability::Monitor {
+    static MONITOR: std::sync::OnceLock<connector::reachability::Monitor> = std::sync::OnceLock::new();
+    MONITOR.get_or_init(|| {
+        connector::reachability::Monitor::start(
+            Box::new(|| (load_sources(&sources::bridge_config_path()), installed_connectors())),
+            // The cards ask again on their own (Home.qml's timer).
+            Box::new(|| {}),
+        )
+    })
+}
+
+fn online_at(path: &Path, connectors: &[Description], id: &str, monitor: &connector::reachability::Monitor) -> i32 {
+    let Some(source) = load_sources(path).into_iter().find(|source| source.id == id) else { return -1 };
+    match monitor.status(&source.target, connectors.iter().find(|c| c.id == source.target.connector)) {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    }
+}
+
+/// Whether the computer `id` answers: 1 yes, 0 no (it is shut down or
+/// cannot be reached), -1 not known (not checked yet, or its type has no
+/// address to check).
+pub fn source_online(id: &str) -> i32 {
+    online_at(&sources::bridge_config_path(), &installed_connectors(), id, monitor())
+}
+
 // ---- The helper ----
 
 /// The helper's password for one run: 48 hex characters from the system's
@@ -453,6 +490,37 @@ mod tests {
         remove_at(&path, &id).unwrap();
         assert!(!has_source(&path, &id));
         assert_eq!(sources_at(&path, &connectors), "[]");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A computer that is shut down shows offline: the app checks its own
+    /// computers as an agent checks its sources (here on this computer only).
+    #[test]
+    fn a_computer_that_does_not_answer_is_offline() {
+        let path = temp_config("online");
+        let connectors = builtin();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap().port();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let values = |port: u16| serde_json::json!({ "host": "127.0.0.1", "port": port.to_string(), "password": "pw" }).to_string();
+        let on = add_at(&path, &connectors, "On", "rustdesk", &values(open)).unwrap();
+        let off = add_at(&path, &connectors, "Off", "rustdesk", &values(closed)).unwrap();
+        let loaded = path.clone();
+        let described = connectors.clone();
+        let monitor = connector::reachability::Monitor::start_with(
+            Box::new(move || (load_sources(&loaded), described.clone())),
+            Box::new(|| {}),
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while online_at(&path, &connectors, &off, &monitor) < 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(online_at(&path, &connectors, &on, &monitor), 1);
+        assert_eq!(online_at(&path, &connectors, &off, &monitor), 0);
+        assert_eq!(online_at(&path, &connectors, "no-such-computer", &monitor), -1);
+        drop(listener);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -55,6 +55,11 @@ getrandom = "0.4"
 sha2 = "0.11"
 hex = "0.4"
 subtle = "2.6"
+# Two-factor sign-in (mfa.rs): RFC 6238 codes and otpauth:// links for
+# authenticator apps; the secret comes from getrandom above. The QR code is
+# drawn as SVG (no image crates).
+totp-rs = { version = "6.0.0", default-features = false, features = ["std", "otpauth"] }
+qrcodegen = "1.8.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -62,6 +62,38 @@ QtObject {
             ] }
         ]
     })
+    // The RDP and VNC connectors as the agent describes them (offered when
+    // a test puts them in `extra`).
+    readonly property var rdp: ({
+        id: "rdp", name: "Remote Desktop (RDP)",
+        note: "Remote Desktop must be enabled on that computer (Windows: Settings, System, Remote Desktop). When you press Add, its certificate is checked and remembered; Lunaris refuses the connection if it changes later.",
+        fields: [
+            { key: "host", label: "Address", kind: "text", "default": "", required: true },
+            { key: "port", label: "Port", kind: "port", "default": "3389", required: false },
+            { key: "username", label: "User name", kind: "text", "default": "", required: false },
+            { key: "password", label: "Password", kind: "secret", "default": "", required: false },
+            { key: "domain", label: "Domain", kind: "text", "default": "", required: false },
+            { key: "security", label: "Security", kind: "choice", "default": "nla", required: false, options: [
+                { value: "nla", label: "NLA (recommended)" },
+                { value: "tls", label: "TLS (sign in on the computer's screen)" },
+                { value: "any", label: "Either" }
+            ] },
+            { key: "resolution", label: "Resolution", kind: "text", "default": "auto", required: false }
+        ]
+    })
+    readonly property var vnc: ({
+        id: "vnc", name: "VNC",
+        note: "A VNC server must be running on that computer, with \"None\" or \"VNC password\" security. VNC does not encrypt the picture or what you type: use it only on a network you trust, or through a VPN.",
+        fields: [
+            { key: "host", label: "Address", kind: "text", "default": "", required: true },
+            { key: "port", label: "Port", kind: "port", "default": "5900", required: false },
+            { key: "password", label: "Password", kind: "secret", "default": "", required: false },
+            { key: "view_only", label: "Mode", kind: "choice", "default": "off", required: false, options: [
+                { value: "off", label: "Control" },
+                { value: "on", label: "View only" }
+            ] }
+        ]
+    })
     property var extra: []
     readonly property var firstSetup: ({ state: "pending", message: "Open Sunshine's web page on that computer, choose PIN, and enter this PIN.", code: "4711" })
     // How the set-up "su-1" stands: what asking about it is answered.
@@ -109,6 +141,7 @@ QtObject {
 
     // ---- Signals of the real bridge that the pages listen to ----
     signal loginResult(bool success, string errorMsg, string tok, string user, string srv)
+    signal mfaRequired(string srv, string user)
     signal credentialsLoaded(bool success, string srv, string tok, string user)
     signal hostsResult(bool success, string errorMsg, string hostsJson)
     signal appsResult(bool success, string errorMsg, string hostId, string appsJson)
@@ -155,10 +188,18 @@ QtObject {
     function deleteHost(id) {}
     function logout() {}
     function login(server, user, password) {}
+    // Two-factor sign-in: what the dialog sent, newest last ({ code, recovery }).
+    property var mfaCalls: []
+    property int mfaCancels: 0
+    function loginMfa(code, recovery) { stub.mfaCalls = stub.mfaCalls.concat([{ code: code, recovery: recovery }]); }
+    function cancelMfa() { stub.mfaCancels += 1; }
 
     // ---- The app's own computers of other types ----
     function bridgeConnectors() { return JSON.stringify([stub.rustdesk, stub.acme].concat(stub.extra)); }
     function bridgeSources() { return JSON.stringify(stub.ownSources); }
+    // Whether each of them answers: source id -> 1 / 0; not in it: not known (-1).
+    property var sourceStatus: ({})
+    function bridgeSourceOnline(id) { return stub.sourceStatus[id] === undefined ? -1 : stub.sourceStatus[id]; }
     function shownValues(connectorId, values) {
         var c = connectorId === "rustdesk" ? stub.rustdesk : connectorId === "sunshine" ? stub.sunshine : stub.acme;
         var out = {};

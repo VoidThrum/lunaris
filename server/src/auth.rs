@@ -20,11 +20,34 @@ static JWT_SECRET: Lazy<Vec<u8>> = Lazy::new(|| {
     }
 });
 
-/// `JWT_SECRET` when set (never the old default), otherwise a random secret
-/// kept in `file` so sign-ins survive a restart.
+/// Shortest `JWT_SECRET` accepted (bytes): a short one can be guessed offline
+/// from any token.
+pub const MIN_JWT_SECRET: usize = 32;
+
+/// Checked at start (lib.rs run_server): a `JWT_SECRET` that is set but too
+/// short stops the server with this message, instead of signing with it.
+pub fn check_jwt_secret_env() -> Result<(), String> {
+    jwt_secret_problem(std::env::var("JWT_SECRET").ok().as_deref()).map_or(Ok(()), Err)
+}
+
+fn jwt_secret_problem(env: Option<&str>) -> Option<String> {
+    let secret = env.map(str::trim).filter(|s| !s.is_empty() && *s != OLD_DEFAULT_SECRET)?;
+    (secret.len() < MIN_JWT_SECRET).then(|| {
+        format!(
+            "JWT_SECRET is too short ({} bytes; at least {} needed). Use a long random value \
+             (e.g. `openssl rand -hex 32`), or unset it to let the server keep its own key.",
+            secret.len(),
+            MIN_JWT_SECRET
+        )
+    })
+}
+
+/// `JWT_SECRET` when set (never the old default, never a short one: the
+/// server refuses to start with that), otherwise a random secret kept in
+/// `file` so sign-ins survive a restart.
 fn choose_secret(env: Option<String>, file: &std::path::Path) -> Vec<u8> {
     if let Some(secret) = env.map(|s| s.trim().to_string()) {
-        if !secret.is_empty() && secret != OLD_DEFAULT_SECRET {
+        if secret.len() >= MIN_JWT_SECRET && secret != OLD_DEFAULT_SECRET {
             return secret.into_bytes();
         }
         if secret == OLD_DEFAULT_SECRET {
@@ -54,6 +77,11 @@ pub struct Claims {
     pub username: String,
     pub role: String,
     pub exp: u64,
+    /// The user's `token_version` when the token was made; a token from
+    /// before the last bump is refused. Tokens from before this claim count
+    /// as version 0.
+    #[serde(default)]
+    pub ver: i64,
 }
 
 pub fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
@@ -82,6 +110,7 @@ pub fn create_jwt(
     user_id: &str,
     username: &str,
     role: &str,
+    token_version: i64,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let expiration = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::days(7))
@@ -93,6 +122,7 @@ pub fn create_jwt(
         username: username.to_string(),
         role: role.to_string(),
         exp: expiration,
+        ver: token_version,
     };
 
     encode(
@@ -113,6 +143,53 @@ pub fn verify_jwt(token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
 
 use crate::signaling::SignalingState;
 use std::sync::Arc;
+
+/// Why a valid-looking session token is not accepted.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionCheck {
+    /// Good: the user's current role (from the database, not the token).
+    Ok(String),
+    Disabled,
+    UnknownUser,
+    /// Made before the user's last password change or two-factor reset.
+    Revoked,
+}
+
+/// Whether the session `claims` stand for is still good.
+pub async fn check_session(db: &sqlx::SqlitePool, claims: &Claims) -> Result<SessionCheck, sqlx::Error> {
+    let row: Option<(String, i64, i64)> =
+        sqlx::query_as("SELECT COALESCE(role, 'user'), is_active, token_version FROM users WHERE id = ?")
+            .bind(&claims.sub)
+            .fetch_optional(db)
+            .await?;
+    Ok(match row {
+        None => SessionCheck::UnknownUser,
+        Some((_, 0, _)) => SessionCheck::Disabled,
+        Some((_, _, version)) if version != claims.ver => SessionCheck::Revoked,
+        Some((role, _, _)) => SessionCheck::Ok(role),
+    })
+}
+
+/// The user's current token version (0 for unknown users).
+pub async fn token_version(db: &sqlx::SqlitePool, user_id: &str) -> Result<i64, sqlx::Error> {
+    let v: Option<i64> = sqlx::query_scalar("SELECT token_version FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(v.unwrap_or(0))
+}
+
+/// Ends every session of a user (new password, two-factor turned off):
+/// their tokens stop working and their open connections are closed. Returns
+/// the new token version.
+pub async fn revoke_sessions(state: &SignalingState, user_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = ?")
+        .bind(user_id)
+        .execute(&state.db)
+        .await?;
+    state.close_user_connections(user_id);
+    token_version(&state.db, user_id).await
+}
 
 #[allow(dead_code)]
 pub struct AuthenticatedUser {
@@ -144,22 +221,22 @@ impl FromRequestParts<Arc<SignalingState>> for AuthenticatedUser {
         let token = &auth_header[7..];
         let claims = verify_jwt(token).map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid Token"))?;
 
-        // The user must still exist and be active; the role comes from the database.
-        let status = crate::security::user_status(&state.db, &claims.sub)
-            .await
-            .map_err(|e| {
-                tracing::error!("Database verification error: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Database Error")
-            })?;
+        // The user must still exist and be active, and the token must be
+        // from after their last password change; the role comes from the database.
+        let status = check_session(&state.db, &claims).await.map_err(|e| {
+            tracing::error!("Database verification error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database Error")
+        })?;
 
         match status {
-            Some((role, true)) => Ok(AuthenticatedUser {
+            SessionCheck::Ok(role) => Ok(AuthenticatedUser {
                 user_id: claims.sub,
                 username: claims.username,
                 role,
             }),
-            Some((_, false)) => Err((StatusCode::UNAUTHORIZED, "Account is disabled")),
-            None => Err((StatusCode::UNAUTHORIZED, "User does not exist in database")),
+            SessionCheck::Disabled => Err((StatusCode::UNAUTHORIZED, "Account is disabled")),
+            SessionCheck::UnknownUser => Err((StatusCode::UNAUTHORIZED, "User does not exist in database")),
+            SessionCheck::Revoked => Err((StatusCode::UNAUTHORIZED, "Session ended. Sign in again.")),
         }
     }
 }
@@ -215,6 +292,7 @@ mod tests {
             username: "admin".into(),
             role: "admin".into(),
             exp: (chrono::Utc::now().timestamp() + 3600) as u64,
+            ver: 0,
         };
         let forged = encode(
             &Header::default(),
@@ -237,7 +315,10 @@ mod tests {
         // Kept across restarts.
         assert_eq!(choose_secret(None, &file), s1);
         // An explicit secret wins.
-        assert_eq!(choose_secret(Some("my-own-secret".into()), &file), b"my-own-secret");
+        let own = "my-own-secret-of-at-least-32-bytes!";
+        assert_eq!(choose_secret(Some(own.into()), &file), own.as_bytes());
+        // A short one is never used (and stops the server at start).
+        assert_eq!(choose_secret(Some("my-own-secret".into()), &file), s1);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -248,6 +329,18 @@ mod tests {
     }
 
     #[test]
+    fn short_jwt_secret_stops_the_server() {
+        assert!(jwt_secret_problem(None).is_none());
+        assert!(jwt_secret_problem(Some("  ")).is_none());
+        // The old default is ignored with a warning, not fatal.
+        assert!(jwt_secret_problem(Some(OLD_DEFAULT_SECRET)).is_none());
+        let msg = jwt_secret_problem(Some("short-secret")).unwrap();
+        assert!(msg.contains("too short") && !msg.contains("short-secret"), "{msg}");
+        assert!(jwt_secret_problem(Some(&"x".repeat(31))).is_some());
+        assert!(jwt_secret_problem(Some(&"x".repeat(32))).is_none());
+    }
+
+    #[test]
     fn dummy_hash_is_valid_bcrypt() {
         assert!(!verify_password("anything", DUMMY_HASH));
         assert!(bcrypt::verify("x", DUMMY_HASH).is_ok());
@@ -255,7 +348,19 @@ mod tests {
 
     #[test]
     fn jwt_roundtrip_hs256() {
-        let t = create_jwt("id1", "bob", "admin").unwrap();
+        // A token from before the version claim reads as version 0.
+        #[derive(Serialize)]
+        struct OldClaims<'a> { sub: &'a str, username: &'a str, role: &'a str, exp: u64 }
+        let old = encode(
+            &Header::default(),
+            &OldClaims { sub: "id1", username: "bob", role: "user", exp: (chrono::Utc::now().timestamp() + 3600) as u64 },
+            &EncodingKey::from_secret(&JWT_SECRET),
+        )
+        .unwrap();
+        assert_eq!(verify_jwt(&old).unwrap().ver, 0);
+        assert_eq!(verify_jwt(&create_jwt("id1", "bob", "user", 3).unwrap()).unwrap().ver, 3);
+
+        let t = create_jwt("id1", "bob", "admin", 0).unwrap();
         let header = jsonwebtoken::decode_header(&t).unwrap();
         assert_eq!(header.alg, jsonwebtoken::Algorithm::HS256);
         let c = verify_jwt(&t).unwrap();
