@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+# update_notice.rs: "a new version exists" in the log (release parsing and
+# version comparison only; no downloads) over tokio-rustls below, with the
+# system's CA certificates.
+updater = { path = "../updater", default-features = false }
+rustls-native-certs = "0.8"
 axum = { version = "0.8", features = ["ws", "macros"] }
 tokio = { version = "1.0", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "fs", "set-header"] }
@@ -55,6 +60,11 @@ getrandom = "0.4"
 sha2 = "0.11"
 hex = "0.4"
 subtle = "2.6"
+# Two-factor sign-in (mfa.rs): RFC 6238 codes and otpauth:// links for
+# authenticator apps; the secret comes from getrandom above. The QR code is
+# drawn as SVG (no image crates).
+totp-rs = { version = "6.0.0", default-features = false, features = ["std", "otpauth"] }
+qrcodegen = "1.8.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

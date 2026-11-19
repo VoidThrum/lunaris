@@ -78,7 +78,7 @@ export const newGroup = (random: () => number = Math.random): string => {
 export const shortTypeName = (name: string): string => name.replace(/\s*[(（].*$/, '').trim() || name;
 
 /** The types whose short name is not their name without its brackets. */
-const SHORT_NAMES: Record<string, string> = { lunaris: 'Lunaris', rustdesk: 'RustDesk', sunshine: 'Sunshine' };
+const SHORT_NAMES: Record<string, string> = { lunaris: 'Lunaris', rustdesk: 'RustDesk', sunshine: 'Sunshine', rdp: 'RDP', vnc: 'VNC' };
 
 /**
  * The name of a type where there is little room (a tile, a chip): by its
@@ -95,7 +95,22 @@ export interface LayoutField {
   key: string;
   kind: string;
   default?: string;
+  /** What a choice is chosen from. */
+  options?: { value: string; label: string }[];
 }
+
+/**
+ * A choice shown as a list to open (a dropdown), not as options to press:
+ * more than three options, or one whose label is long.
+ */
+export const choiceAsList = (field: LayoutField): boolean =>
+  field.kind === 'choice' && !!field.options && field.options.length > 0
+  && (field.options.length > 3 || Math.max(...field.options.map((o) => String(o.label ?? '').length)) > 32);
+
+/** A choice shown as options to press whose labels take much room: it keeps a row of its own. */
+const wideChoice = (field: LayoutField) =>
+  field.kind === 'choice' && !!field.options && field.options.length > 0 && !choiceAsList(field)
+  && field.options.reduce((sum, o) => sum + String(o.label ?? '').length, 0) > 20;
 
 /** A field in its row: `span` of 6 columns (6 = the whole row). */
 export interface PlacedField<F extends LayoutField = LayoutField> {
@@ -111,7 +126,9 @@ const shortField = (field: LayoutField) =>
  * The fields of a form on a wide window, in rows of 6 columns: a field and
  * the port after it share a row (4 + 2); short fields that follow one
  * another share rows, three to a row (2 + 2 + 2) and two (3 + 3) where three
- * would leave one alone; anything else has a row of its own. On a narrow
+ * would leave one alone; the rest, one after another, share rows two to a
+ * row (3 + 3), except a choice of options to press whose labels together
+ * are longer than 20 characters, which has a row of its own. On a narrow
  * window every field has its own row (the caller's style sheet). The order
  * never changes.
  */
@@ -141,6 +158,16 @@ export function layoutFields<F extends LayoutField>(fields: F[]): PlacedField<F>
       const row = left === 4 || left === 2 ? 2 : 3;
       for (let k = 0; k < row; k++) placed.push({ field: fields[i++], span: row === 3 ? 2 : 3 });
       left -= row;
+    }
+  }
+  // Fields left alone on a row, one after another: two to a row.
+  for (let k = 0; k + 1 < placed.length; k++) {
+    const a = placed[k];
+    const b = placed[k + 1];
+    if (a.span === 6 && b.span === 6 && !wideChoice(a.field) && !wideChoice(b.field)) {
+      a.span = 3;
+      b.span = 3;
+      k++;
     }
   }
   return placed;
@@ -270,4 +297,126 @@ export function rememberMethod(store: KeyValue, known: Record<string, string>, c
   for (const old of keys.slice(0, Math.max(0, keys.length - MAX_REMEMBERED))) delete next[old];
   try { store.setItem(METHODS_STORE, JSON.stringify(next)); } catch { /* storage unavailable */ }
   return next;
+}
+
+// ---- Finding a computer: search, the type filter and how the list looks ----
+// (client-qml/qml/Cards.js has the same functions; change neither alone.)
+
+/** `text` for comparing: lower case, without accents ("Máy Đức" -> "may duc"). */
+export const foldText = (text: unknown): string =>
+  String(text ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[đĐ]/g, 'd').toLowerCase();
+
+/** The type of a way to connect: "lunaris" or its connector's id. */
+export const methodType = (method: { source?: { connector: string } }): string =>
+  method.source ? String(method.source.connector || '') : 'lunaris';
+
+/** The types of a card's ways to connect, each once. */
+export function cardTypes(card: { methods: { source?: { connector: string } }[] }): string[] {
+  const out: string[] = [];
+  for (const method of card.methods) {
+    const id = methodType(method);
+    if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+type Searchable = {
+  title: string;
+  methods: {
+    label: string;
+    host?: { name?: string; address?: string; ip_address?: string | null };
+    source?: { name?: string; host_name?: string; connector: string };
+  }[];
+};
+
+/** What a search looks in: the card's name, and for each way to connect its
+ *  name, address and the computer it is reached through. Folded (foldText). */
+export function cardSearchText(card: Searchable): string {
+  const parts: unknown[] = [card.title];
+  for (const m of card.methods) {
+    parts.push(m.label);
+    if (m.host) {
+      parts.push(m.host.name, m.host.address, m.host.ip_address);
+      if (typeof m.host.address === 'string') parts.push(m.host.address.replace(/:8091$/, ''));
+    }
+    if (m.source) parts.push(m.source.name, m.source.host_name);
+  }
+  return foldText(parts.filter((p) => p !== undefined && p !== null && p !== '').join('\n'));
+}
+
+/** Whether a card is found by `query`: every word of it is somewhere in what
+ *  the search looks in (case and accents aside). An empty query finds all. */
+export function matchesSearch(card: Searchable, query: string): boolean {
+  const words = foldText(query).split(/\s+/).filter(Boolean);
+  if (words.length === 0) return true;
+  const text = cardSearchText(card);
+  return words.every((word) => text.includes(word));
+}
+
+export interface CardType { id: string; name: string }
+
+const TYPE_ORDER = ['lunaris', 'rustdesk', 'sunshine'];
+
+/** The types to filter by, in the cards: Lunaris first, then RustDesk and
+ *  Sunshine, then any other by name. `nameOf` names one (left out: Lunaris,
+ *  else the connector's short name). */
+export function typesOf<S extends { connector: string; connector_name?: string }>(
+  cards: { methods: { source?: S }[] }[],
+  nameOf: (id: string, source?: S) => string = (id, source) =>
+    id === 'lunaris' ? 'Lunaris' : typeShortName(id, source?.connector_name || id),
+): CardType[] {
+  const found: CardType[] = [];
+  const seen = new Set<string>();
+  for (const card of cards) {
+    for (const method of card.methods) {
+      const id = methodType(method);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      found.push({ id, name: String(nameOf(id, method.source) || id) });
+    }
+  }
+  const rank = (id: string) => { const r = TYPE_ORDER.indexOf(id); return r === -1 ? TYPE_ORDER.length : r; };
+  return found.sort((a, b) => rank(a.id) - rank(b.id) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+}
+
+/** The type filtered by: `chosen` while some card has it, else "" (all). */
+export const effectiveType = (types: CardType[], chosen: string | null | undefined): string =>
+  types.some((type) => type.id === chosen) ? String(chosen) : '';
+
+/** The cards found by `query` that have a way to connect of type `type`
+ *  ("" = any), in their order. */
+export const filterCards = <C extends Searchable>(cards: C[], query: string, type: string): C[] =>
+  cards.filter((card) => (!type || cardTypes(card).includes(type)) && matchesSearch(card, query));
+
+// ---- How the list looks, and the type filtered by: kept in the browser ----
+
+export type ComputerView = 'grid' | 'list';
+export const VIEW_STORE = 'lunaris_computer_view';
+export const TYPE_STORE = 'lunaris_computer_type';
+
+type Store = { getItem(key: string): string | null; setItem(key: string, value: string): void };
+
+/** The browser's storage, or one that keeps nothing where it cannot be used. */
+export function browserStore(): Store {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage) return localStorage;
+  } catch { /* storage blocked */ }
+  return { getItem: () => null, setItem: () => {} };
+}
+
+export function loadView(store: Store): ComputerView {
+  try { return store.getItem(VIEW_STORE) === 'list' ? 'list' : 'grid'; } catch { return 'grid'; }
+}
+export function saveView(store: Store, view: ComputerView): void {
+  try { store.setItem(VIEW_STORE, view); } catch { /* storage unavailable */ }
+}
+/** The type remembered ("" = all). */
+export function loadTypeFilter(store: Store): string {
+  try {
+    const value = store.getItem(TYPE_STORE) || '';
+    return value.length <= 64 && /^[A-Za-z0-9._-]*$/.test(value) ? value : '';
+  } catch { return ''; }
+}
+export function saveTypeFilter(store: Store, type: string): void {
+  try { store.setItem(TYPE_STORE, type); } catch { /* storage unavailable */ }
 }

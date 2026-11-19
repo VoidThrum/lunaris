@@ -48,6 +48,26 @@ cp -a %{stage_client}/. %{buildroot}/
 modprobe uinput >/dev/null 2>&1 || :
 udevadm control --reload-rules >/dev/null 2>&1 || :
 udevadm trigger --subsystem-match=misc --sysname-match=uinput >/dev/null 2>&1 || :
+# Capture service (unattended Wayland capture): enable on install, restart
+# on upgrade, stop and disable on removal.
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+    if [ "$1" -eq 1 ]; then
+        systemctl enable --now lunaris-capture.service >/dev/null 2>&1 || :
+    else
+        systemctl try-restart lunaris-capture.service >/dev/null 2>&1 || :
+    fi
+fi
+
+%preun -n lunaris-agent
+if [ "$1" -eq 0 ] && [ -d /run/systemd/system ]; then
+    systemctl disable --now lunaris-capture.service >/dev/null 2>&1 || :
+fi
+
+%postun -n lunaris-agent
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+fi
 
 %post -n lunaris-client
 modprobe uinput >/dev/null 2>&1 || :
@@ -61,6 +81,7 @@ udevadm trigger --subsystem-match=misc --sysname-match=uinput >/dev/null 2>&1 ||
 /usr/share/icons/hicolor/256x256/apps/lunaris-agent.png
 /usr/lib/udev/rules.d/60-lunaris-input.rules
 /usr/lib/modules-load.d/lunaris.conf
+/usr/lib/systemd/system/lunaris-capture.service
 
 %files -n lunaris-client
 %license /usr/share/licenses/lunaris-client

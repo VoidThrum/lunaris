@@ -19,7 +19,21 @@ pub extern "C" fn __cpu_indicator_init() -> i32 {
 }
 
 fn main() -> std::process::ExitCode {
+    // How this program was started (the restart after an update); a
+    // restarted app first waits for the old one to exit (its
+    // single-instance port must be free).
+    updater::restart::remember_launch();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.len() < 2 || !matches!(args[1].to_str(), Some("agent" | "server")) {
+        updater::restart::wait_for_previous();
+        // The app comes back as a plain window: no tray-only start, no link.
+        updater::restart::set_relaunch_args_filter(|args| {
+            args.iter()
+                .filter(|a| *a != "--minimized" && !a.to_string_lossy().starts_with("lunaris://"))
+                .cloned()
+                .collect()
+        });
+    }
     match args.get(1).and_then(|a| a.to_str()) {
         Some("agent") => {
             attach_console();

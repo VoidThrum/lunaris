@@ -3,9 +3,11 @@ import QtQuick.Controls as QQC
 import QtQuick.Layouts
 import "Cards.js" as Cards
 
-// "Add computer" and "Edit": the Type first (the types there are in one
-// row, each a tile with its logo to click; what the chosen one says about
-// itself stands once, under the row), then that type's form.
+// "Add computer" and "Edit": the Type, then that type's form. Adding on a
+// wide window, the types are a list at the left (each a row with its logo
+// to click) and the chosen one's form is at the right, under what that type
+// says about itself; on a narrow window (and to edit) the types are chips
+// in a row above the form.
 //
 // "Lunaris" is the form there always was (address, password). Every other
 // type is a connector, described by data: { id, name, fields: [{ key,
@@ -15,8 +17,10 @@ import "Cards.js" as Cards
 // (a type's logo and short name are looked up by its id, Cards.js).
 //
 // On a wide window short fields share a row (Cards.layoutFields); on a
-// narrow one every field has its own. The buttons stay in sight while a
-// long form scrolls.
+// narrow one every field has its own. A choice is options to click, or a
+// drop-down when they are many or long (Cards.choiceAsList). The buttons
+// stay in sight while a long form scrolls (and a long list of types, on
+// its own).
 //
 // The dialog checks what was typed and hands it over (lunarisSubmitted /
 // sourceSubmitted); the owner saves it, and closes the dialog or sets
@@ -41,10 +45,15 @@ import "Cards.js" as Cards
 // plain text.
 DialogFrame {
     id: dlg
-    // Wide where there is room, never wider than the window.
-    width: Math.max(300, Math.min(600, (QQC.Overlay.overlay ? QQC.Overlay.overlay.width : 640) - 40))
-    // Short fields share a row from this width on.
-    readonly property bool wide: dlg.availableWidth >= 480
+    // Wide where there is room, never wider than the window (wider when
+    // adding: the list of types stands beside the form).
+    width: Math.max(300, Math.min(editing ? 600 : 820, (QQC.Overlay.overlay ? QQC.Overlay.overlay.width : 640) - 40))
+    // Adding with room for both: the types at the left, the form at the right.
+    readonly property bool twoPane: !dlg.editing && dlg.availableWidth >= 640
+    readonly property int railWidth: 176
+    // Short fields share a row from this width on (the form's part of a
+    // two-pane dialog is always that wide).
+    readonly property bool wide: dlg.twoPane || dlg.availableWidth >= 480
     // Not closed by a click beside it while a set-up waits for its PIN.
     closePolicy: dlg.setupWaiting ? QQC.Popup.CloseOnEscape : (QQC.Popup.CloseOnEscape | QQC.Popup.CloseOnPressOutside)
 
@@ -343,6 +352,10 @@ DialogFrame {
     // The room there is for the form: a long one (many fields) scrolls
     // instead of leaving the window; the title and the buttons stay.
     readonly property real roomHeight: (QQC.Overlay.overlay ? QQC.Overlay.overlay.height : 720) - 90
+    // What is left of it under the title and over the buttons.
+    readonly property real bodyRoom: Math.max(120, dlg.roomHeight - titleText.implicitHeight - 24
+        - (buttonRow.visible ? buttonRow.implicitHeight + 12 : 0)
+        - (errorText.visible ? errorText.implicitHeight + 12 : 0))
 
     FontMetrics { id: optionMetrics; font.pixelSize: 13; font.weight: Font.DemiBold }
 
@@ -363,14 +376,66 @@ DialogFrame {
             elide: Text.ElideRight
         }
 
+      RowLayout {
+        id: body
+        Layout.fillWidth: true
+        spacing: 16
+
+        // ---- The types, as a list beside the form (adding, wide) ----
+        ColumnLayout {
+            id: rail
+            objectName: "typeRail"
+            visible: dlg.twoPane && !dlg.setupShown
+            Layout.preferredWidth: dlg.railWidth
+            Layout.maximumWidth: dlg.railWidth
+            Layout.alignment: Qt.AlignTop
+            spacing: 6
+            FieldLabel { id: railLabel; text: I18n.t("Type") }
+            Flickable {
+                id: railScroller
+                objectName: "railScroller"
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.min(railColumn.implicitHeight, dlg.bodyRoom - railLabel.implicitHeight - rail.spacing)
+                contentHeight: railColumn.implicitHeight
+                clip: contentHeight > height
+                boundsBehavior: Flickable.StopAtBounds
+                QQC.ScrollBar.vertical: QQC.ScrollBar { id: railBar; policy: railScroller.contentHeight > railScroller.height + 1 ? QQC.ScrollBar.AlwaysOn : QQC.ScrollBar.AlwaysOff }
+                Column {
+                    id: railColumn
+                    objectName: "typeOptions"
+                    width: railScroller.width - (railBar.policy === QQC.ScrollBar.AlwaysOn ? 12 : 0)
+                    spacing: 6
+                    Accessible.role: Accessible.Grouping
+                    Accessible.name: I18n.t("Type")
+                    Repeater {
+                        model: dlg.twoPane ? dlg.typeOptions : []
+                        delegate: TypeTile {
+                            required property var modelData
+                            objectName: "typeOption-" + modelData.value
+                            width: railColumn.width
+                            typeId: modelData.value
+                            fullName: I18n.t(modelData.label)
+                            text: Cards.typeShortName(modelData.value, I18n.t(modelData.label))
+                            chosen: dlg.typeId === modelData.value
+                            onClicked: dlg.chooseType(modelData.value)
+                        }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            visible: rail.visible
+            Layout.fillHeight: true
+            Layout.preferredWidth: 1
+            color: Theme.border
+        }
+
       Flickable {
         id: scroller
         objectName: "formScroller"
         Layout.fillWidth: true
-        Layout.preferredHeight: Math.min(form.implicitHeight,
-            Math.max(120, dlg.roomHeight - titleText.implicitHeight - 24
-                - (buttonRow.visible ? buttonRow.implicitHeight + 12 : 0)
-                - (errorText.visible ? errorText.implicitHeight + 12 : 0)))
+        Layout.alignment: Qt.AlignTop
+        Layout.preferredHeight: Math.min(form.implicitHeight, dlg.bodyRoom)
         contentHeight: form.implicitHeight
         clip: contentHeight > height
         boundsBehavior: Flickable.StopAtBounds
@@ -379,7 +444,7 @@ DialogFrame {
       ColumnLayout {
         id: form
         width: scroller.width - (scrollBar.policy === QQC.ScrollBar.AlwaysOn ? 12 : 0)
-        spacing: 12
+        spacing: 10
 
         Note {
             objectName: "methodNote"
@@ -484,16 +549,17 @@ DialogFrame {
             visible: !dlg.setupShown
             Layout.fillWidth: true
             spacing: 6
-            FieldLabel { text: I18n.t("Type") }
-            // The types there are in one row, each a tile to click; with many
-            // types, in as many rows of the same length as they need.
+            FieldLabel { visible: !dlg.twoPane; text: I18n.t("Type") }
+            // Narrow (or editing, where it is not shown): the types in one
+            // row of chips; with many types, in as many rows of the same
+            // length as they need.
             GridLayout {
                 id: typeGrid
-                objectName: "typeOptions"
-                visible: !dlg.editing
+                objectName: "typeChips"
+                visible: !dlg.editing && !dlg.twoPane
                 Layout.fillWidth: true
-                // The most tiles that fit side by side (a tile is 92 wide at least).
-                readonly property int fit: Math.max(1, Math.floor((form.width + columnSpacing) / (92 + columnSpacing)))
+                // The most chips that fit side by side (a chip is 120 wide at least).
+                readonly property int fit: Math.max(1, Math.floor((form.width + columnSpacing) / (120 + columnSpacing)))
                 readonly property int rowsNeeded: Math.max(1, Math.ceil(dlg.typeOptions.length / fit))
                 columns: Math.max(1, Math.ceil(dlg.typeOptions.length / rowsNeeded))
                 columnSpacing: 8
@@ -501,10 +567,11 @@ DialogFrame {
                 Accessible.role: Accessible.Grouping
                 Accessible.name: I18n.t("Type")
                 Repeater {
-                    model: dlg.typeOptions
+                    model: !dlg.editing && !dlg.twoPane ? dlg.typeOptions : []
                     delegate: TypeTile {
                         required property var modelData
                         objectName: "typeOption-" + modelData.value
+                        centered: true
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1
                         typeId: modelData.value
@@ -521,7 +588,8 @@ DialogFrame {
                 objectName: "typeAbout"
                 visible: !dlg.editing && dlg.typeChosen !== null
                 Layout.fillWidth: true
-                Layout.topMargin: 2
+                Layout.topMargin: dlg.twoPane ? 0 : 2
+                Layout.bottomMargin: 4
                 spacing: 2
                 Text {
                     objectName: "typeFullName"
@@ -564,12 +632,12 @@ DialogFrame {
             // The address and the password share a row where there is room.
             columns: dlg.wide ? 2 : 1
             columnSpacing: 12
-            rowSpacing: 12
+            rowSpacing: 10
             ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
                 Layout.alignment: Qt.AlignTop
-                spacing: 5
+                spacing: 4
                 FieldLabel { text: I18n.t("Address") + " *" }
                 InputField { id: addressField; objectName: "addressField"; placeholder: I18n.t("Address, e.g. 192.168.1.20"); onAccepted: dlg.submit() }
             }
@@ -577,7 +645,7 @@ DialogFrame {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
                 Layout.alignment: Qt.AlignTop
-                spacing: 5
+                spacing: 4
                 FieldLabel { text: I18n.t("Password (optional)") }
                 RowLayout {
                     Layout.fillWidth: true
@@ -605,7 +673,7 @@ DialogFrame {
                 Layout.fillWidth: true
                 Layout.columnSpan: parent.columns
                 Layout.alignment: Qt.AlignTop
-                spacing: 5
+                spacing: 4
                 FieldLabel { text: I18n.t("Name (optional)") }
                 InputField { id: lunarisNameField; objectName: "lunarisNameField"; placeholder: I18n.t("Name, e.g. Office PC"); input.maximumLength: 64; onAccepted: dlg.submit() }
             }
@@ -615,7 +683,7 @@ DialogFrame {
         ColumnLayout {
             visible: !dlg.isLunaris && !dlg.setupShown
             Layout.fillWidth: true
-            spacing: 12
+            spacing: 10
 
             // The name and, on a server, the Lunaris computer it is reached
             // through: side by side where that is a line or two options.
@@ -626,13 +694,13 @@ DialogFrame {
                 readonly property bool paired: dlg.wide && dlg.serverMode && (dlg.editing || dlg.throughOptions.length <= 2)
                 columns: paired ? 2 : 1
                 columnSpacing: 12
-                rowSpacing: 12
+                rowSpacing: 10
 
                 ColumnLayout {
                     Layout.fillWidth: true
                     Layout.preferredWidth: 1
                     Layout.alignment: Qt.AlignTop
-                    spacing: 5
+                    spacing: 4
                     FieldLabel { text: I18n.t("Name") + " *" }
                     InputField { id: nameField; objectName: "nameField"; placeholder: I18n.t("Name, e.g. Office PC"); input.maximumLength: 64; onAccepted: dlg.submit() }
                 }
@@ -642,7 +710,7 @@ DialogFrame {
                     Layout.fillWidth: true
                     Layout.preferredWidth: 1
                     Layout.alignment: Qt.AlignTop
-                    spacing: 5
+                    spacing: 4
                     FieldLabel { text: I18n.t("Through which Lunaris computer") }
                     // A few: each a card to click. Many: a list to open.
                     GridLayout {
@@ -661,6 +729,7 @@ DialogFrame {
                                 objectName: "throughOption-" + modelData.value
                                 Layout.fillWidth: true
                                 Layout.preferredWidth: 1
+                                Layout.minimumWidth: 0
                                 plain: true
                                 text: String(modelData.label)
                                 chosen: dlg.throughHost === modelData.value
@@ -710,7 +779,7 @@ DialogFrame {
                 Layout.topMargin: -rowSpacing
                 columns: 6
                 columnSpacing: 12
-                rowSpacing: 12
+                rowSpacing: 10
 
                 // (Six columns of one width, whatever stands in them.)
                 Repeater {
@@ -730,6 +799,8 @@ DialogFrame {
                         // A choice with nothing to choose from is a line to type.
                         readonly property var options: field.kind === "choice" && field.options instanceof Array ? field.options : []
                         readonly property bool choice: options.length > 0
+                        // Many options, or long ones: a drop-down.
+                        readonly property bool asList: Cards.choiceAsList(field)
                         // Edit: what is stored and may be shown; add: the connector's default.
                         readonly property string first: dlg.editing ? String(dlg.editValues[field.key] || "")
                                                                     : String(field["default"] || "")
@@ -742,7 +813,7 @@ DialogFrame {
                         Layout.preferredWidth: Layout.columnSpan
                         Layout.minimumWidth: 0
                         Layout.alignment: Qt.AlignTop
-                        spacing: 5
+                        spacing: 4
                         FieldLabel {
                             text: I18n.t(fieldItem.field.label) + (fieldItem.field.required && !dlg.keepsEmpty(fieldItem.field) ? " *" : "")
                         }
@@ -777,35 +848,50 @@ DialogFrame {
                             Item { visible: fieldItem.port && fieldItem.Layout.columnSpan === 6; Layout.fillWidth: true }
                         }
                         // One of a few: each an option to click (side by side
-                        // where their names fit).
-                        GridLayout {
-                            id: choiceGrid
+                        // where their names fit); of many, a drop-down.
+                        ColumnLayout {
                             objectName: "choice-" + fieldItem.field.key
                             visible: fieldItem.choice
                             Layout.fillWidth: true
-                            readonly property real widest: {
-                                var most = 0;
-                                for (var i = 0; i < fieldItem.options.length; i++)
-                                    most = Math.max(most, optionMetrics.advanceWidth(I18n.t(String(fieldItem.options[i].label))));
-                                return most + 56;
+                            spacing: 0
+                            ThemedCombo {
+                                objectName: "fieldCombo-" + fieldItem.field.key
+                                visible: fieldItem.asList
+                                Layout.fillWidth: true
+                                implicitWidth: 120
+                                options: fieldItem.asList ? fieldItem.options : []
+                                value: fieldItem.picked
+                                onPicked: (v) => fieldItem.picked = String(v)
+                                Accessible.name: I18n.t(fieldItem.field.label)
                             }
-                            readonly property int count: Math.max(1, fieldItem.options.length)
-                            columns: (fieldItem.width + columnSpacing) / count - columnSpacing >= widest ? count : 1
-                            columnSpacing: 8
-                            rowSpacing: 6
-                            Accessible.role: Accessible.Grouping
-                            Accessible.name: I18n.t(fieldItem.field.label)
-                            Repeater {
-                                model: fieldItem.options
-                                delegate: OptionCard {
-                                    required property var modelData
-                                    objectName: "field-" + fieldItem.field.key + "-" + modelData.value
-                                    Layout.fillWidth: true
-                                    Layout.preferredWidth: 1
-                                    plain: true
-                                    text: I18n.t(String(modelData.label))
-                                    chosen: fieldItem.picked === String(modelData.value)
-                                    onClicked: fieldItem.picked = String(modelData.value)
+                            GridLayout {
+                                id: choiceGrid
+                                visible: !fieldItem.asList
+                                Layout.fillWidth: true
+                                readonly property real widest: {
+                                    var most = 0;
+                                    for (var i = 0; i < fieldItem.options.length; i++)
+                                        most = Math.max(most, optionMetrics.advanceWidth(I18n.t(String(fieldItem.options[i].label))));
+                                    return most + 56;
+                                }
+                                readonly property int count: Math.max(1, fieldItem.options.length)
+                                columns: (fieldItem.width + columnSpacing) / count - columnSpacing >= widest ? count : 1
+                                columnSpacing: 8
+                                rowSpacing: 6
+                                Accessible.role: Accessible.Grouping
+                                Accessible.name: I18n.t(fieldItem.field.label)
+                                Repeater {
+                                    model: fieldItem.asList ? [] : fieldItem.options
+                                    delegate: OptionCard {
+                                        required property var modelData
+                                        objectName: "field-" + fieldItem.field.key + "-" + modelData.value
+                                        Layout.fillWidth: true
+                                        Layout.preferredWidth: 1
+                                        plain: true
+                                        text: I18n.t(String(modelData.label))
+                                        chosen: fieldItem.picked === String(modelData.value)
+                                        onClicked: fieldItem.picked = String(modelData.value)
+                                    }
                                 }
                             }
                         }
@@ -823,7 +909,7 @@ DialogFrame {
                 objectName: "sameView"
                 visible: dlg.editing && dlg.sameOptions.length > 0
                 Layout.fillWidth: true
-                spacing: 5
+                spacing: 4
                 FieldLabel { text: I18n.t("Same computer as") }
                 QQC.ScrollView {
                     id: sameScroll
@@ -870,6 +956,7 @@ DialogFrame {
                     : I18n.t("This type is not installed any more: only the name can be changed.")
             }
         }
+      }
       }
       }
 

@@ -43,6 +43,9 @@ struct HostStatus {
     /// RustDesk clients may also use their file manager here
     /// (`rustdesk_file_transfer`; agent/src/rustdesk/files.rs).
     rustdesk_file_transfer: bool,
+    /// Screen capture on a Linux Wayland session: "auto" or "portal"
+    /// (`wayland_capture`; an unknown value is shown as "auto").
+    wayland_capture: String,
     error: String,
 }
 
@@ -207,6 +210,7 @@ pub fn status_json() -> String {
             rustdesk_enabled: config.rustdesk_port.is_some(),
             rustdesk_port: config.rustdesk_port.unwrap_or(agent::rustdesk::DEFAULT_PORT),
             rustdesk_file_transfer: config.rustdesk_file_transfer,
+            wayland_capture: pairing::wayland_capture_preference(&config.wayland_capture).0.as_str().to_string(),
             error: String::new(),
         },
         Err(error) => HostStatus {
@@ -224,6 +228,7 @@ pub fn status_json() -> String {
             rustdesk_enabled: false,
             rustdesk_port: agent::rustdesk::DEFAULT_PORT,
             rustdesk_file_transfer: false,
+            wayland_capture: "auto".into(),
             error,
         },
     };
@@ -380,6 +385,18 @@ pub fn set_approve_mode(mode: &str) -> Result<(), String> {
     }
     let mut config = load_or_create_config()?;
     config.approve_mode = mode.to_string();
+    save(&config)?;
+    restart_if_ours()
+}
+
+/// Screen capture on a Linux Wayland session: "auto" or "portal"
+/// (`wayland_capture`). Restarts the app's agent so new sessions follow.
+pub fn set_wayland_capture(mode: &str) -> Result<(), String> {
+    if !matches!(mode, "auto" | "portal") {
+        return Err(format!("unknown Wayland capture mode {}", mode));
+    }
+    let mut config = load_or_create_config()?;
+    config.wayland_capture = mode.to_string();
     save(&config)?;
     restart_if_ours()
 }

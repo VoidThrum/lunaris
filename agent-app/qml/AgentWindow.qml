@@ -31,8 +31,12 @@ ApplicationWindow {
     property bool agentConnected: false
     property string agentId: ""
     property string agentName: ""
-    property string updateVersion: ""
-    property string updateUrl: ""
+    // The updater's state (bridge.updateStatus(), see updater/src/service.rs).
+    property var update: ({ state: "idle", current: "", latest: "", notes: "", releaseUrl: "",
+                            canInstall: false, manualMessage: "", progress: 0, error: "",
+                            errorKind: "", autoCheck: true })
+    property bool updateDismissed: false
+    readonly property bool updateBusy: ["downloading", "verifying", "installing", "restart"].indexOf(update.state) >= 0
     property bool closeToTray: false
     property bool showLog: false
     property string notice: ""
@@ -43,6 +47,8 @@ ApplicationWindow {
     property bool rustdeskEnabled: false
     property int rustdeskPort: 21118
     property bool rustdeskFileTransfer: false
+    // Screen capture on a Linux Wayland session: "auto" or "portal".
+    property string waylandCapture: "auto"
     property string directPassword: ""
     property var directAddresses: []
 
@@ -76,11 +82,33 @@ ApplicationWindow {
     function restartIfSharing() { if (window.agentActive) { bridge.stopAgent(); restartTimer.restart() } }
     function copyText(t) { clipHelper.text = t; clipHelper.selectAll(); clipHelper.copy(); clipHelper.text = "" }
     function flash(msg, isError) { window.notice = msg; window.noticeError = isError; noticeTimer.restart() }
+    function pollUpdate() {
+        var s
+        try { s = JSON.parse(bridge.updateStatus()) } catch (e) { return }
+        window.update = s
+        // Installed: quit, the agent starts again by itself.
+        if (s.state === "restart" && bridge.updateRestart()) Qt.quit()
+    }
+    function updateStateText() {
+        var u = window.update
+        switch (u.state) {
+        case "checking": return "Checking for updates…"
+        case "upToDate": return "Lunaris is up to date"
+        case "downloading": return "Downloading " + Math.round(u.progress * 100) + "%…"
+        case "verifying": return "Checking the signature…"
+        case "installing": return "Installing…"
+        case "restart": return "Restarting…"
+        case "error": return u.error
+        case "available": return "Lunaris " + u.latest + " is available"
+        }
+        return ""
+    }
 
     // ── Timers ──
     Timer { interval: 100;  running: true; repeat: true; onTriggered: bridge.pollLogs() }
     Timer { interval: 2000; running: true; repeat: true; onTriggered: bridge.pollStatus() }
-    Timer { interval: 3600000; running: true; repeat: true; onTriggered: bridge.checkForUpdates() }
+    // The updater checks by itself (at start, then daily); this shows its state.
+    Timer { interval: 1000; running: true; repeat: true; triggeredOnStart: true; onTriggered: pollUpdate() }
     Timer { id: noticeTimer; interval: 3500; onTriggered: window.notice = "" }
     // Give the stopped agent a moment to release the direct-connection port.
     Timer { id: restartTimer; interval: 800; onTriggered: bridge.startAgent() }
@@ -193,18 +221,58 @@ ApplicationWindow {
             }
         }
 
-        // Update banner
+        // Update banner: a newer release, the download/install progress, or
+        // why the update failed.
         Rectangle {
-            visible: window.updateVersion !== ""
+            id: updateBanner
+            objectName: "updateBanner"
+            visible: window.update.latest !== "" && !window.updateDismissed
+                     && (window.update.state === "available" || window.updateBusy
+                         || (window.update.state === "error" && window.update.errorKind !== "check"))
             Layout.fillWidth: true
-            implicitHeight: 38
+            implicitHeight: bannerCol.implicitHeight + 16
             radius: Theme.radius
-            color: Theme.accentA(0.12)
-            border.color: Theme.accentA(0.4)
-            RowLayout {
-                anchors.fill: parent; anchors.leftMargin: 12; anchors.rightMargin: 8
-                Text { text: "Lunaris " + window.updateVersion + " is available"; color: Theme.textStrong; font.pixelSize: 12; Layout.fillWidth: true }
-                LinkButton { text: "Download"; color: Theme.accentFg; onClicked: bridge.openUrl(window.updateUrl) }
+            color: window.update.state === "error" ? Qt.rgba(Theme.danger.r, Theme.danger.g, Theme.danger.b, 0.10) : Theme.accentA(0.12)
+            border.color: window.update.state === "error" ? Theme.danger : Theme.accentA(0.4)
+            ColumnLayout {
+                id: bannerCol
+                anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: 12; anchors.rightMargin: 8
+                spacing: 4
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Text {
+                        objectName: "updateBannerText"
+                        text: window.update.state === "available" ? "Lunaris " + window.update.latest + " is available" : updateStateText()
+                        color: window.update.state === "error" ? Theme.danger : Theme.textStrong
+                        font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.Wrap
+                    }
+                    LinkButton {
+                        visible: !window.updateBusy && window.update.canInstall
+                        objectName: "updateBannerInstall"
+                        text: window.update.state === "error" ? "Try again" : "Update"
+                        color: Theme.accentFg; font.weight: Font.DemiBold
+                        onClicked: bridge.updateInstall()
+                    }
+                    LinkButton {
+                        visible: !window.updateBusy && !window.update.canInstall
+                        text: "Download"; color: Theme.accentFg
+                        onClicked: bridge.openUrl(window.update.releaseUrl)
+                    }
+                    LinkButton { visible: !window.updateBusy; text: "✕"; onClicked: window.updateDismissed = true }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    visible: window.update.state === "available" && !window.update.canInstall && window.update.manualMessage !== ""
+                    text: window.update.manualMessage
+                    color: Theme.textMuted; font.pixelSize: 11; wrapMode: Text.Wrap
+                }
+                ProgressBar {
+                    Layout.fillWidth: true
+                    visible: window.update.state === "downloading"
+                    from: 0; to: 1; value: window.update.progress
+                }
             }
         }
 
@@ -425,6 +493,78 @@ ApplicationWindow {
             }
         }
 
+        // Updates
+        Card {
+            Layout.fillWidth: true
+            implicitHeight: updatesCol.implicitHeight + 28
+            ColumnLayout {
+                id: updatesCol
+                anchors.fill: parent; anchors.margins: 14
+                spacing: 8
+                SectionLabel { text: "UPDATES" }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Text {
+                        text: "Version " + window.update.current
+                        color: Theme.text; font.pixelSize: 13; Layout.fillWidth: true
+                    }
+                    LinkButton {
+                        objectName: "updateCheckNow"
+                        visible: !window.updateBusy && window.update.state !== "checking"
+                        text: "Check now"
+                        onClicked: bridge.checkForUpdates()
+                    }
+                }
+                Toggle {
+                    text: "Check for updates automatically"
+                    checked: window.update.autoCheck
+                    onToggled: bridge.setUpdateAutoCheck(checked)
+                }
+                Text {
+                    Layout.fillWidth: true
+                    visible: text !== "" && window.update.state !== "available"
+                    text: updateStateText()
+                    color: window.update.state === "error" ? Theme.danger : Theme.textMuted
+                    font.pixelSize: 12; wrapMode: Text.Wrap
+                }
+                Text {
+                    Layout.fillWidth: true
+                    visible: window.update.latest !== "" && window.update.notes !== ""
+                    text: window.update.notes
+                    textFormat: Text.PlainText
+                    color: Theme.textMuted; font.pixelSize: 11; wrapMode: Text.Wrap
+                    maximumLineCount: 8; elide: Text.ElideRight
+                }
+            }
+        }
+
+        // Screen capture on Wayland (Linux only)
+        Card {
+            visible: Qt.platform.os === "linux"
+            Layout.fillWidth: true
+            implicitHeight: waylandCol.implicitHeight + 28
+            ColumnLayout {
+                id: waylandCol
+                anchors.fill: parent; anchors.margins: 14
+                spacing: 8
+                SectionLabel { text: "WAYLAND SCREEN CAPTURE" }
+                Toggle {
+                    text: "Ask through the portal"
+                    checked: window.waylandCapture === "portal"
+                    onToggled: { bridge.setWaylandCapture(checked ? "portal" : "auto"); restartIfSharing() }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: window.waylandCapture === "portal"
+                        ? "The capture service is never used: the person at this computer approves on the desktop (remembered until withdrawn there), which shows the screen is shared."
+                        : "Automatic: no prompt when the capture service is installed, otherwise the desktop asks. For Linux desktops on Wayland."
+                    color: Theme.textMuted; font.pixelSize: 12
+                }
+            }
+        }
+
         }
         }
         }
@@ -531,11 +671,11 @@ ApplicationWindow {
         function onImportCompleted(success, error) {
             if (success) flash("Configuration imported", false); else if (error !== "") flash("Import failed: " + error, true)
         }
-        function onUpdateAvailable(version, url) { window.updateVersion = version; window.updateUrl = url }
         function onRustdeskConfigLoaded(enabled, port) {
             window.rustdeskEnabled = enabled; window.rustdeskPort = port
         }
         function onRustdeskFileTransferLoaded(enabled) { window.rustdeskFileTransfer = enabled }
+        function onWaylandCaptureLoaded(mode) { window.waylandCapture = mode.toString() }
         function onDirectConfigLoaded(enabled, port, password, addresses) {
             window.directEnabled = enabled; window.directPort = port; window.directPassword = password
             var a = addresses.toString(); window.directAddresses = a === "" ? [] : a.split("\n")
@@ -543,5 +683,9 @@ ApplicationWindow {
     }
 
     onClosing: (close) => { if (window.closeToTray) { close.accepted = false; window.hide() } }
-    Component.onCompleted: { bridge.loadConfig(); bridge.loadDirectConfig(); window.show() }
+    Component.onCompleted: {
+        bridge.loadConfig(); bridge.loadDirectConfig(); window.show()
+        // Started again after an update while it was sharing: share again.
+        if (bridge.resumeSharingAfterUpdate()) saveAndStart()
+    }
 }

@@ -27,6 +27,12 @@ RequestExecutionLevel admin
 !insertmacro MUI_LANGUAGE "English"
 
 
+; The agent's Windows service (LunarisAgentService, `--install-service`, see
+; agent/src/win_service.rs) runs the program from its install folder, which
+; keeps the files in use. An install (also the app's silent update, `/S`)
+; stops it before copying and starts it again afterwards when it was running.
+Var ServiceWasRunning
+
 ; ---- Safe install / uninstall -------------------------------------------------
 ; The uninstaller removes only what the installer put there (install.log), never a
 ; whole folder, so a mistaken install folder cannot lose the user's own files.
@@ -143,6 +149,13 @@ Section "Install"
   StrCmp $InstDirOk 1 +3
     MessageBox MB_OK|MB_ICONSTOP "The install folder $INSTDIR is not empty and is not a previous install. Choose an empty folder." /SD IDOK
     Abort
+  ; Stop the agent service (if installed and running) so its files can be replaced.
+  StrCpy $ServiceWasRunning 0
+  nsExec::Exec 'net stop LunarisAgentService'
+  Pop $0
+  StrCmp $0 0 0 svc_not_running
+    StrCpy $ServiceWasRunning 1
+  svc_not_running:
   SetOutPath "$INSTDIR"
   File /r "lunaris-client-desktop\*"
 
@@ -166,7 +179,12 @@ Section "Install"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "DisplayIcon" '"$INSTDIR\client-desktop.exe"'
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "Publisher" "Lunaris"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "DisplayVersion" "0.6.1"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunaris Client" "DisplayVersion" "0.6.4"
+  ; Start the service again with the new files.
+  StrCmp $ServiceWasRunning 1 0 svc_done
+    nsExec::Exec 'net start LunarisAgentService'
+    Pop $0
+  svc_done:
 SectionEnd
 
 Section "Uninstall"

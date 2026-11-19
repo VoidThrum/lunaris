@@ -103,6 +103,20 @@ Rectangle {
     readonly property var cards: Cards.buildCards(hostsList, sourcesList, function (s) {
         return Cards.typeShortName(s.connector, I18n.t(String(s.connector_name || s.connector || "")));
     }, "Lunaris")
+    // Finding a computer (ComputerFinder.qml; Cards.js): the search, the
+    // types among the cards, the one filtered by (ViewPrefs, shared with
+    // Home's list) and the cards shown, in the grid or as a list.
+    property string searchText: ""
+    readonly property var cardTypes: Cards.typesOf(cards, function (id, source) {
+        return id === "lunaris" ? "Lunaris" : Cards.typeShortName(id, I18n.t(String(source ? (source.connector_name || id) : id)));
+    })
+    readonly property string cardType: Cards.effectiveType(cardTypes, ViewPrefs.computerType)
+    readonly property var shownCards: Cards.filterCards(cards, searchText, cardType)
+    readonly property bool listView: ViewPrefs.computerView === "list"
+    function clearFinding() {
+        dashboardRoot.searchText = "";
+        ViewPrefs.computerType = "";
+    }
     // The way used last for a card: { "<card key>": "<method key>" }. The
     // owner (Home) keeps it between runs: it sets this when it starts and
     // saves it on `cardMethodChosen`.
@@ -371,11 +385,17 @@ Rectangle {
                 dashboardRoot.isLoggedIn = true;
                 dashboardRoot.authError = "";
                 bridge.fetchHosts();
-            } else {
+            } else if (!mfaDialog.visible) {
                 dashboardRoot.authError = errorMsg;
             }
         }
 
+        // The password was right; the account wants a code from its app.
+        function onMfaRequired(srv, user) {
+            dashboardRoot.authLoading = false;
+            dashboardRoot.authError = "";
+            mfaDialog.begin(user);
+        }
 
 
         function onCredentialsLoaded(success, srv, tok, user) {
@@ -1006,27 +1026,49 @@ Rectangle {
                 }
             }
 
-            // Hosts Grid
-            ScrollView {
+            // Search, the type of computer, how many, grid or list.
+            ComputerFinder {
+                id: serverFinder
+                objectName: "serverFinder"
+                visible: dashboardRoot.cards.length > 0
                 anchors.top: sectionHeader.bottom
+                anchors.topMargin: visible ? 24 : 0
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: visible ? implicitHeight : 0
+                searchText: dashboardRoot.searchText
+                types: dashboardRoot.cardTypes
+                typeFilter: dashboardRoot.cardType
+                total: dashboardRoot.cards.length
+                shown: dashboardRoot.shownCards.length
+                view: ViewPrefs.computerView
+                onSearchEdited: (text) => dashboardRoot.searchText = text
+                onTypeChosen: (id) => ViewPrefs.computerType = id
+                onViewChosen: (view) => ViewPrefs.computerView = view
+            }
+
+            // Hosts Grid (or, as a list, a grid of one column of rows)
+            ScrollView {
+                anchors.top: serverFinder.bottom
                 anchors.bottom: parent.bottom
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.topMargin: 32
+                anchors.topMargin: serverFinder.visible ? 10 : 32
                 clip: true
 
                 GridView {
                     id: hostsGrid
+                    objectName: "serverGrid"
                     anchors.fill: parent
                     topMargin: 8
-                    cellWidth: 330
-                    cellHeight: 190
-                    model: dashboardRoot.cards.length > 0 ? dashboardRoot.cards : 0
+                    cellWidth: dashboardRoot.listView ? Math.max(0, width - 12) : 330
+                    cellHeight: dashboardRoot.listView ? 66 : 190
+                    model: dashboardRoot.shownCards.length > 0 ? dashboardRoot.shownCards : 0
 
                     delegate: Item {
                         id: hostDelegate
-                        width: 290
-                        height: 180
+                        width: dashboardRoot.listView ? hostsGrid.cellWidth : 290
+                        height: dashboardRoot.listView ? 58 : 180
 
                         objectName: "serverCard"
                         property bool isHostHovered: cardMouseArea.containsMouse || webBtn.hovered || gearBtn.hovered || editBtn.hovered || deleteBtn.hovered || connectBtn.hovered || chooseBtn.hovered || addMethodBtn.hovered
@@ -1042,11 +1084,20 @@ Rectangle {
                         readonly property bool isSource: !!method.source
                         readonly property string status: isSource ? (item.online ? "Online" : "Offline") : item.status
                         function connect() { dashboardRoot.connectMethod(cardData, method); }
+                        // Which of the card's buttons it has (the grid's card and the list's row alike).
+                        readonly property bool hasWeb: status === "Online" && !isSource
+                        readonly property bool hasFiles: (status === "Online" || status === "Busy")
+                            && !(isSource && item.capabilities && item.capabilities.files === false)
+                        readonly property bool hasSettings: status === "Online" || status === "Busy"
+                        readonly property bool hasEdit: isSource && dashboardRoot.isAdmin
+                        readonly property bool hasAddMethod: dashboardRoot.isAdmin && !multi && dashboardRoot.takesMethods(cardData)
+                        readonly property bool hasRemove: !isSource || dashboardRoot.isAdmin
 
                         // Static background click handler to avoid hover-translation flicker
                         MouseArea {
                             id: cardMouseArea
-                            width: 270; height: 160
+                            width: dashboardRoot.listView ? hostDelegate.width : 270
+                            height: dashboardRoot.listView ? hostDelegate.height : 160
                             hoverEnabled: true
                             onClicked: {
                                 if (hostDelegate.status === "Online") hostDelegate.connect();
@@ -1056,6 +1107,7 @@ Rectangle {
                         // Device card (translates up 4px smoothly on hover based on parent static MouseArea)
                         Rectangle {
                             id: card
+                            visible: !dashboardRoot.listView
                             width: 310
                             height: 170
                             radius: 14
@@ -1268,7 +1320,7 @@ Rectangle {
                                     // Remote control in the browser (web console, signed in)
                                     Button {
                                         id: webBtn
-                                        visible: hostDelegate.status === "Online" && !hostDelegate.isSource
+                                        visible: hostDelegate.hasWeb
                                         hoverEnabled: true
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
@@ -1292,8 +1344,7 @@ Rectangle {
                                         id: filesBtn
                                         objectName: "cardFilesButton"
                                         // Not for a computer of another type whose connector says it has no files.
-                                        visible: (hostDelegate.status === "Online" || hostDelegate.status === "Busy")
-                                            && !(hostDelegate.isSource && hostDelegate.item.capabilities && hostDelegate.item.capabilities.files === false)
+                                        visible: hostDelegate.hasFiles
                                         hoverEnabled: true
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
@@ -1318,7 +1369,7 @@ Rectangle {
                                     // Settings Gear Icon (Sleek custom vector gear)
                                     Button {
                                         id: gearBtn
-                                        visible: hostDelegate.status === "Online" || hostDelegate.status === "Busy"
+                                        visible: hostDelegate.hasSettings
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
                                         ToolTip.text: I18n.t("Stream settings")
@@ -1339,7 +1390,7 @@ Rectangle {
                                     // Name and fields of a computer of another type (administrators)
                                     Button {
                                         id: editBtn
-                                        visible: hostDelegate.isSource && dashboardRoot.isAdmin
+                                        visible: hostDelegate.hasEdit
                                         hoverEnabled: true
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
@@ -1364,7 +1415,7 @@ Rectangle {
                                     Button {
                                         id: addMethodBtn
                                         objectName: "cardAddMethodButton"
-                                        visible: dashboardRoot.isAdmin && !hostDelegate.multi && dashboardRoot.takesMethods(hostDelegate.cardData)
+                                        visible: hostDelegate.hasAddMethod
                                         hoverEnabled: true
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
@@ -1385,7 +1436,7 @@ Rectangle {
 
                                     Button {
                                         id: deleteBtn
-                                        visible: !hostDelegate.isSource || dashboardRoot.isAdmin
+                                        visible: hostDelegate.hasRemove
                                         hoverEnabled: true
                                         ToolTip.visible: hovered
                                         ToolTip.delay: 400
@@ -1410,8 +1461,163 @@ Rectangle {
                                 }
                             }
                         }
+
+                        // The list's row: the same computer, the same buttons
+                        // (made only for the list).
+                        Loader {
+                            anchors.fill: parent
+                            active: dashboardRoot.listView
+                            sourceComponent: Rectangle {
+                                id: rowCard
+                                objectName: "serverRow"
+                                radius: 10
+                                color: Theme.surface
+                                border.color: hostDelegate.isHostHovered || rowHover.hovered ? Theme.borderStrong : Theme.border
+                                HoverHandler { id: rowHover }
+                                readonly property color statusColor: hostDelegate.status === "Online" ? "#22c55e" : (hostDelegate.status === "Busy" ? "#f59e0b" : "#ef4444")
+
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 12
+                                    anchors.rightMargin: 10
+                                    spacing: 8
+                                    TypeLogo {
+                                        typeId: Cards.methodType(hostDelegate.method)
+                                        name: String(hostDelegate.method.label || "")
+                                        size: 34
+                                    }
+                                    Column {
+                                        Layout.fillWidth: true
+                                        Layout.minimumWidth: 60
+                                        spacing: 2
+                                        Text {
+                                            objectName: "cardTitle"
+                                            width: parent.width
+                                            textFormat: Text.PlainText
+                                            text: hostDelegate.cardData.title
+                                            font.pixelSize: 14
+                                            font.weight: Font.DemiBold
+                                            color: Theme.textStrong
+                                            elide: Text.ElideRight
+                                        }
+                                        Row {
+                                            width: parent.width
+                                            spacing: 6
+                                            Rectangle { width: 7; height: 7; radius: 3.5; color: rowCard.statusColor; anchors.verticalCenter: parent.verticalCenter }
+                                            Text {
+                                                width: parent.width - 13
+                                                textFormat: Text.PlainText
+                                                text: I18n.t(hostDelegate.status) + "  ·  " + (hostDelegate.isSource
+                                                    ? I18n.t("via %1").arg(hostDelegate.item.host_name)
+                                                    : (hostDelegate.item.link_error ? I18n.t(hostDelegate.item.link_error)
+                                                       : (hostDelegate.item.address ? String(hostDelegate.item.address).replace(/:8091$/, "")
+                                                          : (hostDelegate.item.ip_address || I18n.t("Connected via Agent")))))
+                                                font.pixelSize: 12
+                                                color: !hostDelegate.isSource && hostDelegate.item.link_error ? Theme.danger : Theme.textMuted
+                                                elide: Text.ElideRight
+                                            }
+                                        }
+                                    }
+                                    MethodChips {
+                                        objectName: "rowChips"
+                                        visible: hostDelegate.multi && rowCard.width > 620
+                                        Layout.preferredWidth: Math.min(300, rowCard.width * 0.34)
+                                        Layout.preferredHeight: 20
+                                        Layout.alignment: Qt.AlignVCenter
+                                        clip: true
+                                        oneRow: true
+                                        methods: hostDelegate.multi ? hostDelegate.cardData.methods : []
+                                        current: hostDelegate.method.key
+                                        onChosen: (key) => dashboardRoot.chooseMethod(hostDelegate.cardData, key)
+                                    }
+                                    IconButton {
+                                        visible: hostDelegate.hasWeb && rowCard.width > 640
+                                        iconName: "globe"
+                                        tip: I18n.t("Open in the browser")
+                                        onClicked: webBtn.clicked()
+                                    }
+                                    IconButton {
+                                        visible: hostDelegate.hasFiles && rowCard.width > 480
+                                        iconName: "folder"
+                                        tip: I18n.t("Files")
+                                        onClicked: filesBtn.clicked()
+                                    }
+                                    IconButton {
+                                        visible: hostDelegate.hasSettings && rowCard.width > 480
+                                        iconName: "settings"
+                                        tip: I18n.t("Stream settings")
+                                        onClicked: gearBtn.clicked()
+                                    }
+                                    IconButton {
+                                        visible: hostDelegate.hasEdit && rowCard.width > 640
+                                        iconName: "edit"
+                                        tip: I18n.t("Edit")
+                                        onClicked: editBtn.clicked()
+                                    }
+                                    IconButton {
+                                        visible: hostDelegate.hasAddMethod && rowCard.width > 640
+                                        iconName: "plus"
+                                        tip: I18n.t("Add a connection method")
+                                        onClicked: addMethodBtn.clicked()
+                                    }
+                                    IconButton {
+                                        visible: hostDelegate.hasRemove && rowCard.width > 560
+                                        iconName: "trash"
+                                        tip: I18n.t("Remove")
+                                        onClicked: deleteBtn.clicked()
+                                    }
+                                    // (The same room in every row: the buttons line up.)
+                                    Item {
+                                        Layout.preferredWidth: Math.max(rowConnectRow.width, 124)
+                                        Layout.preferredHeight: 30
+                                        Row {
+                                            id: rowConnectRow
+                                            anchors.right: parent.right
+                                            spacing: 1
+                                            PrimaryButton {
+                                                objectName: "rowConnect"
+                                                visible: hostDelegate.status === "Online"
+                                                text: I18n.t("Connect")
+                                                implicitHeight: 30
+                                                leftPadding: 14
+                                                rightPadding: 14
+                                                onClicked: hostDelegate.connect()
+                                            }
+                                            Button {
+                                                id: rowChooseBtn
+                                                objectName: "rowChooseButton"
+                                                visible: hostDelegate.multi
+                                                hoverEnabled: true
+                                                ToolTip.visible: hovered
+                                                ToolTip.delay: 400
+                                                ToolTip.text: I18n.t("Choose how to connect")
+                                                Accessible.name: I18n.t("Choose how to connect")
+                                                onClicked: methodMenu.openFor(hostDelegate.cardData, rowChooseBtn)
+                                                background: Rectangle {
+                                                    implicitWidth: 24; implicitHeight: 30; radius: Theme.radiusSm
+                                                    color: rowChooseBtn.hovered ? Theme.accentHover : Theme.accent
+                                                }
+                                                contentItem: Item {
+                                                    implicitWidth: 12; implicitHeight: 16
+                                                    Icon { anchors.centerIn: parent; name: "chevronDown"; size: 14; color: Theme.textOnAccent }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+            }
+
+            // Computers there are, but the search and the filter find none.
+            NoMatch {
+                objectName: "serverNoMatch"
+                anchors.centerIn: parent
+                visible: dashboardRoot.cards.length > 0 && dashboardRoot.shownCards.length === 0
+                width: Math.min(parent.width - 48, 420)
+                onCleared: dashboardRoot.clearFinding()
             }
 
             // Empty state view
@@ -2093,5 +2299,11 @@ Rectangle {
                 }
             }
         }
+    }
+
+    // Two-factor sign-in: the code from the authenticator app (MfaDialog.qml).
+    MfaDialog {
+        id: mfaDialog
+        onExpired: dashboardRoot.authError = I18n.t("This sign-in has expired. Sign in again.")
     }
 }

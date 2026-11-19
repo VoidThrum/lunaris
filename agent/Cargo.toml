@@ -10,6 +10,9 @@ static-ffmpeg = ["dep:ffmpeg-sys-next", "ffmpeg-sys-next/static"]
 
 [dependencies]
 common = { path = "../common" }
+# restart.rs: the headless agent re-executes itself when its program file is
+# replaced by an update (updater::restart::watch_executable).
+updater = { path = "../updater" }
 lunaris-media = { git = "https://github.com/collyn/lunaris-media.git" }
 ffmpeg-sys-next = { version = "8.1", optional = true, default-features = false }
 bitflags = "2"
@@ -71,7 +74,11 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # connector/sunshine (GameStream client):
 # RSA-2048 key generation for the client identity (ring cannot generate RSA
 # keys); signing and verifying stay with ring.
-rsa = "0.10"
+# Pinned to the release candidate that sspi (connector/rdp, through
+# ironrdp-connector) pins with `=`: Cargo keeps one 0.10 per build, and 0.10.0
+# final cannot be beside it. Same key generation (rsa 0.10.0 only renamed
+# `RsaPrivateKey` to `PrivateKey`).
+rsa = "=0.10.0-rc.18"
 # AES-128 single blocks for the pairing challenge (ECB without padding; ring
 # has no raw block interface), AES-128-GCM of video packets, the control
 # stream and RTSP, AES-128-CBC of audio packets.
@@ -81,6 +88,32 @@ cbc = "0.2.1"
 # ENet, the transport of the GameStream control stream (pure Rust port of
 # ENet 1.3.18; Sunshine uses a fork with the same wire format).
 rusty_enet = "0.4.1"
+# connector/rdp: IronRDP (Devolutions, MIT OR Apache-2.0), the client side of
+# RDP: connection sequence with CredSSP/NLA (sspi, through ironrdp-connector),
+# the active session (bitmap codecs, pointer), the clipboard channel, input
+# state, the tokio framing; ironrdp-displaycontrol only for its size rule.
+# One generation of crates (ironrdp-pdu 0.11).
+ironrdp-connector = "0.12"
+ironrdp-session = "0.13"
+ironrdp-pdu = "0.11"
+ironrdp-core = "0.3"
+ironrdp-graphics = "0.11"
+ironrdp-tokio = "0.12"
+ironrdp-cliprdr = "0.9"
+ironrdp-displaycontrol = "0.10"
+ironrdp-input = "0.9"
+# connector/rdp/tls.rs: the server certificate's public key for CredSSP
+# (the same parser ironrdp-tls uses for `extract_tls_server_public_key`).
+x509-cert = { version = "0.3", default-features = false, features = ["std"] }
+# connector/vnc: VNC Authentication (RFC 6143 7.2.2) is DES; ZRLE is zlib.
+des = "0.9"
+flate2 = "1"
+
+[dev-dependencies]
+# connector/rdp/fake_server.rs: IronRDP's server side of the connection
+# sequence, for the RDP connector's tests (same generation as the client).
+ironrdp-acceptor = "0.12"
+ironrdp-svc = "0.10"
 
 [build-dependencies]
 # build.rs: message.proto -> Rust; protox is a protobuf compiler in pure Rust,

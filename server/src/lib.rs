@@ -16,7 +16,9 @@ mod admin;
 mod auth;
 pub mod bridge;
 mod db;
+mod install;
 mod links;
+mod mfa;
 mod paths;
 mod queue;
 mod security;
@@ -24,6 +26,7 @@ mod service;
 mod sources;
 mod tls;
 mod turn;
+pub mod update_notice;
 mod web;
 
 pub mod signaling;
@@ -205,8 +208,11 @@ pub(crate) fn init_logging(log_file: Option<&std::path::Path>) {
 fn run_foreground() -> Result<(), String> {
     init_logging(None);
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    rt.block_on(run_server(shutdown_signal()))
-        .map_err(|e| e.to_string())
+    rt.block_on(async {
+        update_notice::spawn();
+        run_server(shutdown_signal()).await
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Ctrl+C, or SIGTERM from systemd / docker stop.
@@ -230,15 +236,26 @@ async fn shutdown_signal() {
 
 /// Ports the server listens on: agents use ws:// on `http`, browsers may
 /// prefer `https` (controllers and the clipboard need a secure page).
-async fn ports_handler() -> axum::Json<serde_json::Value> {
+async fn ports_handler(via_tls: Option<axum::Extension<tls::ViaTls>>) -> axum::Json<serde_json::Value> {
     let http: u16 = std::env::var("SERVER_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8090);
-    axum::Json(serde_json::json!({ "http": http, "https": tls::https_port() }))
+    axum::Json(ports_json(http, via_tls.is_some()))
+}
+
+/// https_self_signed: this page came over the server's own HTTPS listener
+/// with its own certificate, which curl and PowerShell refuse (the web then
+/// starts the install command with the self-signed option). Not through a
+/// reverse proxy, whose certificate is usually trusted: `curl -k` there would
+/// only throw away the check on a script that runs as root.
+fn ports_json(http: u16, via_tls: bool) -> serde_json::Value {
+    serde_json::json!({ "http": http, "https": tls::https_port(), "https_self_signed": via_tls && tls::self_signed() })
 }
 
 /// Runs the server until `shutdown` completes.
 pub(crate) async fn run_server(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything listens: a weak sign-in key is a configuration error.
+    auth::check_jwt_secret_env()?;
     let database_url = find_database_url();
 
     info!("Initializing SQLite database: {}", database_url);
@@ -269,6 +286,14 @@ pub(crate) async fn run_server(
     let mut app = Router::new()
         .route("/api/auth/login", post(login_handler))
         .route("/api/auth/me", get(admin::get_current_user))
+        // Two-factor sign-in with an authenticator app (mfa.rs).
+        .route("/api/auth/login/mfa", post(mfa::login_mfa_handler))
+        .route("/api/auth/mfa", get(mfa::status))
+        .route("/api/auth/mfa/setup", post(mfa::setup))
+        .route("/api/auth/mfa/enable", post(mfa::enable))
+        .route("/api/auth/mfa/disable", post(mfa::disable))
+        .route("/api/auth/mfa/recovery-codes", post(mfa::regenerate_recovery_codes))
+        .route("/api/admin/users/{id}/mfa", delete(mfa::admin_reset))
         .route("/api/hosts", get(hosts_handler))
         .route("/api/hosts/{id}", delete(delete_host_handler))
         .route("/api/admin/hosts/{id}/reset-key", post(admin::reset_host_key))
@@ -312,6 +337,14 @@ pub(crate) async fn run_server(
             "/api/admin/turn-servers/{id}",
             delete(admin::delete_turn_server),
         )
+        // One-line agent installation (install.rs).
+        .route(
+            "/api/admin/install-tokens",
+            get(install::list_tokens).post(install::create_token),
+        )
+        .route("/api/admin/install-tokens/{id}", delete(install::revoke_token))
+        .route("/install/agent.sh", get(install::agent_sh))
+        .route("/install/agent.ps1", get(install::agent_ps1))
         .route("/ws/agent", get(agent_ws_handler))
         .route("/ws/client", get(client_ws_handler));
 
@@ -388,7 +421,7 @@ async fn login_handler(
     ConnectInfo(addrs): ConnectInfo<signaling::ConnAddrs>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<LoginRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let now = std::time::Instant::now();
     let ip_key = security::client_ip(addrs.remote.ip(), &headers).to_string();
     // Per name *and* address: guessing from one address can't lock the
@@ -398,8 +431,8 @@ async fn login_handler(
         return Err(too_many_attempts());
     }
 
-    let row: Option<(String, String, String, i64)> = sqlx::query_as(
-        "SELECT id, password_hash, COALESCE(role, 'user') as role, is_active FROM users WHERE username = ?",
+    let row: Option<(String, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, password_hash, COALESCE(role, 'user') as role, is_active, token_version FROM users WHERE username = ?",
     )
     .bind(&payload.username)
     .fetch_optional(&state.db)
@@ -414,11 +447,15 @@ async fn login_handler(
 
     // Unknown users are checked against a dummy hash: same time as a wrong password.
     let (found, hash) = match &row {
-        Some((_, hash, _, _)) => (true, hash.clone()),
+        Some((_, hash, ..)) => (true, hash.clone()),
         None => (false, DUMMY_HASH.to_string()),
     };
     let password_ok = verify_password_blocking(payload.password.clone(), hash).await;
-    let Some((user_id, _, role, is_active)) = row.filter(|_| found && password_ok) else {
+    // A disabled account answers like a wrong password (and counts as a
+    // failure): the answer must not tell whether a guessed password was right.
+    let Some((user_id, _, role, _, token_version)) =
+        row.filter(|(_, _, _, active, _)| found && password_ok && *active != 0)
+    else {
         state.login_ip_limit.record_failure(&ip_key, now);
         state.login_user_limit.record_failure(&user_key, now);
         return Err((
@@ -427,14 +464,21 @@ async fn login_handler(
         ));
     };
     state.login_user_limit.reset(&user_key);
-    if is_active == 0 {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "This account is disabled" })),
-        ));
+
+    // Two-factor sign-in on: no session yet, only the step that asks for the code.
+    match mfa::is_enabled(&state.db, &user_id).await {
+        Ok(true) => return Ok(mfa::challenge(&state, &user_id, &payload.username)),
+        Ok(false) => {}
+        Err(e) => {
+            error!("Database error: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal Database Error" })),
+            ));
+        }
     }
 
-    let token = create_jwt(&user_id, &payload.username, &role).map_err(|e| {
+    let token = create_jwt(&user_id, &payload.username, &role, token_version).map_err(|e| {
         error!("Token error: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -449,7 +493,8 @@ async fn login_handler(
             username: payload.username,
             role,
         }),
-    ))
+    )
+        .into_response())
 }
 
 async fn check_host_online(ip: &str, port: u16) -> bool {
@@ -647,6 +692,12 @@ async fn delete_host_handler(
         let _ = session.peer_connection.close().await;
     }
 
+    // Its group memberships go explicitly (foreign keys are not on for every
+    // pooled connection): an agent registering this id again starts with none.
+    let _ = sqlx::query("DELETE FROM host_groups WHERE host_id = ?")
+        .bind(&host_id)
+        .execute(&state.db)
+        .await;
     if let Err(e) = sqlx::query("DELETE FROM hosts WHERE id = ?")
         .bind(&host_id)
         .execute(&state.db)
@@ -659,6 +710,8 @@ async fn delete_host_handler(
         )
             .into_response();
     }
+    // The agent connected as this host is disconnected, its sessions end.
+    signaling::disconnect_agent(&state, &host_id).await;
 
     StatusCode::OK.into_response()
 }
@@ -714,7 +767,8 @@ mod tests {
     async fn login_limit_and_inactive_users() {
         let state = state_with_users().await;
         assert_eq!(login(&state, "10.0.0.1", "alice", "right-pw").await, StatusCode::OK);
-        assert_eq!(login(&state, "10.0.0.1", "carol", "right-pw").await, StatusCode::FORBIDDEN);
+        // A disabled account answers like a wrong password (no password oracle).
+        assert_eq!(login(&state, "10.0.0.1", "carol", "right-pw").await, StatusCode::UNAUTHORIZED);
         assert_eq!(login(&state, "10.0.0.1", "carol", "wrong").await, StatusCode::UNAUTHORIZED);
         for _ in 0..10 {
             assert_eq!(login(&state, "10.0.0.2", "alice", "wrong").await, StatusCode::UNAUTHORIZED);
@@ -772,12 +826,24 @@ mod tests {
                 .into_parts()
                 .0
         };
-        let mut ok = parts(auth::create_jwt("u1", "alice", "user").unwrap());
+        let mut ok = parts(auth::create_jwt("u1", "alice", "user", 0).unwrap());
         assert!(AuthenticatedUser::from_request_parts(&mut ok, &state).await.is_ok());
-        let mut off = parts(auth::create_jwt("u2", "carol", "user").unwrap());
+        let mut off = parts(auth::create_jwt("u2", "carol", "user", 0).unwrap());
         assert!(AuthenticatedUser::from_request_parts(&mut off, &state).await.is_err());
         // The role claimed in the token is not trusted.
-        let mut forged_role = parts(auth::create_jwt("u1", "alice", "admin").unwrap());
+        let mut forged_role = parts(auth::create_jwt("u1", "alice", "admin", 0).unwrap());
         assert!(auth::AdminUser::from_request_parts(&mut forged_role, &state).await.is_err());
+    }
+
+    /// The self-signed hint is only for pages served by the server's own
+    /// HTTPS listener, not for plain HTTP or a reverse proxy in front.
+    #[test]
+    fn self_signed_hint_only_on_own_https() {
+        if std::env::var_os("LUNARIS_TLS_CERT").is_some() || tls::https_port().is_none() {
+            return;
+        }
+        assert_eq!(ports_json(8090, true)["https_self_signed"], true);
+        assert_eq!(ports_json(8090, false)["https_self_signed"], false);
+        assert_eq!(ports_json(8090, false)["http"], 8090);
     }
 }

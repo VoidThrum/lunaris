@@ -62,6 +62,38 @@ QtObject {
             ] }
         ]
     })
+    // The RDP and VNC connectors as the agent describes them (offered when
+    // a test puts them in `extra`).
+    readonly property var rdp: ({
+        id: "rdp", name: "Remote Desktop (RDP)",
+        note: "Remote Desktop must be enabled on that computer (Windows: Settings, System, Remote Desktop). When you press Add, its certificate is checked and remembered; Lunaris refuses the connection if it changes later.",
+        fields: [
+            { key: "host", label: "Address", kind: "text", "default": "", required: true },
+            { key: "port", label: "Port", kind: "port", "default": "3389", required: false },
+            { key: "username", label: "User name", kind: "text", "default": "", required: false },
+            { key: "password", label: "Password", kind: "secret", "default": "", required: false },
+            { key: "domain", label: "Domain", kind: "text", "default": "", required: false },
+            { key: "security", label: "Security", kind: "choice", "default": "nla", required: false, options: [
+                { value: "nla", label: "NLA (recommended)" },
+                { value: "tls", label: "TLS (sign in on the computer's screen)" },
+                { value: "any", label: "Either" }
+            ] },
+            { key: "resolution", label: "Resolution", kind: "text", "default": "auto", required: false }
+        ]
+    })
+    readonly property var vnc: ({
+        id: "vnc", name: "VNC",
+        note: "A VNC server must be running on that computer, with \"None\" or \"VNC password\" security. VNC does not encrypt the picture or what you type: use it only on a network you trust, or through a VPN.",
+        fields: [
+            { key: "host", label: "Address", kind: "text", "default": "", required: true },
+            { key: "port", label: "Port", kind: "port", "default": "5900", required: false },
+            { key: "password", label: "Password", kind: "secret", "default": "", required: false },
+            { key: "view_only", label: "Mode", kind: "choice", "default": "off", required: false, options: [
+                { value: "off", label: "Control" },
+                { value: "on", label: "View only" }
+            ] }
+        ]
+    })
     property var extra: []
     readonly property var firstSetup: ({ state: "pending", message: "Open Sunshine's web page on that computer, choose PIN, and enter this PIN.", code: "4711" })
     // How the set-up "su-1" stands: what asking about it is answered.
@@ -105,10 +137,13 @@ QtObject {
         groupsSaid = [];
         setupGroup = "*";
         setupHost = "";
+        waylandCapture = "auto";
+        waylandCaptureSet = [];
     }
 
     // ---- Signals of the real bridge that the pages listen to ----
     signal loginResult(bool success, string errorMsg, string tok, string user, string srv)
+    signal mfaRequired(string srv, string user)
     signal credentialsLoaded(bool success, string srv, string tok, string user)
     signal hostsResult(bool success, string errorMsg, string hostsJson)
     signal appsResult(bool success, string errorMsg, string hostId, string appsJson)
@@ -127,11 +162,25 @@ QtObject {
     function getLocalHostname() { return "this-pc"; }
     function isAutostartEnabled() { return false; }
     function setAutostartEnabled(on) {}
-    function checkForUpdates() {}
+    // The updater (updater/src/service.rs): the tests set `updateState`
+    // and count what the pages ask for.
+    property var updateState: ({ state: "idle", current: "0.5.0", latest: "", notes: "", releaseUrl: "",
+                                 canInstall: false, manualReason: "", manualMessage: "", progress: 0,
+                                 error: "", errorKind: "", autoCheck: true, lastChecked: 0, installKind: "deb" })
+    property int updateChecks: 0
+    property int updateInstalls: 0
+    property var updateAutoChecks: []
+    function checkForUpdates() { stub.updateChecks += 1; }
+    function updateStatus() { return JSON.stringify(stub.updateState); }
+    function updateInstall() { stub.updateInstalls += 1; }
+    function updateRestart() { return false; }
+    function updateAutoCheck() { return stub.updateState.autoCheck; }
+    function setUpdateAutoCheck(on) { stub.updateAutoChecks = stub.updateAutoChecks.concat([on]); }
     function hostStatus() {
         return JSON.stringify({ enabled: true, running: true, port: 8091, password: "k7m2p9qd", addresses: ["192.168.1.10"],
             hostname: "this-pc", input_ready: true, allow_clipboard: true, allow_file_transfer: true, full_disk_access: false,
-            approve_mode: "password-click", rustdesk_enabled: false, rustdesk_port: 21118, rustdesk_file_transfer: false, error: "" });
+            approve_mode: "password-click", rustdesk_enabled: false, rustdesk_port: 21118, rustdesk_file_transfer: false,
+            wayland_capture: stub.waylandCapture, error: "" });
     }
     function hostStart() { return ""; }
     function hostStop() { return ""; }
@@ -141,6 +190,15 @@ QtObject {
     function hostSetSharing(c, f) { return ""; }
     function hostSetFileAccess(full) { return ""; }
     function hostSetApproveMode(mode) { return ""; }
+    // The host's `wayland_capture` ("auto" / "portal") and what was set, newest last.
+    property string waylandCapture: "auto"
+    property var waylandCaptureSet: []
+    function hostSetWaylandCapture(mode) {
+        stub.waylandCaptureSet = stub.waylandCaptureSet.concat([mode]);
+        if (mode !== "auto" && mode !== "portal") return "unknown Wayland capture mode " + mode;
+        stub.waylandCapture = mode;
+        return "";
+    }
     function hostUseServer(server, token) { return "already"; }
     function serverStatus() {
         return JSON.stringify({ enabled: false, running: false, ours: false, port: 8090, local_url: "", lan_url: "", admin_password: "", data_dir: "", error: "" });
@@ -155,10 +213,18 @@ QtObject {
     function deleteHost(id) {}
     function logout() {}
     function login(server, user, password) {}
+    // Two-factor sign-in: what the dialog sent, newest last ({ code, recovery }).
+    property var mfaCalls: []
+    property int mfaCancels: 0
+    function loginMfa(code, recovery) { stub.mfaCalls = stub.mfaCalls.concat([{ code: code, recovery: recovery }]); }
+    function cancelMfa() { stub.mfaCancels += 1; }
 
     // ---- The app's own computers of other types ----
     function bridgeConnectors() { return JSON.stringify([stub.rustdesk, stub.acme].concat(stub.extra)); }
     function bridgeSources() { return JSON.stringify(stub.ownSources); }
+    // Whether each of them answers: source id -> 1 / 0; not in it: not known (-1).
+    property var sourceStatus: ({})
+    function bridgeSourceOnline(id) { return stub.sourceStatus[id] === undefined ? -1 : stub.sourceStatus[id]; }
     function shownValues(connectorId, values) {
         var c = connectorId === "rustdesk" ? stub.rustdesk : connectorId === "sunshine" ? stub.sunshine : stub.acme;
         var out = {};

@@ -460,7 +460,9 @@ pub(super) fn make_certificate(
 ) -> Result<(String, String), Error> {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
-    let key = rsa::PrivateKey::new(&mut SystemRng, 2048)
+    let key = // rsa 0.10.0-rc.18 takes an infallible generator: the system's random
+    // source not answering ends the program here, as it would in ring.
+    rsa::RsaPrivateKey::new(&mut rsa::rand_core::UnwrapErr(SystemRng), 2048)
         .map_err(|_| Error::Internal("key generation failed"))?;
     let pkcs8 = key.to_pkcs8_der().map_err(|_| Error::Internal("key encoding failed"))?;
     let spki = key

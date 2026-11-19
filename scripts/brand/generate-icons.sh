@@ -37,4 +37,9 @@ done
 cp "$WORK/256.png" "$ROOT/agent-app/qml/icons/icon.png"
 cp "$WORK/256.png" "$ROOT/client-qml/qml/icon.png"
 cp "$SVG" "$ROOT/web/public/favicon.svg"
+# The mark alone (no tile), the type logo beside RustDesk and Sunshine.
+# assets/brand/lunaris-mark.svg is cut from the master by hand: redo it when
+# the master's drawing changes.
+cp "$ROOT/assets/brand/lunaris-mark.svg" "$ROOT/client-qml/qml/logos/lunaris.svg"
+cp "$ROOT/assets/brand/lunaris-mark.svg" "$ROOT/web/src/assets/logos/lunaris.svg"
 echo "Icons regenerated from $SVG"

@@ -50,13 +50,10 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for ChannelMakeWriter {
 // ---------------------------------------------------------------------------
 // Pending event queues (cross-thread communication from tokio tasks to QML)
 // ---------------------------------------------------------------------------
-pub static PENDING_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Set for the agent window started again after an update when it was sharing.
+const RESUME_SHARING_ENV: &str = "LUNARIS_AGENT_RESUME_SHARING";
 
-pub(crate) struct UpdateInfo {
-    version: String,
-    url: String,
-}
-pub(crate) static PENDING_UPDATE: std::sync::Mutex<Option<UpdateInfo>> = std::sync::Mutex::new(None);
+pub static PENDING_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 // ---------------------------------------------------------------------------
 // cxx-qt bridge
@@ -102,13 +99,6 @@ pub mod qobject {
         );
 
         #[qsignal]
-        fn update_available(
-            self: Pin<&mut AgentBridge>,
-            latest_version: QString,
-            release_url: QString,
-        );
-
-        #[qsignal]
         fn config_saved(self: Pin<&mut AgentBridge>, success: bool, error_msg: QString);
 
         /// RustDesk clients by IP address: on/off and the port.
@@ -118,6 +108,10 @@ pub mod qobject {
         /// Whether RustDesk clients may use their file manager here.
         #[qsignal]
         fn rustdesk_file_transfer_loaded(self: Pin<&mut AgentBridge>, enabled: bool);
+
+        /// Screen capture on a Linux Wayland session: "auto" or "portal".
+        #[qsignal]
+        fn wayland_capture_loaded(self: Pin<&mut AgentBridge>, mode: QString);
 
         /// Direct connections: on/off, port, access password and this
         /// computer's addresses (one per line).
@@ -168,6 +162,11 @@ pub mod qobject {
         #[qinvokable]
         fn set_rustdesk_file_transfer(self: Pin<&mut AgentBridge>, enabled: bool);
 
+        /// Screen capture on a Linux Wayland session: "auto" or "portal"
+        /// (`wayland_capture` of the config).
+        #[qinvokable]
+        fn set_wayland_capture(self: Pin<&mut AgentBridge>, mode: QString);
+
         #[qinvokable]
         fn start_agent(self: Pin<&mut AgentBridge>);
 
@@ -183,8 +182,33 @@ pub mod qobject {
         #[qinvokable]
         fn clear_logs(self: Pin<&mut AgentBridge>);
 
+        /// "Check now" (in the background; `update_status` shows the result).
         #[qinvokable]
         fn check_for_updates(self: Pin<&mut AgentBridge>);
+
+        /// The updater's state as JSON (updater::service::status_json).
+        #[qinvokable]
+        fn update_status(self: &AgentBridge) -> QString;
+
+        /// Update: download, verify the signature and the checksum, install.
+        #[qinvokable]
+        fn update_install(self: Pin<&mut AgentBridge>);
+
+        /// After the install: true when the window should quit now (the
+        /// agent then starts again by itself).
+        #[qinvokable]
+        fn update_restart(self: Pin<&mut AgentBridge>) -> bool;
+
+        /// Whether sharing was on before the restart of an update (it
+        /// then starts again); true only once.
+        #[qinvokable]
+        fn resume_sharing_after_update(self: Pin<&mut AgentBridge>) -> bool;
+
+        #[qinvokable]
+        fn update_auto_check(self: &AgentBridge) -> bool;
+
+        #[qinvokable]
+        fn set_update_auto_check(self: Pin<&mut AgentBridge>, enabled: bool);
 
         #[qinvokable]
         fn open_url(self: Pin<&mut AgentBridge>, url: QString);
@@ -339,6 +363,17 @@ impl qobject::AgentBridge {
         self.as_mut().save_direct_config(config);
     }
 
+    pub fn set_wayland_capture(mut self: Pin<&mut Self>, mode: QString) {
+        let mode = mode.to_string();
+        if !matches!(mode.as_str(), "auto" | "portal") {
+            self.as_mut().config_saved(false, QString::from(&format!("Unknown Wayland capture mode {}", mode)));
+            return;
+        }
+        let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
+        config.wayland_capture = mode;
+        self.as_mut().save_direct_config(config);
+    }
+
     pub fn regenerate_direct_password(mut self: Pin<&mut Self>) {
         let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
         config.direct_password = agent::pairing::generate_direct_password();
@@ -372,6 +407,8 @@ impl qobject::AgentBridge {
             config.rustdesk_port.unwrap_or(agent::rustdesk::DEFAULT_PORT) as i32,
         );
         self.as_mut().rustdesk_file_transfer_loaded(config.rustdesk_file_transfer);
+        let (wayland_capture, _) = agent::pairing::wayland_capture_preference(&config.wayland_capture);
+        self.as_mut().wayland_capture_loaded(QString::from(wayland_capture.as_str()));
         self.as_mut().direct_config_loaded(
             config.direct_enabled,
             config.direct_port as i32,
@@ -478,15 +515,6 @@ impl qobject::AgentBridge {
                 self.as_mut().log_message(QString::from(&msg));
             }
         }
-        // Check for pending update result
-        if let Ok(mut opt) = PENDING_UPDATE.lock() {
-            if let Some(info) = opt.take() {
-                self.as_mut().update_available(
-                    QString::from(&info.version),
-                    QString::from(&info.url),
-                );
-            }
-        }
     }
 
     pub fn clear_logs(self: Pin<&mut Self>) {
@@ -496,52 +524,37 @@ impl qobject::AgentBridge {
     }
 
     pub fn check_for_updates(self: Pin<&mut Self>) {
-        let mut rust_obj = self.rust_mut();
-        let rt = rust_obj.get_or_init_runtime();
-        rt.spawn(async move {
-            let client = match reqwest::Client::builder()
-                .user_agent("lunaris-agent")
-                .build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            let res = match client
-                .get("https://api.github.com/repos/collyn/lunaris/releases/latest")
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            if !res.status().is_success() {
-                return;
+        updater::service::check_now();
+    }
+
+    pub fn update_status(&self) -> QString {
+        QString::from(&updater::service::status_json())
+    }
+
+    pub fn update_install(self: Pin<&mut Self>) {
+        updater::service::install();
+    }
+
+    pub fn update_restart(self: Pin<&mut Self>) -> bool {
+        if updater::service::restart_now() {
+            if AGENT_ACTIVE.load(Ordering::SeqCst) {
+                updater::restart::set_relaunch_env(RESUME_SHARING_ENV, "1");
             }
-            #[derive(serde::Deserialize)]
-            struct GithubRelease {
-                tag_name: String,
-                html_url: String,
-            }
-            let release: GithubRelease = match res.json().await {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            let current = env!("CARGO_PKG_VERSION");
-            // Simple semver check
-            let current_clean = current.trim_start_matches('v');
-            let latest_clean = release.tag_name.trim_start_matches('v');
-            if latest_clean != current_clean {
-                let newer = compare_versions(latest_clean, current_clean);
-                if newer {
-                    if let Ok(mut opt) = PENDING_UPDATE.lock() {
-                        *opt = Some(UpdateInfo {
-                            version: release.tag_name,
-                            url: release.html_url,
-                        });
-                    }
-                }
-            }
-        });
+            return true;
+        }
+        false
+    }
+
+    pub fn resume_sharing_after_update(self: Pin<&mut Self>) -> bool {
+        updater::restart::consume_env(RESUME_SHARING_ENV).is_some()
+    }
+
+    pub fn update_auto_check(&self) -> bool {
+        updater::service::auto_check()
+    }
+
+    pub fn set_update_auto_check(self: Pin<&mut Self>, enabled: bool) {
+        updater::service::set_auto_check(enabled);
     }
 
     pub fn open_url(self: Pin<&mut Self>, url: QString) {
@@ -636,6 +649,13 @@ pub fn run_gui(minimized: bool) {
         }
     });
 
+    // Updates: the automatic check and the window's Updates section.
+    // Settings beside the agent's own, in the per-user config folder.
+    let update_dir = dirs::config_dir()
+        .map(|d| d.join("lunaris-agent"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    updater::service::init(updater::App::Agent, &update_dir);
+
     // Create the Qt application (QtWidgets flavour, see agent_gui.h) and load QML.
     unsafe { qobject::create_widgets_application() };
     let mut engine = QQmlApplicationEngine::new();
@@ -647,22 +667,6 @@ pub fn run_gui(minimized: bool) {
 
     let _ = minimized; // QML handles initial visibility
     unsafe { qobject::exec_widgets_application() };
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-fn compare_versions(latest: &str, current: &str) -> bool {
-    let latest_parts: Vec<&str> = latest.split('.').collect();
-    let current_parts: Vec<&str> = current.split('.').collect();
-    for i in 0..std::cmp::max(latest_parts.len(), current_parts.len()) {
-        let ln = latest_parts.get(i).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-        let cn = current_parts.get(i).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-        if ln > cn {
-            return true;
-        } else if cn > ln {
-            return false;
-        }
-    }
-    false
+    // After an update the window quit: start the new version.
+    updater::restart::relaunch_if_requested();
 }

@@ -12,7 +12,9 @@
     "test:pointer": "node --test tests/pointerInPicture.test.ts tests/pointerShown.test.ts",
     "test:cards": "node --test tests/computerCards.test.ts",
     "test:keyboard": "node --test tests/keyboard.test.ts",
-    "test:stats": "node --test tests/streamStats.test.ts"
+    "test:stats": "node --test tests/streamStats.test.ts",
+    "test:install": "node --test tests/installCommand.test.ts",
+    "test:mfa": "node --test tests/mfa.test.ts"
   },
   "dependencies": {
     "react": "^19.2.6",

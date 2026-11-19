@@ -75,6 +75,16 @@ pub struct AgentConfig {
     /// when missing), sent as `key` on `/ws/agent`.
     #[serde(default)]
     pub agent_key: String,
+    /// An install token from `--enroll` (the one-line installer): sent as
+    /// `install_token` instead of `server_token` until the server has
+    /// accepted it once, then cleared; the agent signs in with
+    /// `agent_key` alone afterwards.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub install_token: String,
+    /// Name shown for this computer (`--enroll --name`); empty: the host
+    /// name. `--name` on the command line wins.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// RustDesk compatibility (rustdesk.rs): when set, RustDesk clients can
     /// connect to this port by IP address and see and control this computer
     /// (unencrypted, as RustDesk's direct IP access is: for a LAN or a VPN),
@@ -97,6 +107,26 @@ pub struct AgentConfig {
     /// the id and the name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<crate::connector::SourceConfig>,
+    /// Screen capture on a Linux Wayland session: "auto" (the default: the
+    /// capture service without a prompt when installed, else KMS, else the
+    /// portal) or "portal" (always the XDG portal: the person here approves
+    /// and the desktop shows the screen is shared; the service and KMS are
+    /// never used). Anything else counts as "auto" (`wayland_capture_preference`).
+    #[serde(default = "default_wayland_capture")]
+    pub wayland_capture: String,
+}
+
+fn default_wayland_capture() -> String {
+    "auto".to_string()
+}
+
+/// `wayland_capture` as lunaris-media takes it, and whether the value was
+/// one it knows (an unknown one is `Auto`).
+pub fn wayland_capture_preference(value: &str) -> (lunaris_media::capture::WaylandCapturePreference, bool) {
+    match lunaris_media::capture::WaylandCapturePreference::parse(value) {
+        Some(p) => (p, true),
+        None => (lunaris_media::capture::WaylandCapturePreference::Auto, false),
+    }
 }
 
 impl Default for AgentConfig {
@@ -200,6 +230,17 @@ pub fn ensure_agent_key(config: &mut AgentConfig) -> bool {
 static CONFIG_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Sets the config file path for this process (from `--config`); call once at startup.
+/// Gives `config` an id when it has none (a config written by hand or by an
+/// older tool): an empty id is refused by servers and links. `true` when one
+/// was made (the caller saves it, so the id stays the same next time).
+pub fn ensure_client_id(config: &mut AgentConfig) -> bool {
+    if !config.client_unique_id.trim().is_empty() {
+        return false;
+    }
+    config.client_unique_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    true
+}
+
 /// A fresh configuration for this computer: a new id, no server and a new
 /// direct-access password. Direct connections stay off until the user turns
 /// remote control on.
@@ -391,6 +432,90 @@ fn reg_command() -> std::process::Command {
     cmd
 }
 
+/// What `--enroll` does about starting at login, given the app's autostart
+/// entry as it is now.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum CliAutostart {
+    /// Write the headless entry in the app's file (none there, or one an
+    /// earlier `--enroll` wrote).
+    AppEntry,
+    /// The app already starts at login with this same config: it joins the
+    /// server itself; a second agent with the same id would fight it.
+    KeepApp,
+    /// The app starts at login with its own config: this agent (another
+    /// config, another id) gets an entry of its own next to it.
+    OwnEntry,
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn cli_autostart_choice(existing: Option<&str>, config_is_the_apps: bool) -> CliAutostart {
+    match existing {
+        None => CliAutostart::AppEntry,
+        Some(entry) if entry.lines().any(|l| l.starts_with("Exec=") && l.contains(" --cli ")) => CliAutostart::AppEntry,
+        Some(_) if config_is_the_apps => CliAutostart::KeepApp,
+        Some(_) => CliAutostart::OwnEntry,
+    }
+}
+
+/// Linux: starts the agent headless (`--cli`) with `config` when the user
+/// logs in to the desktop. Used by `--enroll`, for computers set up by the
+/// one-line installer. The app's own "Start at login" entry (it opens the
+/// window) is never replaced: with the same config it is kept as it is (the
+/// app joins the server then); with another config this agent gets
+/// `lunaris-agent-cli.desktop` beside it. Returns the entry that starts the
+/// agent, and whether it is the app's, kept.
+#[cfg(target_os = "linux")]
+pub fn enable_cli_autostart(config: &str) -> std::io::Result<(std::path::PathBuf, bool)> {
+    let exe = match std::env::var("APPIMAGE").ok().filter(|p| !p.is_empty()) {
+        Some(appimage) => appimage,
+        None => std::env::current_exe()?.to_string_lossy().into_owned(),
+    };
+    let canonical = |p: &str| std::fs::canonicalize(p).map(|p| p.to_string_lossy().into_owned()).ok();
+    let config = canonical(config).unwrap_or_else(|| config.to_string());
+    // The config the app uses when started at login (`--minimized`, no --config).
+    let apps_config = dirs::config_dir()
+        .map(|d| d.join("lunaris-agent").join("agent_config.json").to_string_lossy().into_owned())
+        .and_then(|p| canonical(&p).or(Some(p)));
+    let path = get_autostart_path_linux()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
+    let existing = std::fs::read_to_string(&path).ok();
+    match cli_autostart_choice(existing.as_deref(), apps_config.as_deref() == Some(config.as_str())) {
+        CliAutostart::AppEntry => {
+            std::fs::write(&path, cli_autostart_entry(&exe, &config))?;
+            Ok((path, false))
+        }
+        CliAutostart::KeepApp => Ok((path, true)),
+        CliAutostart::OwnEntry => {
+            let own = path.with_file_name("lunaris-agent-cli.desktop");
+            std::fs::write(&own, cli_autostart_entry(&exe, &config))?;
+            Ok((own, false))
+        }
+    }
+}
+
+/// The desktop entry: arguments quoted as the Desktop Entry spec says.
+#[cfg(any(target_os = "linux", test))]
+fn cli_autostart_entry(exe: &str, config: &str) -> String {
+    let quote = |s: &str| {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            if matches!(c, '"' | '`' | '$' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+        // Then the string escape (a backslash twice), and `%` is a field code.
+        out.replace('\\', "\\\\").replace('%', "%%")
+    };
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Lunaris Agent\nExec={} --cli --config {}\nIcon=lunaris-agent\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        quote(exe),
+        quote(config)
+    )
+}
+
 pub fn set_autostart_enabled_impl(enabled: bool) {
     // Inside an AppImage current_exe() points into a temporary mount; the
     // AppImage file itself is what has to be started at login.
@@ -512,11 +637,81 @@ mod tests {
     }
 
     #[test]
+    fn cli_autostart_entry_quotes() {
+        let e = cli_autostart_entry("/opt/lunaris agent/x.AppImage", "/home/a/.config/lunaris-agent/agent_config.json");
+        assert!(e.contains("Exec=\"/opt/lunaris agent/x.AppImage\" --cli --config \"/home/a/.config/lunaris-agent/agent_config.json\"\n"));
+        let e = cli_autostart_entry("/usr/bin/lunaris-agent", "/h/$x\"%");
+        assert!(e.contains("--config \"/h/\\\\$x\\\\\"%%\""), "{e}");
+    }
+
+    /// `--enroll` never replaces the app's own "Start at login" entry.
+    #[test]
+    fn enroll_keeps_the_apps_autostart_entry() {
+        let app = "[Desktop Entry]\nType=Application\nName=Lunaris Agent\nExec=\"/usr/bin/lunaris-agent\" --minimized\n";
+        let ours = cli_autostart_entry("/usr/bin/lunaris-agent", "/home/a/.config/lunaris-agent/agent_config.json");
+        assert_eq!(cli_autostart_choice(None, true), CliAutostart::AppEntry);
+        assert_eq!(cli_autostart_choice(None, false), CliAutostart::AppEntry);
+        // An entry an earlier --enroll wrote: updated.
+        assert_eq!(cli_autostart_choice(Some(&ours), true), CliAutostart::AppEntry);
+        assert_eq!(cli_autostart_choice(Some(&ours), false), CliAutostart::AppEntry);
+        // The app's: kept with the same config, beside it with another.
+        assert_eq!(cli_autostart_choice(Some(app), true), CliAutostart::KeepApp);
+        assert_eq!(cli_autostart_choice(Some(app), false), CliAutostart::OwnEntry);
+        // Something else someone put there under that name: not replaced either.
+        assert_eq!(cli_autostart_choice(Some("[Desktop Entry]\nExec=my-wrapper.sh\n"), false), CliAutostart::OwnEntry);
+    }
+
+    #[test]
+    fn install_token_and_name_stay_out_of_the_file_when_empty() {
+        let c = new_config();
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("install_token") && !json.contains("\"name\""));
+        let mut c = c;
+        c.install_token = "lit_x".into();
+        let back: AgentConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.install_token, "lit_x");
+    }
+
+    #[test]
     fn defaults_for_new_fields() {
         let c: AgentConfig = serde_json::from_str(r#"{"server_url":"x"}"#).unwrap();
         assert_eq!(c.server_sessions, "trusted");
         assert_eq!(c.file_access, "");
         assert!(c.server_cert_sha256.is_empty() && c.agent_key.is_empty());
+        assert_eq!(c.wayland_capture, "auto");
+        assert_eq!(AgentConfig::default().wayland_capture, "auto");
+        assert_eq!(new_config().wayland_capture, "auto");
+    }
+
+    #[test]
+    fn wayland_capture_round_trips() {
+        let mut c = AgentConfig::default();
+        c.wayland_capture = "portal".into();
+        let back: AgentConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.wayland_capture, "portal");
+        use lunaris_media::capture::WaylandCapturePreference as P;
+        assert_eq!(wayland_capture_preference(&back.wayland_capture), (P::Portal, true));
+        assert_eq!(wayland_capture_preference("auto"), (P::Auto, true));
+    }
+
+    #[test]
+    fn missing_id_is_made_once() {
+        let mut c: AgentConfig = serde_json::from_str("{}").unwrap();
+        assert!(ensure_client_id(&mut c));
+        let id = c.client_unique_id.clone();
+        assert_eq!(id.len(), 36);
+        assert!(!ensure_client_id(&mut c));
+        assert_eq!(c.client_unique_id, id);
+    }
+
+    #[test]
+    fn unknown_wayland_capture_is_auto() {
+        use lunaris_media::capture::WaylandCapturePreference as P;
+        let c: AgentConfig = serde_json::from_str(r#"{"wayland_capture":"service"}"#).unwrap();
+        // Kept in the file as written, used as auto.
+        assert_eq!(c.wayland_capture, "service");
+        assert_eq!(wayland_capture_preference(&c.wayland_capture), (P::Auto, false));
+        assert_eq!(wayland_capture_preference(""), (P::Auto, false));
     }
 
     #[cfg(unix)]

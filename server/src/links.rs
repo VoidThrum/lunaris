@@ -199,19 +199,31 @@ async fn connect_once(
         },
         _ => return Err(("no answer from the agent".into(), false)),
     };
+    // The id is only what the other end says: it may not take over another
+    // computer's (signaling::link_may_register), nor a live connection.
+    let known = host_id.lock().unwrap().clone();
+    if let Err(why) = crate::signaling::link_may_register(state, &id, &name, known.as_deref()).await {
+        // `run` logs it and retries slowly.
+        return Err((why, true));
+    }
+    let Some((conn_id, mut rx)) = crate::signaling::link_connected(state, &id, &name, codec_support).await else {
+        // Also briefly while its previous connection is being closed.
+        return Err(("a computer with this id is already connected to the server".into(), false));
+    };
     *error.lock().unwrap() = None;
-    *host_id.lock().unwrap() = Some(id.clone());
-    let _ = sqlx::query("UPDATE address_hosts SET host_id = ? WHERE address = ?")
-        .bind(&id)
-        .bind(address)
-        .execute(&state.db)
-        .await;
+    if known.is_none() {
+        *host_id.lock().unwrap() = Some(id.clone());
+        let _ = sqlx::query("UPDATE address_hosts SET host_id = ? WHERE address = ?")
+            .bind(&id)
+            .bind(address)
+            .execute(&state.db)
+            .await;
+    }
     if let Some(ip) = local_ip {
         state.agent_local_ips.write().unwrap().insert(id.clone(), ip);
     }
     info!("Connected to {} ({}) added by address {}", name, id, address);
 
-    let (conn_id, mut rx) = crate::signaling::agent_connected(state, &id, &name, codec_support).await;
     // Also when the link is stopped (removed, new password) mid-way.
     let _registered = Registered { state: state.clone(), id: id.clone(), conn_id };
     let writer = tokio::spawn(async move {

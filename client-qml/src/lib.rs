@@ -495,6 +495,12 @@ pub fn run() {
         local_server::start_if_enabled();
     }
 
+    // Updates: the automatic check (at start, then daily) and the window's
+    // notice and Updates settings. Not for a one-stream launch.
+    if APP_ARGS.get().is_none() {
+        updater::service::init(updater::App::Client, &app_settings_dir());
+    }
+
     let mut engine = QQmlApplicationEngine::new();
 
     // 3. Load QML resources
@@ -513,4 +519,18 @@ pub fn run() {
     host::shutdown();
     own_computers::shutdown();
     local_server::shutdown();
+    // After an update the window quit: start the new version (it starts
+    // its agent and server again, as at every start).
+    updater::restart::relaunch_if_requested();
+}
+
+/// `~/.lunaris` (Windows: `%USERPROFILE%\.lunaris`), where the app keeps its settings.
+fn app_settings_dir() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join(".lunaris");
+    let _ = secure_fs::create_private_dir(&dir);
+    dir
 }

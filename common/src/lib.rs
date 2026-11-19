@@ -72,6 +72,9 @@ pub struct UserInfo {
     pub is_active: bool,
     pub groups: Vec<GroupBrief>,
     pub created_at: Option<String>,
+    /// Two-factor sign-in (authenticator app) is on.
+    #[serde(default)]
+    pub mfa_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -226,6 +229,13 @@ pub struct SourceInfoMsg {
     /// none, and by peers from before groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Whether the computer itself is there, as its agent last checked
+    /// (a connection to its port): `Some(false)` when it did not answer.
+    /// Left out when that is not known (not checked yet, nothing to check),
+    /// and by agents from before the checks: then it is listed as online
+    /// while its agent is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
 }
 
 /// The longest group of a source, in characters.

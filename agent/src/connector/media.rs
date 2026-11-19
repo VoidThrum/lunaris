@@ -274,6 +274,8 @@ pub struct Source {
     session: Session,
     first: Option<Event>,
     pending: Vec<Event>,
+    /// While the session lasts the computer counts as there (`reachability`).
+    in_use: super::reachability::InUse,
 }
 
 /// Logs in to `target` and waits for the first picture. The codec of an
@@ -297,6 +299,7 @@ pub async fn open(
     }
     info!("Connector {}: connecting ({:?}) for a viewer that takes {:?}", target.connector, target, viewer.codecs);
     let mut session = connector.connect(target, &viewer).await.map_err(fail)?;
+    let in_use = super::reachability::in_use(target, Some(&connector.describe()));
     let mut pending = Vec::new();
     let deadline = tokio::time::Instant::now() + FIRST_FRAME_TIMEOUT;
     loop {
@@ -310,7 +313,7 @@ pub async fn open(
                     return Err(SourceError(format!("The computer sends {:?} video, which this viewer cannot show", codec)));
                 }
                 info!("Connector {}: the computer sends {:?}", target.connector, codec);
-                return Ok(Source { codec, session, first: Some(event), pending });
+                return Ok(Source { codec, session, first: Some(event), pending, in_use });
             }
             Event::Closed { reason } => return Err(SourceError(reason)),
             // Sound before the first picture is of no use.
@@ -635,7 +638,7 @@ impl LatencyOut {
 /// ends, the agent's session stops it, or the packager is gone. When the
 /// source ends by itself the viewer is told and the session closed.
 pub async fn run(source: Source, link: ViewerLink) {
-    let Source { codec: session_codec, session, first, pending } = source;
+    let Source { codec: session_codec, session, first, pending, in_use: _in_use } = source;
     let Session { mut events, commands } = session;
     let ViewerLink {
         video,

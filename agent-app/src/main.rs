@@ -20,6 +20,14 @@ pub extern "C" fn __cpu_indicator_init() -> i32 {
 }
 
 fn main() -> std::process::ExitCode {
+    // How this program was started, for the restart after an update; a
+    // restarted one first waits for the old one to exit.
+    updater::restart::remember_launch();
+    updater::restart::wait_for_previous();
+    // The window comes back shown after an update, not in the tray.
+    updater::restart::set_relaunch_args_filter(|args| {
+        args.iter().filter(|a| *a != "--minimized").cloned().collect()
+    });
     #[cfg(feature = "gui")]
     {
         agent::run_with_gui(

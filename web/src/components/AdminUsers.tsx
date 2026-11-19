@@ -14,6 +14,8 @@ interface User {
   is_active: boolean;
   groups?: { id: number; name: string }[];
   created_at?: string;
+  /** Two-factor sign-in (authenticator app) is on. */
+  mfa_enabled?: boolean;
 }
 
 interface Group {
@@ -43,6 +45,11 @@ export function AdminUsers({ token, getBackendHost, getBackendProtocol }: AdminU
   const [editGroupIds, setEditGroupIds] = useState<number[]>([]);
   const [editLoading, setEditLoading] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+
+  // Turn off another user's two-factor sign-in (a lost phone)
+  const [resetMfaUser, setResetMfaUser] = useState<User | null>(null);
+  const [resetMfaLoading, setResetMfaLoading] = useState(false);
+  const [resetMfaError, setResetMfaError] = useState<string | null>(null);
 
   // Delete confirm
   const [deleteUser, setDeleteUser] = useState<User | null>(null);
@@ -184,11 +191,38 @@ export function AdminUsers({ token, getBackendHost, getBackendProtocol }: AdminU
       if (response.ok) {
         setDeleteUser(null);
         fetchUsers();
+      } else {
+        // e.g. the last active administrator, or one's own account.
+        const data = await response.json().catch(() => ({}));
+        window.alert(t(data.error || 'Failed to delete user'));
       }
     } catch (err) {
       console.error('Failed to delete user:', err);
     } finally {
       setDeleteLoading(false);
+    }
+  };
+
+  const handleResetMfa = async () => {
+    if (!resetMfaUser) return;
+    setResetMfaLoading(true);
+    setResetMfaError(null);
+    try {
+      const response = await fetch(`${apiBase()}/api/admin/users/${encodeURIComponent(String(resetMfaUser.id))}/mfa`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (response.ok) {
+        setResetMfaUser(null);
+        fetchUsers();
+      } else {
+        const data = await response.json().catch(() => ({}));
+        setResetMfaError(t(data.error || 'Could not reset two-factor sign-in'));
+      }
+    } catch {
+      setResetMfaError(t('Connection error'));
+    } finally {
+      setResetMfaLoading(false);
     }
   };
 
@@ -252,7 +286,12 @@ export function AdminUsers({ token, getBackendHost, getBackendProtocol }: AdminU
                   <span style={{ fontWeight: 600, color: 'var(--text-main)' }}>{user.username}</span>
                 </td>
                 <td>
-                  <span className={`role-badge ${user.role}`}>{user.role === 'admin' ? t('Admin') : t('User')}</span>
+                  <div className="user-badges">
+                    <span className={`role-badge ${user.role}`}>{user.role === 'admin' ? t('Admin') : t('User')}</span>
+                    {user.mfa_enabled && (
+                      <span className="role-badge mfa" title={t('Two-factor sign-in is on')}>2FA</span>
+                    )}
+                  </div>
                 </td>
                 <td>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
@@ -288,6 +327,19 @@ export function AdminUsers({ token, getBackendHost, getBackendProtocol }: AdminU
                         <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
                       </svg>
                     </button>
+                    {user.mfa_enabled && (
+                      <button
+                        onClick={() => { setResetMfaError(null); setResetMfaUser(user); }}
+                        className="admin-action-btn reset-mfa"
+                        title={t('Reset 2FA')}
+                        aria-label={t('Reset 2FA')}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" />
+                          <path d="m9.5 9.5 5 5M14.5 9.5l-5 5" />
+                        </svg>
+                      </button>
+                    )}
                     <button
                       onClick={() => setDeleteUser(user)}
                       className="admin-action-btn delete"
@@ -454,6 +506,31 @@ export function AdminUsers({ token, getBackendHost, getBackendProtocol }: AdminU
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Reset two-factor sign-in */}
+      {resetMfaUser && (
+        <div className="host-confirm-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget && !resetMfaLoading) setResetMfaUser(null); }}>
+          <div className="host-confirm-card" role="dialog" aria-modal="true" aria-labelledby="resetMfaTitle">
+            <div className="host-confirm-icon danger">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" />
+                <path d="m9.5 9.5 5 5M14.5 9.5l-5 5" />
+              </svg>
+            </div>
+            <div className="host-confirm-content">
+              <h2 id="resetMfaTitle">{t('Reset two-factor sign-in?')}</h2>
+              <p>{t('%1 will sign in with the password only, and is signed out everywhere. Do this only after checking it is really them (for example a lost phone). They can turn it on again under Account security.', resetMfaUser.username)}</p>
+              {resetMfaError && <p className="add-host-error" role="alert">{resetMfaError}</p>}
+            </div>
+            <div className="host-confirm-actions">
+              <button className="btn-secondary" disabled={resetMfaLoading} onClick={() => setResetMfaUser(null)} autoFocus>{t('Cancel')}</button>
+              <button className="btn-danger" disabled={resetMfaLoading} onClick={handleResetMfa}>
+                {resetMfaLoading ? t('Resetting…') : t('Reset 2FA')}
+              </button>
+            </div>
           </div>
         </div>
       )}

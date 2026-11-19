@@ -1,9 +1,11 @@
 import QtQuick
 import QtQuick.Controls
 
-// One type of computer in the row of types of "Add computer": its logo and,
-// under it, its short name ("RustDesk"); the whole name is its tool tip and
+// One type of computer in the types of "Add computer": its logo and its
+// short name ("RustDesk") side by side; the whole name is its tool tip and
 // what a screen reader says. The chosen one has the accent's border.
+// `centered`: logo and name in the middle (a chip in a row of chips);
+// otherwise at the left (a row of the list of types beside the form).
 // The names can come from another computer: plain text only.
 AbstractButton {
     id: tile
@@ -11,8 +13,10 @@ AbstractButton {
     property string typeId: ""
     property string fullName: ""
     property bool chosen: false
-    implicitWidth: 96
-    implicitHeight: 70
+    property bool centered: false
+    property int logoSize: centered ? 20 : 24
+    implicitWidth: 120
+    implicitHeight: centered ? 38 : 40
     hoverEnabled: true
     activeFocusOnTab: true
     Accessible.role: Accessible.RadioButton
@@ -34,32 +38,32 @@ AbstractButton {
         border.width: tile.chosen || tile.activeFocus ? 1.5 : 1
     }
     contentItem: Item {
-        TypeLogo {
-            id: logo
-            objectName: "tileLogo"
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.top: parent.top
-            anchors.topMargin: 10
-            typeId: tile.typeId
-            name: tile.text
-            size: 30
-            chosen: tile.chosen
-        }
-        Text {
-            objectName: "tileName"
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.leftMargin: 6
-            anchors.rightMargin: 6
-            anchors.top: logo.bottom
-            anchors.topMargin: 6
-            horizontalAlignment: Text.AlignHCenter
-            textFormat: Text.PlainText
-            text: tile.text
-            color: tile.chosen ? Theme.textStrong : Theme.text
-            font.pixelSize: 12
-            font.weight: tile.chosen ? Font.DemiBold : Font.Medium
-            elide: Text.ElideRight
+        Row {
+            id: row
+            spacing: 8
+            // Centered when it fits, else from the left with the name cut.
+            x: tile.centered ? Math.max(8, (parent.width - width) / 2) : 8
+            anchors.verticalCenter: parent.verticalCenter
+            TypeLogo {
+                id: logo
+                objectName: "tileLogo"
+                anchors.verticalCenter: parent.verticalCenter
+                typeId: tile.typeId
+                name: tile.text
+                size: tile.logoSize
+                chosen: tile.chosen
+            }
+            Text {
+                objectName: "tileName"
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.min(implicitWidth, tile.availableWidth - 16 - logo.width - row.spacing)
+                textFormat: Text.PlainText
+                text: tile.text
+                color: tile.chosen ? Theme.textStrong : Theme.text
+                font.pixelSize: 13
+                font.weight: tile.chosen ? Font.DemiBold : Font.Medium
+                elide: Text.ElideRight
+            }
         }
     }
 }

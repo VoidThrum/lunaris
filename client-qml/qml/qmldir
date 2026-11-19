@@ -32,3 +32,8 @@ OptionCard 1.0 OptionCard.qml
 MethodChips 1.0 MethodChips.qml
 TypeLogo 1.0 TypeLogo.qml
 TypeTile 1.0 TypeTile.qml
+ComputerFinder 1.0 ComputerFinder.qml
+NoMatch 1.0 NoMatch.qml
+MfaDialog 1.0 MfaDialog.qml
+UpdateBanner 1.0 UpdateBanner.qml
+UpdatesPanel 1.0 UpdatesPanel.qml

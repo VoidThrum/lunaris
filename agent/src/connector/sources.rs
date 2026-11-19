@@ -746,8 +746,16 @@ fn sources_changed() -> &'static tokio::sync::watch::Sender<u64> {
     CHANGED.get_or_init(|| tokio::sync::watch::channel(0).0)
 }
 
+/// The servers are told the sources again (whether each is there changed:
+/// `reachability`).
+pub(crate) fn note_sources_changed() {
+    sources_changed().send_modify(|count| *count += 1);
+}
+
 /// For one connection to a server: sends this agent's sources to `tx` again
-/// whenever a set-up has added one. Ends when the returned guard is dropped
+/// whenever a set-up has added one, and when whether they are there
+/// changed (`reachability`; at most once per round of checks, and a burst
+/// of changes is one announcement). Ends when the returned guard is dropped
 /// (the connection ended).
 pub fn announce_changes(tx: tokio::sync::mpsc::UnboundedSender<common::AgentMessage>, manageable: bool) -> AnnounceChanges {
     let mut changed = sources_changed().subscribe();
@@ -814,11 +822,16 @@ impl Drop for StopSetupsOnDrop {
 /// What a server is told when the agent connects and when its sources
 /// change: the sources (id, name, connector, group) and the connectors there are.
 pub fn announcement(manageable: bool) -> common::AgentMessage {
-    common::AgentMessage::Sources {
-        sources: source_infos(&crate::connector::configured_sources()),
-        connectors: connector_infos(&crate::connector::available(&crate::connector::connectors_dir())),
-        manageable,
+    let configured = crate::connector::configured_sources();
+    let available = crate::connector::available(&crate::connector::connectors_dir());
+    let mut sources = source_infos(&configured);
+    // Whether each is there, as far as it is known (`reachability`).
+    if let Some(monitor) = crate::connector::reachability::agent_monitor() {
+        for (info, source) in sources.iter_mut().zip(&configured) {
+            info.online = monitor.status(&source.target, available.iter().find(|c| c.id == source.target.connector));
+        }
     }
+    common::AgentMessage::Sources { sources, connectors: connector_infos(&available), manageable }
 }
 
 /// The connectors as the server and the viewers are told them.
@@ -858,7 +871,13 @@ pub fn connector_infos(connectors: &[Description]) -> Vec<common::ConnectorInfoM
 pub fn source_infos(sources: &[SourceConfig]) -> Vec<common::SourceInfoMsg> {
     sources
         .iter()
-        .map(|s| common::SourceInfoMsg { id: s.id.clone(), name: s.name.clone(), connector: s.target.connector.clone(), group: group_of(s).map(str::to_string) })
+        .map(|s| common::SourceInfoMsg {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            connector: s.target.connector.clone(),
+            group: group_of(s).map(str::to_string),
+            online: None,
+        })
         .collect()
 }
 

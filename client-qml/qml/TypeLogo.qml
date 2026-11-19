@@ -1,8 +1,8 @@
 import QtQuick
 import "Cards.js" as Cards
 
-// The logo of a type of computer: Lunaris' own, RustDesk's, Sunshine's (by
-// connector id, Cards.typeLogo); any other type, and a logo that cannot be
+// The logo of a type of computer: Lunaris' own, RustDesk's, Sunshine's, and
+// plain glyphs of our own for RDP and VNC (by connector id, Cards.typeLogo); any other type, and a logo that cannot be
 // shown (a package without the SVG image plugin), is the first letter of
 // its name. With `tile` it stands on a neutral rounded square, so that it
 // reads on the light and on the dark theme alike.

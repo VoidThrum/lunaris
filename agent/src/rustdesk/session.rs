@@ -248,8 +248,14 @@ impl Screen for MediaScreen {
         // is what the last capture found, else what the desktop's layout
         // says of the first output; the capture corrects it when it starts
         // (`captured_size`).
+        // With the Lunaris capture service (root KMS helper) every monitor
+        // can be listed and shown, as on X11.
         #[cfg(target_os = "linux")]
-        if wayland_session() {
+        if wayland_session()
+            && !tokio::task::spawn_blocking(lunaris_media::capture::drm_service::service_available)
+                .await
+                .unwrap_or(false)
+        {
             let size = match lunaris_media::input::capture_region() {
                 Some(region) => Some(region),
                 None => tokio::task::spawn_blocking(|| lunaris_media::input::desktop_outputs().into_iter().next())

@@ -86,6 +86,37 @@ EOF
         chmod 755 "$root/DEBIAN/postinst"
     fi
 
+    # The agent package also runs the capture service (unattended capture on
+    # Wayland without the portal prompt, docs/linux-capture-service.md).
+    if [[ "$kind" == agent ]]; then
+        cat >> "$root/DEBIAN/postinst" <<'EOF'
+if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ -z "$2" ]; then
+        systemctl enable --now lunaris-capture.service >/dev/null 2>&1 || true
+    else
+        # Upgrade: keep the admin's choice, run the new binary.
+        systemctl try-restart lunaris-capture.service >/dev/null 2>&1 || true
+    fi
+fi
+EOF
+        cat > "$root/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl disable --now lunaris-capture.service >/dev/null 2>&1 || true
+fi
+EOF
+        cat > "$root/DEBIAN/postrm" <<'EOF'
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+EOF
+        chmod 755 "$root/DEBIAN/prerm" "$root/DEBIAN/postrm"
+    fi
+
     dpkg-deb --build --root-owner-group "$root" "$OUT/${name}_${VERSION}_${ARCH}.deb" >/dev/null
     echo "Built $OUT/${name}_${VERSION}_${ARCH}.deb"
     dpkg-deb --field "$OUT/${name}_${VERSION}_${ARCH}.deb" Depends
@@ -95,9 +126,10 @@ EOF
 build agent "$TARGET/release/agent" "" \
     ", xdg-desktop-portal, pipewire, mesa-va-drivers" \
     "Lunaris remote desktop host agent
- Shares this computer's screen with Lunaris clients: PipeWire/portal capture
- on Wayland (X11 otherwise), hardware encoding (VAAPI, NVENC, Quick Sync) and
- remote keyboard/mouse through uinput."
+ Shares this computer's screen with Lunaris clients: unattended KMS capture
+ through the lunaris-capture service (Wayland without the portal prompt),
+ PipeWire/portal or X11 otherwise, hardware encoding (VAAPI, NVENC, Quick
+ Sync) and remote keyboard/mouse through uinput."
 
 build client "$TARGET/release/client-desktop" \
     ", qml6-module-qtmultimedia, qml6-module-qtquick-shapes" \
