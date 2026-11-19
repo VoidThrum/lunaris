@@ -137,6 +137,8 @@ QtObject {
         groupsSaid = [];
         setupGroup = "*";
         setupHost = "";
+        waylandCapture = "auto";
+        waylandCaptureSet = [];
     }
 
     // ---- Signals of the real bridge that the pages listen to ----
@@ -164,7 +166,8 @@ QtObject {
     function hostStatus() {
         return JSON.stringify({ enabled: true, running: true, port: 8091, password: "k7m2p9qd", addresses: ["192.168.1.10"],
             hostname: "this-pc", input_ready: true, allow_clipboard: true, allow_file_transfer: true, full_disk_access: false,
-            approve_mode: "password-click", rustdesk_enabled: false, rustdesk_port: 21118, rustdesk_file_transfer: false, error: "" });
+            approve_mode: "password-click", rustdesk_enabled: false, rustdesk_port: 21118, rustdesk_file_transfer: false,
+            wayland_capture: stub.waylandCapture, error: "" });
     }
     function hostStart() { return ""; }
     function hostStop() { return ""; }
@@ -174,6 +177,15 @@ QtObject {
     function hostSetSharing(c, f) { return ""; }
     function hostSetFileAccess(full) { return ""; }
     function hostSetApproveMode(mode) { return ""; }
+    // The host's `wayland_capture` ("auto" / "portal") and what was set, newest last.
+    property string waylandCapture: "auto"
+    property var waylandCaptureSet: []
+    function hostSetWaylandCapture(mode) {
+        stub.waylandCaptureSet = stub.waylandCaptureSet.concat([mode]);
+        if (mode !== "auto" && mode !== "portal") return "unknown Wayland capture mode " + mode;
+        stub.waylandCapture = mode;
+        return "";
+    }
     function hostUseServer(server, token) { return "already"; }
     function serverStatus() {
         return JSON.stringify({ enabled: false, running: false, ours: false, port: 8090, local_url: "", lan_url: "", admin_password: "", data_dir: "", error: "" });

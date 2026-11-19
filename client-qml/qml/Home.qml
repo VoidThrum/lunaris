@@ -1594,6 +1594,7 @@ Rectangle {
         // SETTINGS
         // ===========================================================
         AppSettings {
+            objectName: "appSettings"
             anchors.fill: parent
             visible: home.page === "settings"
             homeView: home

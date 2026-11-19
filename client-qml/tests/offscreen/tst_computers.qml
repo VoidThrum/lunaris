@@ -1819,5 +1819,36 @@ Item {
             removeDialog.close();
             wait(250);
         }
+
+        // Settings > Security: "Wayland screen capture" (Linux only), in both languages.
+        function test_wayland_capture_setting_data() {
+            return [{ tag: "en", lang: "en" }, { tag: "vi", lang: "vi" }];
+        }
+        function test_wayland_capture_setting(data) {
+            start(data.lang);
+            var home = test.home;
+            home.page = "settings";
+            var settingsPage = findChild(home, "appSettings");
+            settingsPage.section = "security";
+            wait(50);
+            var card = findChild(settingsPage, "waylandCaptureCard");
+            verify(card !== null);
+            compare(card.visible, Qt.platform.os === "linux");
+            if (Qt.platform.os !== "linux") return;
+            compare(card.title, data.lang === "vi" ? "Chụp màn hình trên Wayland" : "Wayland screen capture");
+            var auto = findChild(card, "waylandCapture_auto");
+            var portal = findChild(card, "waylandCapture_portal");
+            verify(auto.checked && !portal.checked, "auto by default");
+            if (data.lang === "vi") compare(portal.text, "Hỏi quyền qua portal");
+            shot("settings-wayland-capture");
+            portal.clicked();
+            compare(bridge.waylandCaptureSet, ["portal"]);
+            tryCompare(portal, "checked", true);
+            verify(!auto.checked);
+            compare(home.hostError, "");
+            auto.clicked();
+            compare(bridge.waylandCaptureSet, ["portal", "auto"]);
+            tryCompare(auto, "checked", true);
+        }
     }
 }

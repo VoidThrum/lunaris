@@ -43,6 +43,8 @@ ApplicationWindow {
     property bool rustdeskEnabled: false
     property int rustdeskPort: 21118
     property bool rustdeskFileTransfer: false
+    // Screen capture on a Linux Wayland session: "auto" or "portal".
+    property string waylandCapture: "auto"
     property string directPassword: ""
     property var directAddresses: []
 
@@ -425,6 +427,32 @@ ApplicationWindow {
             }
         }
 
+        // Screen capture on Wayland (Linux only)
+        Card {
+            visible: Qt.platform.os === "linux"
+            Layout.fillWidth: true
+            implicitHeight: waylandCol.implicitHeight + 28
+            ColumnLayout {
+                id: waylandCol
+                anchors.fill: parent; anchors.margins: 14
+                spacing: 8
+                SectionLabel { text: "WAYLAND SCREEN CAPTURE" }
+                Toggle {
+                    text: "Ask through the portal"
+                    checked: window.waylandCapture === "portal"
+                    onToggled: { bridge.setWaylandCapture(checked ? "portal" : "auto"); restartIfSharing() }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: window.waylandCapture === "portal"
+                        ? "The capture service is never used: the person at this computer approves on the desktop (remembered until withdrawn there), which shows the screen is shared."
+                        : "Automatic: no prompt when the capture service is installed, otherwise the desktop asks. For Linux desktops on Wayland."
+                    color: Theme.textMuted; font.pixelSize: 12
+                }
+            }
+        }
+
         }
         }
         }
@@ -536,6 +564,7 @@ ApplicationWindow {
             window.rustdeskEnabled = enabled; window.rustdeskPort = port
         }
         function onRustdeskFileTransferLoaded(enabled) { window.rustdeskFileTransfer = enabled }
+        function onWaylandCaptureLoaded(mode) { window.waylandCapture = mode.toString() }
         function onDirectConfigLoaded(enabled, port, password, addresses) {
             window.directEnabled = enabled; window.directPort = port; window.directPassword = password
             var a = addresses.toString(); window.directAddresses = a === "" ? [] : a.split("\n")

@@ -1306,6 +1306,11 @@ pub mod qobject {
         #[qinvokable]
         fn host_set_approve_mode(self: Pin<&mut StreamBridge>, mode: QString) -> QString;
 
+        /// Screen capture on a Linux Wayland session: "auto" or "portal";
+        /// returns an error message or "".
+        #[qinvokable]
+        fn host_set_wayland_capture(self: Pin<&mut StreamBridge>, mode: QString) -> QString;
+
         /// Connections waiting to be accepted here, as JSON:
         /// [{id, requester, kind, timeout_s}].
         #[qinvokable]
@@ -3140,6 +3145,10 @@ impl qobject::StreamBridge {
 
     pub fn host_set_approve_mode(self: Pin<&mut Self>, mode: QString) -> QString {
         QString::from(&crate::host::set_approve_mode(&mode.to_string()).err().unwrap_or_default())
+    }
+
+    pub fn host_set_wayland_capture(self: Pin<&mut Self>, mode: QString) -> QString {
+        QString::from(&crate::host::set_wayland_capture(&mode.to_string()).err().unwrap_or_default())
     }
 
     pub fn host_approvals(self: Pin<&mut Self>) -> QString {

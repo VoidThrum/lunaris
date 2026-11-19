@@ -25,7 +25,10 @@ RuntimeDirectoryMode=0755
 # CAP_SYS_ADMIN: export scan-out framebuffers (DRM GETFB2 handles).
 # CAP_SYS_PTRACE: read /proc/<pid>/exe and environ of the connecting agent
 # (another user's process) to authorise it.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE
+# CAP_DAC_READ_SEARCH: open that environ file (mode 0400, owned by the user;
+# read only, it grants no writing).
+# No CAP_KILL: the agent's liveness check treats EPERM as "still running".
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 AmbientCapabilities=
 NoNewPrivileges=yes
 # Only the DRM devices.

@@ -119,6 +119,10 @@ pub mod qobject {
         #[qsignal]
         fn rustdesk_file_transfer_loaded(self: Pin<&mut AgentBridge>, enabled: bool);
 
+        /// Screen capture on a Linux Wayland session: "auto" or "portal".
+        #[qsignal]
+        fn wayland_capture_loaded(self: Pin<&mut AgentBridge>, mode: QString);
+
         /// Direct connections: on/off, port, access password and this
         /// computer's addresses (one per line).
         #[qsignal]
@@ -167,6 +171,11 @@ pub mod qobject {
         /// or not (`rustdesk_file_transfer` of the config).
         #[qinvokable]
         fn set_rustdesk_file_transfer(self: Pin<&mut AgentBridge>, enabled: bool);
+
+        /// Screen capture on a Linux Wayland session: "auto" or "portal"
+        /// (`wayland_capture` of the config).
+        #[qinvokable]
+        fn set_wayland_capture(self: Pin<&mut AgentBridge>, mode: QString);
 
         #[qinvokable]
         fn start_agent(self: Pin<&mut AgentBridge>);
@@ -339,6 +348,17 @@ impl qobject::AgentBridge {
         self.as_mut().save_direct_config(config);
     }
 
+    pub fn set_wayland_capture(mut self: Pin<&mut Self>, mode: QString) {
+        let mode = mode.to_string();
+        if !matches!(mode.as_str(), "auto" | "portal") {
+            self.as_mut().config_saved(false, QString::from(&format!("Unknown Wayland capture mode {}", mode)));
+            return;
+        }
+        let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
+        config.wayland_capture = mode;
+        self.as_mut().save_direct_config(config);
+    }
+
     pub fn regenerate_direct_password(mut self: Pin<&mut Self>) {
         let mut config = load_config(agent::pairing::config_path()).unwrap_or_else(|_| make_default_config());
         config.direct_password = agent::pairing::generate_direct_password();
@@ -372,6 +392,8 @@ impl qobject::AgentBridge {
             config.rustdesk_port.unwrap_or(agent::rustdesk::DEFAULT_PORT) as i32,
         );
         self.as_mut().rustdesk_file_transfer_loaded(config.rustdesk_file_transfer);
+        let (wayland_capture, _) = agent::pairing::wayland_capture_preference(&config.wayland_capture);
+        self.as_mut().wayland_capture_loaded(QString::from(wayland_capture.as_str()));
         self.as_mut().direct_config_loaded(
             config.direct_enabled,
             config.direct_port as i32,

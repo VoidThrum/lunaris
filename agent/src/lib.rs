@@ -517,6 +517,22 @@ pub async fn run_agent(
     name: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     CONNECTED_TO_SERVER.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Before any session can create a capture backend. Like the other
+    // settings, a change applies when the agent (re)starts: the app and the
+    // agent window restart it after saving one.
+    apply_wayland_capture(&config);
+    if crate::pairing::ensure_client_id(&mut config) {
+        let id = config.client_unique_id.clone();
+        warn!("The config had no computer id; using a new one: {}", id);
+        let saved = crate::pairing::update_config_file(crate::pairing::config_path(), &config, |c| {
+            if c.client_unique_id.trim().is_empty() {
+                c.client_unique_id = id.clone();
+            }
+        });
+        if let Err(e) = saved {
+            warn!("Could not save the new computer id to {}: {}", crate::pairing::config_path(), e);
+        }
+    }
 
     let hub = hub::Hub::new(config.client_unique_id.clone());
     let (agent_tx, router) = hub::spawn_router(hub.clone());
@@ -610,6 +626,20 @@ pub async fn run_agent(
     drop(inbound_tx);
     drop(tasks);
     Ok(())
+}
+
+/// Hands the config's `wayland_capture` to lunaris-media, which reads it
+/// whenever it creates a screen capture backend on a Wayland session.
+fn apply_wayland_capture(config: &AgentConfig) {
+    let (preference, known) = crate::pairing::wayland_capture_preference(&config.wayland_capture);
+    if !known {
+        warn!(
+            "wayland_capture {:?} is not \"auto\" or \"portal\"; using \"auto\"",
+            config.wayland_capture
+        );
+    }
+    lunaris_media::capture::set_wayland_capture_preference(preference);
+    info!("Wayland screen capture: {}", preference.as_str());
 }
 
 /// Aborts the agent's background tasks when `run_agent` stops.

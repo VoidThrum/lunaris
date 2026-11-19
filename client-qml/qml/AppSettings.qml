@@ -383,6 +383,46 @@ Rectangle {
             }
 
             Card {
+                // Linux only: on a Wayland session the agent may capture the
+                // screen without asking (the capture service) or always
+                // through the portal (agent `wayland_capture`).
+                objectName: "waylandCaptureCard"
+                visible: settings.section === "security" && Qt.platform.os === "linux"
+                title: I18n.t("Wayland screen capture")
+                subtitle: I18n.t("For Linux desktops on Wayland. Restarts remote control.")
+                Repeater {
+                    model: [
+                        { value: "auto", label: I18n.t("Automatic (no prompt when the capture service is installed)") },
+                        { value: "portal", label: I18n.t("Ask through the portal"), hint: I18n.t("Never uses the capture service: the person at this computer approves on the desktop (remembered until withdrawn there), which shows the screen is shared.") }
+                    ]
+                    delegate: ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+                        RadioRow {
+                            objectName: "waylandCapture_" + modelData.value
+                            text: modelData.label
+                            checked: (homeView ? (homeView.hostStatus.wayland_capture || "auto") : "auto") === modelData.value
+                            onClicked: {
+                                homeView.hostError = typeof bridge.hostSetWaylandCapture === "function"
+                                    ? bridge.hostSetWaylandCapture(modelData.value)
+                                    : "This version of the app cannot change it";
+                                homeView.refreshHost();
+                            }
+                        }
+                        Text {
+                            visible: !!modelData.hint
+                            Layout.fillWidth: true
+                            Layout.leftMargin: 28
+                            text: modelData.hint || ""
+                            color: Theme.textMuted
+                            font.pixelSize: 11
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+                }
+            }
+
+            Card {
                 visible: settings.section === "security"
                 title: I18n.t("Wrong passwords")
                 Text {

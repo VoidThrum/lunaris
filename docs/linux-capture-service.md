@@ -40,6 +40,16 @@ root: lunaris-agent --capture-service             user session: lunaris-agent
   `CAP_SYS_ADMIN` → portal/PipeWire → X11. `LUNARIS_CAPTURE=service|kms|portal`
   tries one first; `LUNARIS_CAPTURE_SOCKET` changes the socket path. The log
   says which backend was chosen and why.
+* The setting "Wayland screen capture" (app: Settings → Security; agent
+  window; `wayland_capture` in `agent_config.json`) chooses between `auto`
+  (the default, the order above) and `portal`: only portal/PipeWire, then
+  X11. In `portal` mode the agent never connects to the capture service or
+  uses KMS, even when they are available, so the person at the computer
+  approves through the portal and the desktop shows its sharing indicator.
+  (The portal's restore token still remembers an earlier approval.) It
+  applies when the agent starts; the app and the agent window restart it
+  when the setting changes. `LUNARIS_CAPTURE` is a developer override and
+  wins over the setting.
 * With the service the agent can list and show every monitor (RustDesk
   sessions included), not just the one picked in the portal.
 * Frames are sent at the requested rate (KMS has no damage information, and
@@ -148,8 +158,10 @@ descriptors around thousands of frames, malformed packets and reconnects.
 
 **Limits.** At most 4 clients (busy clients get `Error Busy`), 240 fps,
 4 frames in flight, bounded packets; a client that stops reading is dropped
-after a 2 s send timeout. systemd hardening: only `CAP_SYS_ADMIN` (export)
-and `CAP_SYS_PTRACE` (read another user's `/proc/<pid>/exe` and `environ`),
+after a 2 s send timeout. systemd hardening: only `CAP_SYS_ADMIN` (export),
+`CAP_SYS_PTRACE` (read another user's `/proc/<pid>/exe` and `environ`) and
+`CAP_DAC_READ_SEARCH` (open that `environ`, mode 0400; read only). No
+`CAP_KILL`: the liveness check of a client treats EPERM as running. Also
 `NoNewPrivileges`, `DevicePolicy=closed` + `DeviceAllow=char-drm`,
 `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`,
 `@system-service` syscall filter. (`MemoryDenyWriteExecute` is not set

@@ -107,6 +107,26 @@ pub struct AgentConfig {
     /// the id and the name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<crate::connector::SourceConfig>,
+    /// Screen capture on a Linux Wayland session: "auto" (the default: the
+    /// capture service without a prompt when installed, else KMS, else the
+    /// portal) or "portal" (always the XDG portal: the person here approves
+    /// and the desktop shows the screen is shared; the service and KMS are
+    /// never used). Anything else counts as "auto" (`wayland_capture_preference`).
+    #[serde(default = "default_wayland_capture")]
+    pub wayland_capture: String,
+}
+
+fn default_wayland_capture() -> String {
+    "auto".to_string()
+}
+
+/// `wayland_capture` as lunaris-media takes it, and whether the value was
+/// one it knows (an unknown one is `Auto`).
+pub fn wayland_capture_preference(value: &str) -> (lunaris_media::capture::WaylandCapturePreference, bool) {
+    match lunaris_media::capture::WaylandCapturePreference::parse(value) {
+        Some(p) => (p, true),
+        None => (lunaris_media::capture::WaylandCapturePreference::Auto, false),
+    }
 }
 
 impl Default for AgentConfig {
@@ -210,6 +230,17 @@ pub fn ensure_agent_key(config: &mut AgentConfig) -> bool {
 static CONFIG_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Sets the config file path for this process (from `--config`); call once at startup.
+/// Gives `config` an id when it has none (a config written by hand or by an
+/// older tool): an empty id is refused by servers and links. `true` when one
+/// was made (the caller saves it, so the id stays the same next time).
+pub fn ensure_client_id(config: &mut AgentConfig) -> bool {
+    if !config.client_unique_id.trim().is_empty() {
+        return false;
+    }
+    config.client_unique_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    true
+}
+
 /// A fresh configuration for this computer: a new id, no server and a new
 /// direct-access password. Direct connections stay off until the user turns
 /// remote control on.
@@ -647,6 +678,40 @@ mod tests {
         assert_eq!(c.server_sessions, "trusted");
         assert_eq!(c.file_access, "");
         assert!(c.server_cert_sha256.is_empty() && c.agent_key.is_empty());
+        assert_eq!(c.wayland_capture, "auto");
+        assert_eq!(AgentConfig::default().wayland_capture, "auto");
+        assert_eq!(new_config().wayland_capture, "auto");
+    }
+
+    #[test]
+    fn wayland_capture_round_trips() {
+        let mut c = AgentConfig::default();
+        c.wayland_capture = "portal".into();
+        let back: AgentConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.wayland_capture, "portal");
+        use lunaris_media::capture::WaylandCapturePreference as P;
+        assert_eq!(wayland_capture_preference(&back.wayland_capture), (P::Portal, true));
+        assert_eq!(wayland_capture_preference("auto"), (P::Auto, true));
+    }
+
+    #[test]
+    fn missing_id_is_made_once() {
+        let mut c: AgentConfig = serde_json::from_str("{}").unwrap();
+        assert!(ensure_client_id(&mut c));
+        let id = c.client_unique_id.clone();
+        assert_eq!(id.len(), 36);
+        assert!(!ensure_client_id(&mut c));
+        assert_eq!(c.client_unique_id, id);
+    }
+
+    #[test]
+    fn unknown_wayland_capture_is_auto() {
+        use lunaris_media::capture::WaylandCapturePreference as P;
+        let c: AgentConfig = serde_json::from_str(r#"{"wayland_capture":"service"}"#).unwrap();
+        // Kept in the file as written, used as auto.
+        assert_eq!(c.wayland_capture, "service");
+        assert_eq!(wayland_capture_preference(&c.wayland_capture), (P::Auto, false));
+        assert_eq!(wayland_capture_preference(""), (P::Auto, false));
     }
 
     #[cfg(unix)]
